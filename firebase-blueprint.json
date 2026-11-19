@@ -1,0 +1,706 @@
+{
+  "entities": {
+    "OwnerSetupState": {
+      "title": "OwnerSetupState",
+      "description": "Single-owner bootstrap lock storing only owner UID and initialization status (zero PII).",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "initialized": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "initialized", "createdAt"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Server-verified owner/admin authorization record bound to OWNER_EMAIL.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 200 },
+        "role": { "type": "string", "enum": ["owner"] },
+        "ownerProof": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role", "ownerProof", "createdAt", "updatedAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated shop owner user profile with isolated PII.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "email": { "type": "string", "maxLength": 200 },
+        "role": { "type": "string", "enum": ["owner", "admin"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "email", "role", "createdAt", "updatedAt"]
+    },
+    "Shop": {
+      "title": "Shop",
+      "description": "Root shop workspace document owned by a verified user.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "shopName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "shopName", "createdAt", "updatedAt"]
+    },
+    "ShopSettings": {
+      "title": "ShopSettings",
+      "description": "General shop configuration including PKR currency, Asia/Karachi timezone, and DD-MM-YYYY format.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "ownerName": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "address": { "type": "string", "maxLength": 300 },
+        "currency": { "type": "string", "enum": ["PKR"] },
+        "timezone": { "type": "string", "enum": ["Asia/Karachi"] },
+        "dateFormat": { "type": "string", "enum": ["DD-MM-YYYY"] },
+        "language": { "type": "string", "enum": ["English"] },
+        "expiryAlertDays": { "type": "number" },
+        "autoBackupEnabled": { "type": "boolean" },
+        "lastBackupAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "shopName", "ownerName", "phone", "address",
+        "currency", "timezone", "dateFormat", "language",
+        "expiryAlertDays", "autoBackupEnabled", "lastBackupAt",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "StaffMember": {
+      "title": "StaffMember",
+      "description": "Registered sales staff account managed by the shop owner.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "shopCode": { "type": "string", "maxLength": 20 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "username": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "usernameLower": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "authUid": { "type": "string", "maxLength": 128 },
+        "loginVersion": { "type": "number" },
+        "role": { "type": "string", "enum": ["sales_staff", "staff"] },
+        "isActive": { "type": "boolean" },
+        "permissions": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "shopId", "shopCode", "name", "phone", "username",
+        "usernameLower", "authUid", "loginVersion", "role", "isActive",
+        "permissions", "createdAt", "updatedAt"
+      ]
+    },
+    "StaffLookup": {
+      "title": "StaffLookup",
+      "description": "Non-PII username-to-shop routing record for sales staff login.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "staffId": { "type": "string", "maxLength": 128 },
+        "loginVersion": { "type": "number" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "shopId", "staffId", "loginVersion", "isActive", "createdAt", "updatedAt"]
+    },
+    "StaffAuthMap": {
+      "title": "StaffAuthMap",
+      "description": "Maps a Firebase Auth UID for a staff member to their shop and staff profile.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "staffId": { "type": "string", "maxLength": 128 },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "shopId", "staffId", "isActive", "createdAt", "updatedAt"]
+    },
+    "AdminMember": {
+      "title": "AdminMember",
+      "description": "Additional shop admin account created by an authorized Owner/Admin with username and password.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "shopCode": { "type": "string", "maxLength": 20 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "username": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "usernameLower": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "authUid": { "type": "string", "maxLength": 128 },
+        "loginVersion": { "type": "number" },
+        "role": { "type": "string", "enum": ["admin"] },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "shopId", "shopCode", "name", "phone", "username",
+        "usernameLower", "authUid", "loginVersion", "role", "isActive",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "AdminLookup": {
+      "title": "AdminLookup",
+      "description": "Non-PII username-to-shop routing record for added admin login.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "adminMemberId": { "type": "string", "maxLength": 128 },
+        "loginVersion": { "type": "number" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "shopId", "adminMemberId", "loginVersion", "isActive", "createdAt", "updatedAt"]
+    },
+    "AdminAuthMap": {
+      "title": "AdminAuthMap",
+      "description": "Maps a Firebase Auth UID for an added admin to their shop and admin profile.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "adminMemberId": { "type": "string", "maxLength": 128 },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "shopId", "adminMemberId", "isActive", "createdAt", "updatedAt"]
+    },
+    "StaffCatalogItem": {
+      "title": "StaffCatalogItem",
+      "description": "Sanitized product catalog item for sales staff excluding purchase costs and profit margins.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "categoryName": { "type": "string", "maxLength": 100 },
+        "brandName": { "type": "string", "maxLength": 100 },
+        "salePrice": { "type": "number" },
+        "currentStock": { "type": "number" },
+        "unit": { "type": "string", "maxLength": 40 },
+        "isActive": { "type": "boolean" },
+        "allowedStaffUids": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "productId", "name", "categoryName", "brandName",
+        "salePrice", "currentStock", "unit", "isActive", "allowedStaffUids", "updatedAt"
+      ]
+    },
+    "StaffSale": {
+      "title": "StaffSale",
+      "description": "Sales entry recorded by a sales staff member without access to cost or profit fields.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "saleNumber": { "type": "string", "maxLength": 40 },
+        "saleDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "saleDateTime": { "type": "string", "maxLength": 30 },
+        "paymentMethod": { "type": "string", "enum": ["Cash", "Online"] },
+        "totalAmount": { "type": "number" },
+        "totalQuantity": { "type": "number" },
+        "itemCount": { "type": "number" },
+        "items": { "type": "array" },
+        "staffId": { "type": "string", "maxLength": 128 },
+        "staffAuthUid": { "type": "string", "maxLength": 128 },
+        "staffName": { "type": "string", "maxLength": 120 },
+        "staffUsername": { "type": "string", "maxLength": 40 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["completed", "cancelled"] },
+        "syncedToLedger": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "shopId", "saleNumber", "saleDate", "saleDateTime", "paymentMethod",
+        "totalAmount", "totalQuantity", "itemCount", "items", "staffId", "staffAuthUid",
+        "staffName", "staffUsername", "notes", "status", "syncedToLedger", "createdAt", "updatedAt"
+      ]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "Product category such as Diapers, Baby Wipes, Tissues, Toiletries.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 300 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "name", "description", "createdAt", "updatedAt"]
+    },
+    "Brand": {
+      "title": "Brand",
+      "description": "Product brand such as Pampers, Huggies, Molfix, Rose Petal.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "name", "createdAt", "updatedAt"]
+    },
+    "Supplier": {
+      "title": "Supplier",
+      "description": "Product supplier with running total purchases, paid amount, and outstanding balance.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "address": { "type": "string", "maxLength": 300 },
+        "totalPurchased": { "type": "number" },
+        "totalPaid": { "type": "number" },
+        "outstandingBalance": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "name", "phone", "address",
+        "totalPurchased", "totalPaid", "outstandingBalance", "notes",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Retail inventory product with pricing, stock levels, supplier, expiry, and margin.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "categoryId": { "type": "string", "maxLength": 128 },
+        "categoryName": { "type": "string", "maxLength": 100 },
+        "brandId": { "type": "string", "maxLength": 128 },
+        "brandName": { "type": "string", "maxLength": 100 },
+        "purchasePrice": { "type": "number" },
+        "salePrice": { "type": "number" },
+        "wholesalePrice": { "type": "number" },
+        "currentStock": { "type": "number" },
+        "minStockLevel": { "type": "number" },
+        "maxStockLevel": { "type": "number" },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "supplierId": { "type": "string", "maxLength": 128 },
+        "supplierName": { "type": "string", "maxLength": 150 },
+        "expiryDate": { "type": "string", "maxLength": 20 },
+        "profitMarginPct": { "type": "number" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "name", "categoryId", "categoryName", "brandId", "brandName",
+        "purchasePrice", "salePrice", "wholesalePrice",
+        "currentStock", "minStockLevel", "maxStockLevel",
+        "unit", "supplierId", "supplierName", "expiryDate", "profitMarginPct",
+        "isActive", "createdAt", "updatedAt"
+      ]
+    },
+    "Sale": {
+      "title": "Sale",
+      "description": "Manual sales transaction header with Cash or Online payment, staff attribution, and historical profit totals.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "saleNumber": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "saleDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "saleDateTime": { "type": "string", "maxLength": 30 },
+        "paymentMethod": { "type": "string", "enum": ["Cash", "Online"] },
+        "totalAmount": { "type": "number" },
+        "totalCost": { "type": "number" },
+        "totalProfit": { "type": "number" },
+        "totalQuantity": { "type": "number" },
+        "itemCount": { "type": "number" },
+        "staffId": { "type": "string", "maxLength": 128 },
+        "staffName": { "type": "string", "maxLength": 120 },
+        "recordedByRole": { "type": "string", "enum": ["owner", "staff"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["completed", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "saleNumber", "saleDate", "paymentMethod",
+        "totalAmount", "totalCost", "totalProfit", "totalQuantity", "itemCount",
+        "notes", "status", "createdAt", "updatedAt"
+      ]
+    },
+    "SaleItem": {
+      "title": "SaleItem",
+      "description": "Line item of a sale snapshotting historical purchase cost at the time of sale.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "saleId": { "type": "string", "maxLength": 128 },
+        "saleDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "maxLength": 180 },
+        "categoryId": { "type": "string", "maxLength": 128 },
+        "categoryName": { "type": "string", "maxLength": 100 },
+        "brandId": { "type": "string", "maxLength": 128 },
+        "brandName": { "type": "string", "maxLength": 100 },
+        "quantity": { "type": "number" },
+        "salePricePerUnit": { "type": "number" },
+        "purchasePriceAtSale": { "type": "number" },
+        "lineTotal": { "type": "number" },
+        "lineCost": { "type": "number" },
+        "lineProfit": { "type": "number" },
+        "staffId": { "type": "string", "maxLength": 128 },
+        "staffName": { "type": "string", "maxLength": 120 },
+        "status": { "type": "string", "enum": ["completed", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "saleId", "saleDate", "productId", "productName",
+        "categoryId", "categoryName", "brandId", "brandName",
+        "quantity", "salePricePerUnit", "purchasePriceAtSale",
+        "lineTotal", "lineCost", "lineProfit", "status", "createdAt", "updatedAt"
+      ]
+    },
+    "Purchase": {
+      "title": "Purchase",
+      "description": "Supplier purchase header tracking total, amount paid, and balance due.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "purchaseNumber": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "purchaseDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "supplierId": { "type": "string", "maxLength": 128 },
+        "supplierName": { "type": "string", "maxLength": 150 },
+        "totalAmount": { "type": "number" },
+        "amountPaid": { "type": "number" },
+        "balanceDue": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["Cash", "Online"] },
+        "totalQuantity": { "type": "number" },
+        "itemCount": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["completed", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "purchaseNumber", "purchaseDate", "supplierId", "supplierName",
+        "totalAmount", "amountPaid", "balanceDue", "paymentMethod",
+        "totalQuantity", "itemCount", "notes", "status", "createdAt", "updatedAt"
+      ]
+    },
+    "PurchaseItem": {
+      "title": "PurchaseItem",
+      "description": "Line item of a supplier purchase.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "purchaseId": { "type": "string", "maxLength": 128 },
+        "purchaseDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "supplierId": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "maxLength": 180 },
+        "quantity": { "type": "number" },
+        "purchasePricePerUnit": { "type": "number" },
+        "lineTotal": { "type": "number" },
+        "status": { "type": "string", "enum": ["completed", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "purchaseId", "purchaseDate", "supplierId",
+        "productId", "productName", "quantity", "purchasePricePerUnit",
+        "lineTotal", "status", "createdAt", "updatedAt"
+      ]
+    },
+    "ExpenseCategory": {
+      "title": "ExpenseCategory",
+      "description": "Default or custom expense category.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "isDefault": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "name", "isDefault", "createdAt", "updatedAt"]
+    },
+    "Expense": {
+      "title": "Expense",
+      "description": "Shop operating expense entry.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "categoryId": { "type": "string", "maxLength": 128 },
+        "categoryName": { "type": "string", "maxLength": 100 },
+        "amount": { "type": "number" },
+        "expenseDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "paymentMethod": { "type": "string", "enum": ["Cash", "Online"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "title", "categoryId", "categoryName",
+        "amount", "expenseDate", "paymentMethod", "notes", "createdAt", "updatedAt"
+      ]
+    },
+    "StockMovement": {
+      "title": "StockMovement",
+      "description": "Immutable ledger of every stock quantity change from sales, purchases, adjustments, or cancellations.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "maxLength": 180 },
+        "movementDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "movementType": { "type": "string", "enum": ["sale", "sale_edit", "sale_cancel", "purchase", "purchase_cancel", "adjustment_add", "adjustment_reduce", "adjustment_damaged", "adjustment_expired", "adjustment_missing", "initial_stock"] },
+        "quantityChange": { "type": "number" },
+        "previousStock": { "type": "number" },
+        "newStock": { "type": "number" },
+        "referenceId": { "type": "string", "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "productId", "productName", "movementDate", "movementType",
+        "quantityChange", "previousStock", "newStock", "referenceId", "notes", "createdAt"
+      ]
+    },
+    "StockAdjustment": {
+      "title": "StockAdjustment",
+      "description": "Explicit manual stock adjustment record for additions, reductions, damaged, expired, or missing goods.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "maxLength": 180 },
+        "adjustmentDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "adjustmentType": { "type": "string", "enum": ["add", "reduce", "damaged", "expired", "missing"] },
+        "quantity": { "type": "number" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "previousStock": { "type": "number" },
+        "newStock": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "productId", "productName", "adjustmentDate", "adjustmentType",
+        "quantity", "reason", "notes", "previousStock", "newStock", "createdAt"
+      ]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable audit trail of critical business mutations.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "action": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "entityType": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "entityId": { "type": "string", "maxLength": 128 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 400 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "action", "entityType", "entityId", "summary", "createdAt"]
+    },
+    "BackupRecord": {
+      "title": "BackupRecord",
+      "description": "Metadata record for shop data backups.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "backupType": { "type": "string", "enum": ["automatic", "manual"] },
+        "recordCount": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 300 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "backupType", "recordCount", "notes", "createdAt"]
+    },
+    "GoogleSheetsIntegration": {
+      "title": "GoogleSheetsIntegration",
+      "description": "Owner-only Google Sheets sync configuration and status metadata (never stores OAuth tokens or secrets).",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "spreadsheetId": { "type": "string", "maxLength": 180 },
+        "spreadsheetUrl": { "type": "string", "maxLength": 350 },
+        "spreadsheetTitle": { "type": "string", "maxLength": 180 },
+        "autoSyncEnabled": { "type": "boolean" },
+        "connectionState": { "type": "string", "enum": ["connected", "disconnected", "error"] },
+        "lastSyncAt": { "type": "string", "maxLength": 64 },
+        "lastSyncStatus": { "type": "string", "enum": ["idle", "syncing", "synced", "error"] },
+        "lastError": { "type": "string", "maxLength": 500 },
+        "syncedRecordCount": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "spreadsheetId", "spreadsheetUrl", "spreadsheetTitle",
+        "autoSyncEnabled", "connectionState", "lastSyncAt", "lastSyncStatus",
+        "lastError", "syncedRecordCount", "createdAt", "updatedAt"
+      ]
+    },
+    "SheetsSyncJob": {
+      "title": "SheetsSyncJob",
+      "description": "Persistent background retry queue job for failed or pending Google Sheets worksheet synchronizations.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "jobType": { "type": "string", "enum": ["incremental", "full"] },
+        "targetSheets": { "type": "array" },
+        "recordCount": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "failed"] },
+        "retryCount": { "type": "number" },
+        "lastError": { "type": "string", "maxLength": 500 },
+        "summary": { "type": "string", "maxLength": 300 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "jobType", "targetSheets", "recordCount",
+        "status", "retryCount", "lastError", "summary", "createdAt", "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/appState/{stateId}": {
+      "schema": { "$ref": "#/entities/OwnerSetupState" },
+      "description": "Single-owner initial setup lock document (ownerSetup) containing zero PII."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Server-verified authorized owner/admin records."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Isolated user profile documents."
+    },
+    "/staffLookup/{lookupKey}": {
+      "schema": { "$ref": "#/entities/StaffLookup" },
+      "description": "Non-PII staff username routing lookup."
+    },
+    "/staffAuthMap/{authUid}": {
+      "schema": { "$ref": "#/entities/StaffAuthMap" },
+      "description": "Maps staff Firebase Auth UID to shop and staff profile."
+    },
+    "/adminLookup/{lookupKey}": {
+      "schema": { "$ref": "#/entities/AdminLookup" },
+      "description": "Non-PII admin username routing lookup."
+    },
+    "/adminAuthMap/{authUid}": {
+      "schema": { "$ref": "#/entities/AdminAuthMap" },
+      "description": "Maps added admin Firebase Auth UID to shop and admin member profile."
+    },
+    "/shops/{shopId}": {
+      "schema": { "$ref": "#/entities/Shop" },
+      "description": "Shop workspace documents keyed by owner UID."
+    },
+    "/shops/{shopId}/adminMembers/{adminMemberId}": {
+      "schema": { "$ref": "#/entities/AdminMember" },
+      "description": "Additional shop admin accounts managed by the shop owner/admins."
+    },
+    "/shops/{shopId}/staff/{staffId}": {
+      "schema": { "$ref": "#/entities/StaffMember" },
+      "description": "Registered sales staff accounts and permissions."
+    },
+    "/shops/{shopId}/staffCatalog/{productId}": {
+      "schema": { "$ref": "#/entities/StaffCatalogItem" },
+      "description": "Sanitized product catalog for sales staff without cost or profit fields."
+    },
+    "/shops/{shopId}/staffSales/{saleId}": {
+      "schema": { "$ref": "#/entities/StaffSale" },
+      "description": "Sales recorded by sales staff without cost or profit fields."
+    },
+    "/shops/{shopId}/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/ShopSettings" },
+      "description": "Shop general settings."
+    },
+    "/shops/{shopId}/categories/{categoryId}": {
+      "schema": { "$ref": "#/entities/Category" },
+      "description": "Product categories."
+    },
+    "/shops/{shopId}/brands/{brandId}": {
+      "schema": { "$ref": "#/entities/Brand" },
+      "description": "Product brands."
+    },
+    "/shops/{shopId}/suppliers/{supplierId}": {
+      "schema": { "$ref": "#/entities/Supplier" },
+      "description": "Suppliers and balances."
+    },
+    "/shops/{shopId}/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Shop products and inventory levels."
+    },
+    "/shops/{shopId}/sales/{saleId}": {
+      "schema": { "$ref": "#/entities/Sale" },
+      "description": "Sales headers."
+    },
+    "/shops/{shopId}/saleItems/{saleItemId}": {
+      "schema": { "$ref": "#/entities/SaleItem" },
+      "description": "Sales line items with historical purchase cost snapshots."
+    },
+    "/shops/{shopId}/purchases/{purchaseId}": {
+      "schema": { "$ref": "#/entities/Purchase" },
+      "description": "Purchase headers."
+    },
+    "/shops/{shopId}/purchaseItems/{purchaseItemId}": {
+      "schema": { "$ref": "#/entities/PurchaseItem" },
+      "description": "Purchase line items."
+    },
+    "/shops/{shopId}/expenseCategories/{expenseCategoryId}": {
+      "schema": { "$ref": "#/entities/ExpenseCategory" },
+      "description": "Default and custom expense categories."
+    },
+    "/shops/{shopId}/expenses/{expenseId}": {
+      "schema": { "$ref": "#/entities/Expense" },
+      "description": "Shop expenses."
+    },
+    "/shops/{shopId}/stockMovements/{movementId}": {
+      "schema": { "$ref": "#/entities/StockMovement" },
+      "description": "Immutable stock movement ledger."
+    },
+    "/shops/{shopId}/stockAdjustments/{adjustmentId}": {
+      "schema": { "$ref": "#/entities/StockAdjustment" },
+      "description": "Manual stock adjustments."
+    },
+    "/shops/{shopId}/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Immutable audit log entries."
+    },
+    "/shops/{shopId}/backups/{backupId}": {
+      "schema": { "$ref": "#/entities/BackupRecord" },
+      "description": "Backup log records."
+    },
+    "/shops/{shopId}/integrations/{integrationId}": {
+      "schema": { "$ref": "#/entities/GoogleSheetsIntegration" },
+      "description": "Owner-only external integration configuration and sync telemetry."
+    },
+    "/shops/{shopId}/sheetsSyncQueue/{jobId}": {
+      "schema": { "$ref": "#/entities/SheetsSyncJob" },
+      "description": "Owner-only persistent retry queue for pending/failed Google Sheets synchronizations."
+    }
+  }
+}

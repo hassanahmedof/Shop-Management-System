@@ -1,0 +1,6 @@
+{
+  "name": "CareMart Shop Manager",
+  "description": "Retail shop management system for baby care, hygiene, and personal care products with sales, inventory, purchases, expenses, profit & loss, analytics, and PDF/Excel reports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -34,6 +34,8 @@ interface SearchableSelectProps {
   suggestedValues?: string[];
   maxFrequentItems?: number;
   showFrequentSection?: boolean;
+  onCreateFromQuery?: (query: string) => void;
+  createFromQueryLabel?: string;
 }
 
 function HighlightedText({ text, query }: { text: string; query: string }) {
@@ -44,7 +46,7 @@ function HighlightedText({ text, query }: { text: string; query: string }) {
         seg.match ? (
           <mark
             key={idx}
-            className="bg-amber-100 text-slate-900 rounded-xs px-0.5 font-semibold"
+            className="bg-[var(--cm-warning-soft)] text-[var(--cm-text-primary)] rounded-xs px-0.5 font-semibold"
           >
             {seg.text}
           </mark>
@@ -83,7 +85,7 @@ export function SearchableSelect({
   loading = false,
   onRefreshOptions,
   pageSize = 20,
-  debounceMs = 150,
+  debounceMs = 50,
   disabled = false,
   required = false,
   inputId,
@@ -94,6 +96,8 @@ export function SearchableSelect({
   suggestedValues,
   maxFrequentItems = 5,
   showFrequentSection = true,
+  onCreateFromQuery,
+  createFromQueryLabel = 'Add to library',
 }: SearchableSelectProps) {
   const isMobile = useIsMobileViewport();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -132,8 +136,14 @@ export function SearchableSelect({
     }
   }, [isOpen, selectedOption, emptyOptionLabel, value]);
 
-  // Debounce search text slightly for fast filtering on 500–5,000+ records
+  // Fast search debounce for smooth responsiveness on 500–5,000+ records
   useEffect(() => {
+    if (!queryText) {
+      setDebouncedQuery('');
+      setVisibleCount(pageSize);
+      setActiveIndex(0);
+      return;
+    }
     const timer = window.setTimeout(() => {
       setDebouncedQuery(queryText);
       setVisibleCount(pageSize);
@@ -318,64 +328,83 @@ export function SearchableSelect({
   const badgeToneClass = (tone?: SearchableSelectOption['badgeTone']) => {
     switch (tone) {
       case 'success':
-        return 'text-emerald-700';
+        return 'text-[var(--cm-success)]';
       case 'warning':
-        return 'text-amber-700';
+        return 'text-[var(--cm-warning)]';
       case 'danger':
-        return 'text-red-600';
+        return 'text-[var(--cm-danger)]';
       default:
-        return 'text-slate-500';
+        return 'text-[var(--cm-text-muted)]';
     }
   };
 
   const renderResultsBody = () => {
     if (isBusy && options.length === 0) {
       return (
-        <div className="p-5 flex items-center justify-center gap-2 text-xs text-slate-500">
-          <Loader2 className="w-4 h-4 animate-spin text-teal-600" />
+        <div className="p-5 flex items-center justify-center gap-2 text-xs text-[var(--cm-text-muted)]">
+          <Loader2 className="w-4 h-4 animate-spin text-[var(--cm-accent)]" />
           <span>Loading records from database...</span>
         </div>
       );
     }
 
+    const hasExactLabelMatch =
+      hasQuery &&
+      options.some((o) => o.label.trim().toLowerCase() === trimmedQuery.toLowerCase());
+
     if (matchedOptions.length === 0) {
       return (
-        <div className="p-4 text-center space-y-2">
-          <p className="text-sm font-medium text-slate-700">{noResultsMessage}</p>
+        <div className="p-4 text-center space-y-2.5">
+          <p className="text-sm font-medium text-[var(--cm-text-secondary)]">{noResultsMessage}</p>
           {hasQuery && (
-            <p className="text-xs text-slate-500">
-              No records match &ldquo;{trimmedQuery}&rdquo;. Try a shorter keyword.
+            <p className="text-xs text-[var(--cm-text-muted)]">
+              No records match &ldquo;{trimmedQuery}&rdquo;.
             </p>
           )}
-          {hasQuery && (
-            <button
-              type="button"
-              onClick={handleClear}
-              className="px-3 py-1.5 text-xs font-semibold text-teal-700 border border-teal-200 hover:bg-teal-50 rounded-lg cursor-pointer"
-            >
-              Clear Search
-            </button>
-          )}
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            {hasQuery && onCreateFromQuery && (
+              <button
+                type="button"
+                onClick={() => {
+                  const raw = trimmedQuery;
+                  setIsOpen(false);
+                  onCreateFromQuery(raw);
+                }}
+                className="px-3 py-1.5 text-xs font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer"
+              >
+                + {createFromQueryLabel}: &ldquo;{trimmedQuery}&rdquo;
+              </button>
+            )}
+            {hasQuery && (
+              <button
+                type="button"
+                onClick={handleClear}
+                className="px-3 py-1.5 text-xs font-semibold text-[var(--cm-accent-text)] border border-[var(--cm-accent-border)] hover:bg-[var(--cm-accent-soft)] rounded-lg cursor-pointer"
+              >
+                Clear Search
+              </button>
+            )}
+          </div>
         </div>
       );
     }
 
     return (
       <>
-        <div className="px-3 py-1.5 bg-slate-50 border-b border-slate-100 flex items-center justify-between text-[11px] text-slate-500 font-mono-num tabular-nums">
+        <div className="px-3 py-1.5 bg-[var(--cm-bg-subtle)] border-b border-[var(--cm-border)] flex items-center justify-between text-[11px] text-[var(--cm-text-muted)] font-mono-num tabular-nums">
           <span>
             Showing {formatNumber(paginatedOptions.length)} of {formatNumber(matchedOptions.length)}
             {hasQuery ? ' matches' : ' records'}
           </span>
           {(isBusy || isFiltering) && (
-            <span className="inline-flex items-center gap-1 text-teal-700 font-sans">
+            <span className="inline-flex items-center gap-1 text-[var(--cm-accent-text)] font-sans">
               <Loader2 className="w-3 h-3 animate-spin" />
               Searching...
             </span>
           )}
         </div>
 
-        <ul role="listbox" className="divide-y divide-slate-100">
+        <ul role="listbox" className="divide-y divide-[var(--cm-border)]">
           {paginatedOptions.map((opt, idx) => {
             const isHighlighted = idx === activeIndex;
             const isSelected = opt.value === value;
@@ -391,16 +420,16 @@ export function SearchableSelect({
                 aria-selected={isSelected}
               >
                 {showFrequentHeader && (
-                  <div className="px-3 py-1.5 bg-teal-50/50 border-b border-slate-100 flex items-center justify-between gap-2 text-[11px] font-semibold text-teal-800">
+                  <div className="px-3 py-1.5 bg-[var(--cm-accent-soft)] border-b border-[var(--cm-border)] flex items-center justify-between gap-2 text-[11px] font-semibold text-[var(--cm-accent-text)]">
                     <span className="inline-flex items-center gap-1.5">
-                      <Clock className="w-3 h-3 text-teal-600 shrink-0" />
+                      <Clock className="w-3 h-3 shrink-0" />
                       <span>Frequent Items</span>
                     </span>
-                    <span className="font-normal text-slate-500">Recent activity</span>
+                    <span className="font-normal text-[var(--cm-text-muted)]">Recent activity</span>
                   </div>
                 )}
                 {showAllHeader && (
-                  <div className="px-3 py-1.5 bg-slate-50 border-b border-slate-100 text-[11px] font-semibold text-slate-500">
+                  <div className="px-3 py-1.5 bg-[var(--cm-bg-subtle)] border-b border-[var(--cm-border)] text-[11px] font-semibold text-[var(--cm-text-muted)]">
                     All Records
                   </div>
                 )}
@@ -410,16 +439,16 @@ export function SearchableSelect({
                   onClick={() => handleSelectOption(opt)}
                   className={`w-full text-left px-3 py-2 min-h-[44px] transition-colors flex flex-col gap-0.5 cursor-pointer ${
                     opt.disabled
-                      ? 'bg-slate-50/80 opacity-65 hover:bg-slate-100'
+                      ? 'bg-[var(--cm-bg-subtle)] opacity-60 hover:bg-[var(--cm-bg-hover)]'
                       : isHighlighted
-                      ? 'bg-teal-50/80'
+                      ? 'bg-[var(--cm-accent-soft)]'
                       : isSelected
-                      ? 'bg-teal-50/40'
-                      : 'hover:bg-slate-50'
+                      ? 'bg-[var(--cm-accent-soft)]'
+                      : 'hover:bg-[var(--cm-bg-hover)]'
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <span className="text-sm font-medium text-slate-900 leading-snug flex items-center gap-1.5 min-w-0">
+                    <span className="text-sm font-medium text-[var(--cm-text-primary)] leading-snug flex items-center gap-1.5 min-w-0">
                       <span className="truncate">
                         {hasQuery ? (
                           <HighlightedText text={opt.label} query={trimmedQuery} />
@@ -427,7 +456,7 @@ export function SearchableSelect({
                           opt.label
                         )}
                       </span>
-                      {isSelected && <Check className="w-3.5 h-3.5 text-teal-600 shrink-0" />}
+                      {isSelected && <Check className="w-3.5 h-3.5 text-[var(--cm-accent-text)] shrink-0" />}
                     </span>
                     {opt.badge && (
                       <span
@@ -441,9 +470,9 @@ export function SearchableSelect({
                   </div>
 
                   {(opt.subtitle || opt.meta) && (
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-600 font-mono-num tabular-nums">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[var(--cm-text-secondary)] font-mono-num tabular-nums">
                       {opt.subtitle && (
-                        <span className="font-sans text-slate-600">
+                        <span className="font-sans text-[var(--cm-text-secondary)]">
                           {hasQuery ? (
                             <HighlightedText text={opt.subtitle} query={trimmedQuery} />
                           ) : (
@@ -452,7 +481,7 @@ export function SearchableSelect({
                         </span>
                       )}
                       {opt.subtitle && opt.meta && (
-                        <span aria-hidden="true" className="text-slate-300">
+                        <span aria-hidden="true" className="text-[var(--cm-border-strong)]">
                           |
                         </span>
                       )}
@@ -474,15 +503,34 @@ export function SearchableSelect({
         </ul>
 
         {visibleCount < matchedOptions.length && (
-          <div className="p-2 border-t border-slate-100 bg-slate-50 text-center">
+          <div className="p-2 border-t border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-center">
             <button
               type="button"
               onClick={() =>
                 setVisibleCount((prev) => Math.min(prev + pageSize, matchedOptions.length))
               }
-              className="px-3.5 py-1.5 text-xs font-semibold text-teal-700 hover:text-teal-800 bg-white border border-slate-200 rounded-lg cursor-pointer"
+              className="px-3.5 py-1.5 text-xs font-semibold text-[var(--cm-accent-text)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg cursor-pointer"
             >
               Load {Math.min(pageSize, matchedOptions.length - visibleCount)} More Results
+            </button>
+          </div>
+        )}
+
+        {hasQuery && onCreateFromQuery && !hasExactLabelMatch && (
+          <div className="p-2 border-t border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] flex items-center justify-between gap-2">
+            <span className="text-[11px] text-[var(--cm-text-muted)] truncate">
+              Not listed?
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                const raw = trimmedQuery;
+                setIsOpen(false);
+                onCreateFromQuery(raw);
+              }}
+              className="px-2.5 py-1 text-xs font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer shrink-0"
+            >
+              + {createFromQueryLabel}: &ldquo;{trimmedQuery}&rdquo;
             </button>
           </div>
         )}
@@ -519,25 +567,25 @@ export function SearchableSelect({
           disabled={disabled}
           aria-label={ariaLabel || placeholder}
           onClick={handleOpen}
-          className={`w-full ${mobileTriggerHeight} px-3 text-left bg-white border border-slate-200 hover:border-slate-300 focus:border-teal-600 rounded-lg flex items-center justify-between gap-2 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed min-w-0`}
+          className={`w-full ${mobileTriggerHeight} px-3 text-left cm-input border hover:border-[var(--cm-border-strong)] focus:border-[var(--cm-accent)] rounded-lg flex items-center justify-between gap-2 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed min-w-0`}
         >
           <span className="flex items-center gap-2 min-w-0 flex-1">
-            <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            <Search className="w-3.5 h-3.5 text-[var(--cm-text-muted)] shrink-0" />
             <span
               className={`truncate ${
                 hasRealSelection || (value === '' && emptyOptionLabel)
-                  ? 'text-slate-900 font-medium'
-                  : 'text-slate-400'
+                  ? 'text-[var(--cm-text-primary)] font-medium'
+                  : 'text-[var(--cm-text-muted)]'
               }`}
             >
               {displayClosedLabel}
             </span>
           </span>
-          <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+          <ChevronDown className="w-4 h-4 text-[var(--cm-text-muted)] shrink-0" />
         </button>
       ) : (
         <div className="relative">
-          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <Search className="w-3.5 h-3.5 text-[var(--cm-text-muted)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
           <input
             ref={desktopInputRef}
             id={inputId}
@@ -557,7 +605,7 @@ export function SearchableSelect({
             role="combobox"
             aria-expanded={isOpen}
             aria-autocomplete="list"
-            className={`w-full ${sizeClass} pl-8 pr-8 border border-slate-200 rounded-lg bg-white text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-teal-600 disabled:bg-slate-100 disabled:cursor-not-allowed`}
+            className={`w-full ${sizeClass} pl-8 pr-8 border cm-input rounded-lg focus:outline-none focus:border-[var(--cm-accent)] disabled:opacity-60 disabled:cursor-not-allowed`}
           />
 
           {(isOpen ? queryText : hasRealSelection) && (
@@ -575,7 +623,7 @@ export function SearchableSelect({
                 }
               }}
               aria-label="Clear search"
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] rounded cursor-pointer"
             >
               <X className="w-3.5 h-3.5" />
             </button>
@@ -585,9 +633,9 @@ export function SearchableSelect({
 
       {/* Desktop Popover Results */}
       {isOpen && !isMobile && (
-        <div className="absolute left-0 right-0 min-w-[260px] mt-1.5 z-40 bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
+        <div className="absolute left-0 right-0 min-w-[260px] mt-1.5 z-40 bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-xl shadow-lg overflow-hidden">
           {blockedNotice && (
-            <div className="px-3.5 py-2 bg-red-50 border-b border-red-200 text-xs font-medium text-red-700">
+            <div className="px-3.5 py-2 bg-[var(--cm-danger-soft)] border-b border-[var(--cm-danger-border)] text-xs font-medium text-[var(--cm-danger)]">
               {blockedNotice}
             </div>
           )}
@@ -600,12 +648,12 @@ export function SearchableSelect({
       {/* Mobile Full-Screen Searchable Picker */}
       {isOpen && isMobile && (
         <div
-          className="fixed inset-0 z-50 bg-white flex flex-col"
+          className="fixed inset-0 z-50 bg-[var(--cm-bg-surface)] flex flex-col"
           role="dialog"
           aria-modal="true"
           aria-label={ariaLabel || placeholder}
         >
-          <div className="p-3 border-b border-slate-200 bg-white flex items-center gap-2 shrink-0">
+          <div className="p-3 border-b border-[var(--cm-border)] bg-[var(--cm-bg-surface)] flex items-center gap-2 shrink-0">
             <button
               type="button"
               onClick={() => {
@@ -613,13 +661,13 @@ export function SearchableSelect({
                 setBlockedNotice(null);
               }}
               aria-label="Close selector"
-              className="min-w-[44px] min-h-[44px] flex items-center justify-center text-slate-600 hover:text-slate-900 rounded-lg cursor-pointer"
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)] rounded-lg cursor-pointer"
             >
               <ArrowLeft className="w-5 h-5" />
             </button>
 
             <div className="relative flex-1 min-w-0">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <Search className="w-4 h-4 text-[var(--cm-text-muted)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 ref={mobileInputRef}
                 type="text"
@@ -631,14 +679,14 @@ export function SearchableSelect({
                 onKeyDown={handleKeyDown}
                 placeholder={searchPlaceholder}
                 autoComplete="off"
-                className="w-full min-h-[44px] pl-9 pr-10 py-2 text-sm border border-slate-200 rounded-lg bg-slate-50 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:border-teal-600"
+                className="w-full min-h-[44px] pl-9 pr-10 py-2 text-sm border cm-input rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
               />
               {queryText && (
                 <button
                   type="button"
                   onClick={handleClear}
                   aria-label="Clear search"
-                  className="absolute right-1.5 top-1/2 -translate-y-1/2 min-w-[36px] min-h-[36px] flex items-center justify-center text-slate-400 hover:text-slate-700 rounded-md cursor-pointer"
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 min-w-[36px] min-h-[36px] flex items-center justify-center text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] rounded-md cursor-pointer"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -647,12 +695,12 @@ export function SearchableSelect({
           </div>
 
           {blockedNotice && (
-            <div className="px-4 py-2.5 bg-red-50 border-b border-red-200 text-xs font-medium text-red-700 shrink-0">
+            <div className="px-4 py-2.5 bg-[var(--cm-danger-soft)] border-b border-[var(--cm-danger-border)] text-xs font-medium text-[var(--cm-danger)] shrink-0">
               {blockedNotice}
             </div>
           )}
 
-          <div onScroll={handleResultsScroll} className="flex-1 overflow-y-auto bg-white">
+          <div onScroll={handleResultsScroll} className="flex-1 overflow-y-auto bg-[var(--cm-bg-surface)]">
             {renderResultsBody()}
           </div>
         </div>

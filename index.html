@@ -15,6 +15,22 @@
     />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#f3f8f2" />
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('cm_theme_mode');
+          if (t === 'dark') {
+            document.documentElement.classList.add('dark');
+            document.documentElement.dataset.theme = 'dark';
+            var m = document.querySelector('meta[name="theme-color"]');
+            if (m) m.setAttribute('content', '#0b120d');
+          } else {
+            document.documentElement.dataset.theme = 'light';
+          }
+        } catch (e) {}
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -22,7 +38,7 @@
       rel="stylesheet"
     />
   </head>
-  <body class="bg-slate-50 text-slate-900 antialiased selection:bg-teal-100 selection:text-teal-900">
+  <body class="antialiased selection:bg-lime-500/25 selection:text-lime-900 dark:selection:text-lime-200">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

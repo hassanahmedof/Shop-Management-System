@@ -57,6 +57,8 @@ export interface Brand {
   id: string;
   ownerUid: string;
   name: string;
+  categoryIds?: string[];
+  isActive?: boolean;
   createdAt?: Timestamp;
   updatedAt?: Timestamp;
 }
@@ -79,7 +81,9 @@ export type OriginType = '' | 'local' | 'imported';
 
 export interface ProductPackagingUnit {
   unitName: string;
-  conversionQty: number; // Number of base units in 1 of this unit
+  conversionQty: number; // Cumulative number of smallest base stock units in 1 of this unit
+  containsQty?: number; // Quantity of parentUnitName contained in 1 of this package
+  parentUnitName?: string; // Immediately smaller unit name (baseUnit or another level)
   allowPurchase: boolean;
   allowSale: boolean;
   purchasePrice: number;
@@ -92,6 +96,8 @@ export interface ProductPackagingUnit {
 export interface StaffPackagingOption {
   unitName: string;
   conversionQty: number;
+  containsQty?: number;
+  parentUnitName?: string;
   allowSale: boolean;
   salePrice: number;
   wholesalePrice: number;
@@ -156,6 +162,50 @@ export interface Product {
   updatedAt?: Timestamp;
 }
 
+export interface ProductTemplatePackaging {
+  unitName: string;
+  containsQty: number;
+  parentUnitName: string;
+  conversionQty: number;
+  allowPurchase: boolean;
+  allowSale: boolean;
+  isDefaultPurchase?: boolean;
+  isDefaultSale?: boolean;
+  needsConfirmation?: boolean;
+}
+
+export interface ProductTemplate {
+  id: string;
+  ownerUid: string;
+  name: string;
+  categoryId: string;
+  categoryName: string;
+  brandId: string;
+  brandName: string;
+  variant: string;
+  originType?: OriginType;
+  baseUnit: string;
+  defaultPurchaseUnit?: string;
+  defaultSaleUnit?: string;
+  packagingUnits?: ProductTemplatePackaging[];
+  hasUnconfirmedPackaging?: boolean;
+  suggestedPurchasePrice?: number;
+  suggestedSalePrice?: number;
+  suggestedWholesalePrice?: number;
+  priceSource?: string;
+  priceUpdatedAt?: string;
+  trackExpiry?: boolean;
+  bottleSize?: string;
+  storageLocation?: string;
+  isReturnable?: boolean;
+  returnableUnitName?: string;
+  searchKeywords?: string[];
+  isActive: boolean;
+  isCustom?: boolean;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
 export interface Sale {
   id: string;
   ownerUid: string;
@@ -171,6 +221,7 @@ export interface Sale {
   staffId?: string;
   staffName?: string;
   recordedByRole?: 'owner' | 'staff';
+  customerWhatsapp?: string;
   notes: string;
   status: TransactionStatus;
   createdAt?: Timestamp;
@@ -279,6 +330,10 @@ export interface StockMovement {
   quantityChange: number;
   previousStock: number;
   newStock: number;
+  unitName?: string;
+  unitQuantity?: number;
+  conversionFactor?: number;
+  baseQuantity?: number;
   referenceId: string;
   notes: string;
   createdAt?: Timestamp;
@@ -292,6 +347,10 @@ export interface StockAdjustment {
   adjustmentDate: string; // YYYY-MM-DD
   adjustmentType: AdjustmentType;
   quantity: number;
+  unitName?: string;
+  unitQuantity?: number;
+  conversionFactor?: number;
+  baseQuantity?: number;
   reason: string;
   notes: string;
   previousStock: number;
@@ -407,8 +466,17 @@ export interface StaffCatalogItem {
   categoryName: string;
   brandName: string;
   salePrice: number;
+  wholesalePrice?: number;
   currentStock: number;
   unit: string;
+  baseUnit?: string;
+  packagingUnits?: StaffPackagingOption[];
+  originType?: OriginType;
+  bottleSize?: string;
+  storageLocation?: string;
+  isReturnable?: boolean;
+  returnableUnitName?: string;
+  depositPerReturnable?: number;
   isActive: boolean;
   allowedStaffUids: string[];
   updatedAt?: Timestamp;
@@ -418,6 +486,10 @@ export interface StaffSaleLine {
   productId: string;
   productName: string;
   quantity: number;
+  unitName?: string;
+  unitQuantity?: number;
+  conversionFactor?: number;
+  baseQuantity?: number;
   salePricePerUnit: number;
   lineTotal: number;
 }
@@ -438,6 +510,7 @@ export interface StaffSale {
   staffAuthUid: string;
   staffName: string;
   staffUsername: string;
+  customerWhatsapp?: string;
   notes: string;
   status: TransactionStatus;
   syncedToLedger: boolean;

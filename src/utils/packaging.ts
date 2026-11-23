@@ -17,7 +17,8 @@ export const DEFAULT_PRODUCT_CATEGORIES: Array<{
   {
     id: 'cat_baby_care',
     name: 'Baby Care',
-    description: 'Baby bath, oils, powders, feeding accessories, and skincare',
+    description:
+      'Baby oils, lotions, shampoos, powders, rash creams, bath products and baby skincare.',
   },
   {
     id: 'cat_diapers',
@@ -31,13 +32,9 @@ export const DEFAULT_PRODUCT_CATEGORIES: Array<{
   },
   {
     id: 'cat_personal_care',
-    name: 'Personal Care',
-    description: 'Soaps, body washes, deodorants, oral care, and grooming',
-  },
-  {
-    id: 'cat_shampoo_lotion',
-    name: 'Shampoo & Lotion',
-    description: 'Hair shampoos, conditioners, body lotions, and creams',
+    name: 'Personal Care & Toiletries',
+    description:
+      'Shampoo, conditioners, hair oils, lotions, creams, soaps, body washes, deodorants, toothpaste, toothbrushes, face wash, shaving products and grooming products.',
   },
   {
     id: 'cat_tissues',
@@ -46,18 +43,20 @@ export const DEFAULT_PRODUCT_CATEGORIES: Array<{
   },
   {
     id: 'cat_hygiene',
-    name: 'Hygiene Products',
-    description: 'Sanitary pads, adult diapers, sanitizers, cotton buds, and antiseptics',
+    name: 'Hygiene & Sanitary',
+    description:
+      'Sanitary pads, panty liners, adult diapers, hand sanitizers, cotton buds, cotton pads, antiseptics and personal hygiene products.',
+  },
+  {
+    id: 'cat_sexual_wellness',
+    name: 'Sexual Wellness',
+    description:
+      'Condoms, lubricants, personal intimacy gels and other commonly stocked intimate wellness products.',
   },
   {
     id: 'cat_household_cleaning',
     name: 'Household Cleaning',
     description: 'Detergents, dishwashing liquids, floor cleaners, and disinfectants',
-  },
-  {
-    id: 'cat_snacks',
-    name: 'Snacks & Confectionery',
-    description: 'Biscuits, chips, chocolates, candies, and packaged snacks',
   },
   {
     id: 'cat_cold_drinks',
@@ -70,9 +69,9 @@ export const DEFAULT_PRODUCT_CATEGORIES: Array<{
     description: 'Mineral water bottles, fruit juices, flavored milk, and tetra packs',
   },
   {
-    id: 'cat_imported',
-    name: 'Imported Products',
-    description: 'Imported baby care, toiletries, cosmetics, snacks, and beverages',
+    id: 'cat_snacks',
+    name: 'Snacks & Confectionery',
+    description: 'Biscuits, chips, chocolates, candies, and packaged snacks',
   },
   {
     id: 'cat_other',
@@ -80,6 +79,77 @@ export const DEFAULT_PRODUCT_CATEGORIES: Array<{
     description: 'General retail, seasonal items, and miscellaneous store goods',
   },
 ];
+
+export const CATEGORY_MERGE_RULES: ReadonlyArray<{
+  canonicalId: string;
+  canonicalName: string;
+  description: string;
+  aliases: readonly string[];
+  legacyIds?: readonly string[];
+}> = [
+  {
+    canonicalId: 'cat_baby_care',
+    canonicalName: 'Baby Care',
+    description:
+      'Baby oils, lotions, shampoos, powders, rash creams, bath products and baby skincare.',
+    aliases: ['baby care', 'baby bath & skincare', 'baby bath and skincare'],
+  },
+  {
+    canonicalId: 'cat_personal_care',
+    canonicalName: 'Personal Care & Toiletries',
+    description:
+      'Shampoo, conditioners, hair oils, lotions, creams, soaps, body washes, deodorants, toothpaste, toothbrushes, face wash, shaving products and grooming products.',
+    aliases: [
+      'personal care & toiletries',
+      'personal care and toiletries',
+      'personal care',
+      'shampoo & lotion',
+      'shampoo and lotion',
+    ],
+    legacyIds: ['cat_shampoo_lotion'],
+  },
+  {
+    canonicalId: 'cat_hygiene',
+    canonicalName: 'Hygiene & Sanitary',
+    description:
+      'Sanitary pads, panty liners, adult diapers, hand sanitizers, cotton buds, cotton pads, antiseptics and personal hygiene products.',
+    aliases: ['hygiene & sanitary', 'hygiene and sanitary', 'hygiene products'],
+  },
+];
+
+export function normalizeCategoryKey(name: string): string {
+  return name.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+export function isImportedCategoryName(name: string): boolean {
+  return normalizeCategoryKey(name) === 'imported products';
+}
+
+export function resolveCanonicalCategoryName(name: string): string {
+  const key = normalizeCategoryKey(name);
+  for (const rule of CATEGORY_MERGE_RULES) {
+    if (rule.aliases.includes(key)) {
+      return rule.canonicalName;
+    }
+  }
+  const defMatch = DEFAULT_PRODUCT_CATEGORIES.find((d) => normalizeCategoryKey(d.name) === key);
+  return defMatch ? defMatch.name : name.trim().replace(/\s+/g, ' ');
+}
+
+const DEFAULT_CATEGORY_ORDER = new Map<string, number>(
+  DEFAULT_PRODUCT_CATEGORIES.map((c, idx) => [normalizeCategoryKey(c.name), idx])
+);
+
+export function sortCategoriesForDisplay<T extends { id: string; name: string }>(list: T[]): T[] {
+  return [...list].sort((a, b) => {
+    const idxA = DEFAULT_CATEGORY_ORDER.get(normalizeCategoryKey(a.name));
+    const idxB = DEFAULT_CATEGORY_ORDER.get(normalizeCategoryKey(b.name));
+    if (idxA !== undefined && idxB !== undefined) return idxA - idxB;
+    if (idxA !== undefined) return -1;
+    if (idxB !== undefined) return 1;
+    return a.name.localeCompare(b.name);
+  });
+}
 
 export const STANDARD_UNITS = [
   'Piece',
@@ -118,6 +188,35 @@ const FRACTIONAL_UNIT_SET = new Set([
   'ml',
 ]);
 
+export const MAX_PACKAGING_LEVELS = 25;
+
+const UNCHANGED_PLURAL_UNITS = new Set([
+  'dozen',
+  'kilogram',
+  'kg',
+  'gram',
+  'g',
+  'litre',
+  'l',
+  'millilitre',
+  'ml',
+]);
+
+const CUSTOM_PLURALS: Record<string, string> = {
+  box: 'Boxes',
+  sachet: 'Sachets',
+};
+
+export function pluralizeUnit(unit: string, count: number): string {
+  const clean = (unit || 'Piece').trim() || 'Piece';
+  if (Math.abs(count) === 1) return clean;
+  const lower = clean.toLowerCase();
+  if (UNCHANGED_PLURAL_UNITS.has(lower)) return clean;
+  if (CUSTOM_PLURALS[lower]) return CUSTOM_PLURALS[lower];
+  if (/(?:s|sh|ch|x|z)$/i.test(clean)) return `${clean}es`;
+  return `${clean}s`;
+}
+
 export function roundStockQty(val: number): number {
   if (!Number.isFinite(val)) return 0;
   return Math.round((val + Number.EPSILON) * 1000) / 1000;
@@ -134,13 +233,156 @@ export function getEffectiveBaseUnit(
   return candidate || 'Piece';
 }
 
+export interface HierarchyLevelInput {
+  unitName: string;
+  containsQty?: number;
+  parentUnitName?: string;
+  conversionQty?: number;
+}
+
+/**
+ * Resolves cumulative conversionQty (smallest stock units per 1 package) across sequential hierarchy links.
+ * Safe against cycles or out-of-order entries; falls back cleanly to baseUnit if parent is missing.
+ */
+export function resolveCumulativeConversion(
+  levels: HierarchyLevelInput[],
+  baseUnit: string
+): Map<string, { conversionQty: number; containsQty: number; parentUnitName: string }> {
+  const cleanBase = baseUnit.trim() || 'Piece';
+  const baseLower = cleanBase.toLowerCase();
+  const byLower = new Map<string, HierarchyLevelInput>();
+
+  for (const lvl of levels) {
+    const name = (lvl.unitName || '').trim();
+    if (!name || name.toLowerCase() === baseLower) continue;
+    if (!byLower.has(name.toLowerCase())) {
+      byLower.set(name.toLowerCase(), lvl);
+    }
+  }
+
+  const memo = new Map<string, number>();
+  const resolved = new Map<
+    string,
+    { conversionQty: number; containsQty: number; parentUnitName: string }
+  >();
+
+  const computeBaseFactor = (unitLower: string, visiting: Set<string>): number => {
+    if (unitLower === baseLower) return 1;
+    if (memo.has(unitLower)) return memo.get(unitLower)!;
+    if (visiting.has(unitLower)) return 0; // Cycle guard
+
+    const node = byLower.get(unitLower);
+    if (!node) return 0;
+
+    visiting.add(unitLower);
+    const contains = roundStockQty(Number(node.containsQty) || 0);
+    const parentName = (node.parentUnitName || cleanBase).trim() || cleanBase;
+    const parentLower = parentName.toLowerCase();
+
+    let factor = 0;
+    if (contains > 0) {
+      if (parentLower === baseLower) {
+        factor = contains;
+      } else {
+        const parentFactor = computeBaseFactor(parentLower, visiting);
+        factor = parentFactor > 0 ? roundStockQty(contains * parentFactor) : contains;
+      }
+    } else {
+      factor = roundStockQty(Number(node.conversionQty) || 0);
+    }
+
+    visiting.delete(unitLower);
+    if (factor > 0) memo.set(unitLower, factor);
+    return factor;
+  };
+
+  for (const lvl of levels) {
+    const name = (lvl.unitName || '').trim();
+    const lower = name.toLowerCase();
+    if (!name || lower === baseLower || resolved.has(lower)) continue;
+
+    const factor = computeBaseFactor(lower, new Set());
+    if (factor <= 0) continue;
+
+    const rawContains = roundStockQty(Number(lvl.containsQty) || 0);
+    const rawParent = (lvl.parentUnitName || cleanBase).trim() || cleanBase;
+    const validParent =
+      rawParent.toLowerCase() === baseLower || byLower.has(rawParent.toLowerCase())
+        ? rawParent
+        : cleanBase;
+
+    resolved.set(lower, {
+      conversionQty: factor,
+      containsQty: rawContains > 0 ? rawContains : factor,
+      parentUnitName: rawContains > 0 ? validParent : cleanBase,
+    });
+  }
+
+  return resolved;
+}
+
+/**
+ * Hydrates legacy packaging units (which may only store cumulative conversionQty) into
+ * ordered, human-friendly sequential hierarchy rows without altering cumulative conversionQty.
+ */
+export function hydrateHierarchicalPackaging(
+  units: ProductPackagingUnit[] | undefined | null,
+  baseUnit: string
+): ProductPackagingUnit[] {
+  if (!Array.isArray(units) || units.length === 0) return [];
+  const cleanBase = baseUnit.trim() || 'Piece';
+
+  const valid = units
+    .filter((u) => u && (u.unitName || '').trim() && Number(u.conversionQty) > 0)
+    .map((u) => ({ ...u }))
+    .sort((a, b) => Number(a.conversionQty) - Number(b.conversionQty));
+
+  const out: ProductPackagingUnit[] = [];
+  for (let i = 0; i < valid.length; i += 1) {
+    const u = valid[i];
+    const conv = roundStockQty(Number(u.conversionQty) || 0);
+    let containsQty = roundStockQty(Number(u.containsQty) || 0);
+    let parentUnitName = (u.parentUnitName || '').trim();
+
+    if (!(containsQty > 0 && parentUnitName)) {
+      // Infer clean parent relationship from smaller levels if exact integer ratio (> 1)
+      let inferredParent = cleanBase;
+      let inferredContains = conv;
+      for (let j = out.length - 1; j >= 0; j -= 1) {
+        const smaller = out[j];
+        if (smaller.conversionQty > 1 && conv > smaller.conversionQty) {
+          const ratio = conv / smaller.conversionQty;
+          if (Math.abs(ratio - Math.round(ratio)) < 0.0005 && Math.round(ratio) > 1) {
+            inferredParent = smaller.unitName;
+            inferredContains = Math.round(ratio);
+            break;
+          }
+        }
+      }
+      containsQty = inferredContains;
+      parentUnitName = inferredParent;
+    }
+
+    out.push({
+      ...u,
+      conversionQty: conv,
+      containsQty,
+      parentUnitName,
+    });
+  }
+
+  return out;
+}
+
 export function normalizePackagingUnits(
   units: ProductPackagingUnit[] | undefined | null,
   baseUnit: string
 ): ProductPackagingUnit[] {
   if (!Array.isArray(units)) return [];
-  const baseLower = baseUnit.trim().toLowerCase();
+  const cleanBase = baseUnit.trim() || 'Piece';
+  const baseLower = cleanBase.toLowerCase();
   const seen = new Set<string>();
+  const hierarchyResolved = resolveCumulativeConversion(units, cleanBase);
   const cleaned: ProductPackagingUnit[] = [];
 
   for (const raw of units) {
@@ -149,11 +391,14 @@ export function normalizePackagingUnits(
     const lower = unitName.toLowerCase();
     if (lower === baseLower || seen.has(lower)) continue;
 
-    const conversionQty = roundStockQty(Number(raw?.conversionQty) || 0);
+    const resolvedInfo = hierarchyResolved.get(lower);
+    const conversionQty = resolvedInfo
+      ? resolvedInfo.conversionQty
+      : roundStockQty(Number(raw?.conversionQty) || 0);
     if (conversionQty <= 0) continue;
 
     seen.add(lower);
-    cleaned.push({
+    const entry: ProductPackagingUnit = {
       unitName,
       conversionQty,
       allowPurchase: raw?.allowPurchase !== false,
@@ -163,8 +408,17 @@ export function normalizePackagingUnits(
       wholesalePrice: Math.max(0, roundMoney(Number(raw?.wholesalePrice) || 0)),
       isDefaultPurchase: Boolean(raw?.isDefaultPurchase),
       isDefaultSale: Boolean(raw?.isDefaultSale),
-    });
-    if (cleaned.length >= 10) break;
+    };
+
+    const containsQty = resolvedInfo?.containsQty ?? roundStockQty(Number(raw?.containsQty) || 0);
+    const parentName = (resolvedInfo?.parentUnitName || raw?.parentUnitName || cleanBase).trim();
+    if (containsQty > 0) {
+      entry.containsQty = containsQty;
+      entry.parentUnitName = parentName.slice(0, 40);
+    }
+
+    cleaned.push(entry);
+    if (cleaned.length >= MAX_PACKAGING_LEVELS) break;
   }
 
   return cleaned;
@@ -188,15 +442,21 @@ export function toStaffPackagingUnits(
     if (conversionQty <= 0 || u?.allowSale === false) continue;
 
     seen.add(lower);
-    out.push({
+    const opt: StaffPackagingOption = {
       unitName,
       conversionQty,
       allowSale: true,
       salePrice: Math.max(0, roundMoney(Number(u.salePrice) || 0)),
       wholesalePrice: Math.max(0, roundMoney(Number(u.wholesalePrice) || 0)),
       isDefaultSale: Boolean(u.isDefaultSale),
-    });
-    if (out.length >= 10) break;
+    };
+    const containsQty = roundStockQty(Number(u.containsQty) || 0);
+    if (containsQty > 0 && u.parentUnitName) {
+      opt.containsQty = containsQty;
+      opt.parentUnitName = u.parentUnitName.trim().slice(0, 40);
+    }
+    out.push(opt);
+    if (out.length >= MAX_PACKAGING_LEVELS) break;
   }
 
   return out;
@@ -331,6 +591,7 @@ export function getDefaultPurchaseUnit(
 export interface StockBreakdown {
   totalBase: number;
   baseUnit: string;
+  totalLabel: string;
   fullPackages: number;
   packageUnit: string | null;
   packageConversionQty: number;
@@ -349,7 +610,7 @@ export function formatStockBreakdown(
 ): StockBreakdown {
   const totalBase = roundStockQty(Math.max(0, Number(currentStock) || 0));
   const baseUnit = getEffectiveBaseUnit(item);
-  const totalLabel = `${formatNumber(totalBase)} ${baseUnit}`;
+  const totalLabel = `${formatNumber(totalBase)} ${pluralizeUnit(baseUnit, totalBase)}`;
 
   const rawPkgs = Array.isArray(item.packagingUnits) ? item.packagingUnits : [];
   const multiPkgs = rawPkgs
@@ -360,6 +621,7 @@ export function formatStockBreakdown(
     return {
       totalBase,
       baseUnit,
+      totalLabel,
       fullPackages: 0,
       packageUnit: null,
       packageConversionQty: 1,
@@ -369,30 +631,45 @@ export function formatStockBreakdown(
     };
   }
 
-  // Pick the highest conversion package that yields >= 1 full pack, else the primary largest pack
-  const matchingPkg =
-    multiPkgs.find((p) => totalBase >= Number(p.conversionQty)) || multiPkgs[0];
-  const conv = roundStockQty(Number(matchingPkg.conversionQty));
-  const fullPackages = Math.floor(totalBase / conv);
-  const remainderLoose = roundStockQty(Math.max(0, totalBase - fullPackages * conv));
+  // Primary matching package (highest level that fits at least once, else smallest package > 1)
+  const primaryPkg =
+    multiPkgs.find((p) => totalBase >= Number(p.conversionQty)) || multiPkgs[multiPkgs.length - 1];
+  const primaryConv = roundStockQty(Number(primaryPkg.conversionQty));
+  const fullPackages = Math.floor(totalBase / primaryConv);
+  const primaryRemainder = roundStockQty(Math.max(0, totalBase - fullPackages * primaryConv));
+
+  // Greedy multi-level breakdown across configured hierarchy
+  let rem = totalBase;
+  const fullParts: string[] = [];
+  for (const pkg of multiPkgs) {
+    const conv = roundStockQty(Number(pkg.conversionQty));
+    if (conv <= 1) continue;
+    const count = Math.floor((rem + 1e-9) / conv);
+    if (count > 0) {
+      fullParts.push(`${formatNumber(count)} Full ${pluralizeUnit(pkg.unitName, count)}`);
+      rem = roundStockQty(Math.max(0, rem - count * conv));
+    }
+  }
 
   let packageBreakdownText = '';
-  if (fullPackages > 0 && remainderLoose > 0) {
-    packageBreakdownText = `${formatNumber(fullPackages)} ${matchingPkg.unitName} (${formatNumber(conv)}) + ${formatNumber(remainderLoose)} loose`;
-  } else if (fullPackages > 0) {
-    packageBreakdownText = `${formatNumber(fullPackages)} ${matchingPkg.unitName} (${formatNumber(conv)})`;
+  if (fullParts.length > 0 && rem > 0) {
+    packageBreakdownText = `${fullParts.join(', ')} + ${formatNumber(rem)} ${pluralizeUnit(baseUnit, rem)}`;
+  } else if (fullParts.length > 0) {
+    packageBreakdownText = fullParts.join(', ');
   } else if (totalBase > 0) {
-    packageBreakdownText = `${formatNumber(totalBase)} loose ${baseUnit} (< 1 ${matchingPkg.unitName})`;
+    const smallestPkg = multiPkgs[multiPkgs.length - 1];
+    packageBreakdownText = `${formatNumber(totalBase)} loose (< 1 ${smallestPkg.unitName})`;
   }
 
   return {
     totalBase,
     baseUnit,
+    totalLabel,
     fullPackages,
-    packageUnit: matchingPkg.unitName,
-    packageConversionQty: conv,
-    remainderLoose,
-    summaryText: packageBreakdownText ? `${totalLabel} · ${packageBreakdownText}` : totalLabel,
+    packageUnit: primaryPkg.unitName,
+    packageConversionQty: primaryConv,
+    remainderLoose: primaryRemainder,
+    summaryText: packageBreakdownText ? `${totalLabel} (${packageBreakdownText})` : totalLabel,
     packageBreakdownText,
   };
 }

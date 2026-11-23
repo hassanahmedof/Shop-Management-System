@@ -4,12 +4,19 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import {
   isNetworkOrOfflineError,
+  loadCachedOwnerCatalog,
   loadCachedStaffCatalog,
   loadCachedStaffSales,
+  saveCachedOwnerCatalog,
   saveCachedStaffCatalog,
   saveCachedStaffSales,
 } from '../services/offlineSyncService';
-import { recordBackupSnapshot } from '../services/shopService';
+import {
+  ensureDefaultBrands,
+  ensureDefaultCategories,
+  ensureDefaultProductTemplates,
+  recordBackupSnapshot,
+} from '../services/shopService';
 import {
   ensureUsernameStaffLookupIndexes,
   getCatalogAllowedUids,
@@ -24,7 +31,9 @@ import type {
   Category,
   Expense,
   ExpenseCategory,
+  InventoryBatch,
   Product,
+  ProductTemplate,
   Purchase,
   PurchaseItem,
   Sale,
@@ -38,6 +47,7 @@ import type {
   Supplier,
 } from '../types/shop';
 import { getKarachiDateIso } from '../utils/formatters';
+import { sortCategoriesForDisplay } from '../utils/packaging';
 import { useAuth } from './AuthContext';
 
 interface ShopDataContextValue {
@@ -46,6 +56,7 @@ interface ShopDataContextValue {
   brands: Brand[];
   suppliers: Supplier[];
   products: Product[];
+  productTemplates: ProductTemplate[];
   sales: Sale[];
   saleItems: SaleItem[];
   purchases: Purchase[];
@@ -54,6 +65,7 @@ interface ShopDataContextValue {
   expenses: Expense[];
   stockMovements: StockMovement[];
   stockAdjustments: StockAdjustment[];
+  inventoryBatches: InventoryBatch[];
   auditLogs: AuditLog[];
   backups: BackupRecord[];
   staffMembers: StaffMember[];
@@ -79,6 +91,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   const [brands, setBrands] = useState<Brand[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
+  const [productTemplates, setProductTemplates] = useState<ProductTemplate[]>([]);
   const [sales, setSales] = useState<Sale[]>([]);
   const [saleItems, setSaleItems] = useState<SaleItem[]>([]);
   const [purchases, setPurchases] = useState<Purchase[]>([]);
@@ -87,6 +100,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [stockMovements, setStockMovements] = useState<StockMovement[]>([]);
   const [stockAdjustments, setStockAdjustments] = useState<StockAdjustment[]>([]);
+  const [inventoryBatches, setInventoryBatches] = useState<InventoryBatch[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [backups, setBackups] = useState<BackupRecord[]>([]);
   const [staffMembers, setStaffMembers] = useState<StaffMember[]>([]);
@@ -94,15 +108,26 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   const [staffCatalog, setStaffCatalog] = useState<StaffCatalogItem[]>([]);
   const [staffSales, setStaffSales] = useState<StaffSale[]>([]);
   const [loading, setLoading] = useState(true);
+  const [liveListenersSettled, setLiveListenersSettled] = useState(false);
 
   const autoBackupAttemptedRef = useRef<string>('');
+  const defaultCatsCheckedRef = useRef<string>('');
   const catalogSyncSigRef = useRef<string>('');
   const lookupBackfillSigRef = useRef<string>('');
   const reconcilingIdsRef = useRef<Set<string>>(new Set());
+  const ownerCacheSaveTimerRef = useRef<number | null>(null);
+  const cachedOwnerCatalogRef = useRef<{
+    shopId: string;
+    hasCategories: boolean;
+    hasBrands: boolean;
+    hasProducts: boolean;
+    hasTemplates: boolean;
+  } | null>(null);
 
   useEffect(() => {
     if (!user || !shopId || !sessionRole || initializingShop || !shopReady) {
       setLoading(true);
+      setLiveListenersSettled(false);
       return;
     }
 
@@ -113,6 +138,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       setBrands([]);
       setSuppliers([]);
       setProducts([]);
+      setProductTemplates([]);
       setSales([]);
       setSaleItems([]);
       setPurchases([]);
@@ -121,6 +147,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       setExpenses([]);
       setStockMovements([]);
       setStockAdjustments([]);
+      setInventoryBatches([]);
       setAuditLogs([]);
       setBackups([]);
       setStaffMembers([]);
@@ -156,7 +183,10 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
         cachedSales.length > 0
       ) {
         setLoading(false);
-        if (expected === 0) return;
+        if (expected === 0) {
+          setLiveListenersSettled(true);
+          return;
+        }
       }
 
       let settled = 0;
@@ -164,6 +194,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
         settled += 1;
         if (settled >= expected) {
           setLoading(false);
+          setLiveListenersSettled(true);
         }
       };
 
@@ -258,23 +289,66 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
 
     if (sessionRole !== 'owner') {
       setLoading(false);
+      setLiveListenersSettled(true);
       return;
     }
 
-    // Owner Workspace Subscriptions
+    // Owner Workspace Subscriptions + Offline-First Permanent Catalog Warm-Start
     const uid = shopId;
+    setLiveListenersSettled(false);
+
+    const cachedCatalog = loadCachedOwnerCatalog(uid);
+    cachedOwnerCatalogRef.current = cachedCatalog
+      ? {
+          shopId: uid,
+          hasCategories: cachedCatalog.categories.length > 0,
+          hasBrands: cachedCatalog.brands.length > 0,
+          hasProducts: cachedCatalog.products.length > 0,
+          hasTemplates: cachedCatalog.productTemplates.length > 0,
+        }
+      : null;
+
+    if (cachedCatalog) {
+      if (cachedCatalog.categories.length > 0) {
+        setCategories(sortCategoriesForDisplay(cachedCatalog.categories));
+      }
+      if (cachedCatalog.brands.length > 0) {
+        setBrands(cachedCatalog.brands);
+      }
+      if (cachedCatalog.products.length > 0) {
+        setProducts(cachedCatalog.products);
+      }
+      if (cachedCatalog.productTemplates.length > 0) {
+        setProductTemplates(cachedCatalog.productTemplates);
+      }
+      // Instant UI readiness when permanent catalog cache exists (live listeners keep syncing)
+      if (
+        cachedCatalog.categories.length > 0 ||
+        cachedCatalog.brands.length > 0 ||
+        cachedCatalog.products.length > 0
+      ) {
+        setLoading(false);
+      }
+    }
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setLoading(false);
+    }
+
     let settledCount = 0;
-    const totalListeners = 19;
+    const totalListeners = 20;
     const markSettled = () => {
       settledCount += 1;
       if (settledCount >= totalListeners) {
         setLoading(false);
+        setLiveListenersSettled(true);
       }
     };
 
     const listenList = <T extends { id: string }>(
       colName: string,
-      setter: (items: T[]) => void
+      setter: (items: T[]) => void,
+      options?: { protectEmptyOfflineCache?: boolean }
     ) => {
       const path = `shops/${uid}/${colName}`;
       const q = query(collection(db, 'shops', uid, colName), where('ownerUid', '==', uid));
@@ -282,15 +356,27 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       return onSnapshot(
         q,
         (snap) => {
-          setter(
-            snap.docs.map((d) => ({ ...(d.data() as Omit<T, 'id'>), id: d.id }) as T)
-          );
+          const isEmptyOfflineCache =
+            options?.protectEmptyOfflineCache &&
+            snap.empty &&
+            snap.metadata.fromCache &&
+            typeof navigator !== 'undefined' &&
+            !navigator.onLine;
+          if (!isEmptyOfflineCache) {
+            setter(
+              snap.docs.map((d) => ({ ...(d.data() as Omit<T, 'id'>), id: d.id }) as T)
+            );
+          }
           if (first) {
             first = false;
             markSettled();
           }
         },
         (error) => {
+          if (isNetworkOrOfflineError(error)) {
+            setLoading(false);
+            return;
+          }
           handleFirestoreError(error, OperationType.LIST, path);
         }
       );
@@ -310,16 +396,31 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
         }
       },
       (error) => {
+        if (isNetworkOrOfflineError(error)) {
+          setLoading(false);
+          return;
+        }
         handleFirestoreError(error, OperationType.GET, settingsPath);
       }
     );
 
     const unsubs = [
       unsubSettings,
-      listenList<Category>('categories', setCategories),
-      listenList<Brand>('brands', setBrands),
+      listenList<Category>(
+        'categories',
+        (cats) => setCategories(sortCategoriesForDisplay(cats)),
+        { protectEmptyOfflineCache: Boolean(cachedOwnerCatalogRef.current?.hasCategories) }
+      ),
+      listenList<Brand>('brands', setBrands, {
+        protectEmptyOfflineCache: Boolean(cachedOwnerCatalogRef.current?.hasBrands),
+      }),
       listenList<Supplier>('suppliers', setSuppliers),
-      listenList<Product>('products', setProducts),
+      listenList<Product>('products', setProducts, {
+        protectEmptyOfflineCache: Boolean(cachedOwnerCatalogRef.current?.hasProducts),
+      }),
+      listenList<ProductTemplate>('productTemplates', setProductTemplates, {
+        protectEmptyOfflineCache: Boolean(cachedOwnerCatalogRef.current?.hasTemplates),
+      }),
       listenList<Sale>('sales', setSales),
       listenList<SaleItem>('saleItems', setSaleItems),
       listenList<Purchase>('purchases', setPurchases),
@@ -328,6 +429,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       listenList<Expense>('expenses', setExpenses),
       listenList<StockMovement>('stockMovements', setStockMovements),
       listenList<StockAdjustment>('stockAdjustments', setStockAdjustments),
+      listenList<InventoryBatch>('inventoryBatches', setInventoryBatches),
       listenList<AuditLog>('auditLogs', setAuditLogs),
       listenList<BackupRecord>('backups', setBackups),
       listenList<StaffMember>('staff', setStaffMembers),
@@ -351,15 +453,59 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     staffProfile?.permissions?.canViewOwnSales,
   ]);
 
+  // Persist permanent Owner catalog locally whenever categories, brands, products, or templates update
+  useEffect(() => {
+    if (sessionRole !== 'owner' || !shopId || !liveListenersSettled) return;
+    if (ownerCacheSaveTimerRef.current !== null) {
+      window.clearTimeout(ownerCacheSaveTimerRef.current);
+    }
+    ownerCacheSaveTimerRef.current = window.setTimeout(() => {
+      ownerCacheSaveTimerRef.current = null;
+      saveCachedOwnerCatalog(shopId, {
+        categories,
+        brands,
+        products,
+        productTemplates,
+      });
+    }, 350);
+    return () => {
+      if (ownerCacheSaveTimerRef.current !== null) {
+        window.clearTimeout(ownerCacheSaveTimerRef.current);
+        ownerCacheSaveTimerRef.current = null;
+      }
+    };
+  }, [sessionRole, shopId, liveListenersSettled, categories, brands, products, productTemplates]);
+
+  // Owner: consolidate legacy/overlapping categories, backfill preloaded brand library & product templates
+  useEffect(() => {
+    if (sessionRole !== 'owner' || !shopId || !liveListenersSettled) return;
+    if (defaultCatsCheckedRef.current === shopId) return;
+    defaultCatsCheckedRef.current = shopId;
+    void ensureDefaultCategories(shopId, categories, products)
+      .then(() => ensureDefaultBrands(shopId, brands, categories))
+      .then(() => ensureDefaultProductTemplates(shopId, productTemplates, categories, brands))
+      .catch((err) => {
+        console.warn('Category/brand/template backfill skipped:', err);
+      });
+  }, [sessionRole, shopId, liveListenersSettled, categories, brands, products, productTemplates]);
+
   // Owner: keep sanitized staffCatalog synchronized with owner products & active staff permissions
   useEffect(() => {
-    if (sessionRole !== 'owner' || !shopId || loading) return;
+    if (sessionRole !== 'owner' || !shopId || !liveListenersSettled) return;
+    if (staffMembers.length === 0 && staffCatalog.length === 0) return;
+
     const allowedUidsKey = getCatalogAllowedUids(staffMembers).sort().join(',');
     const prodSig = products
-      .map((p) => `${p.id}:${p.name}:${p.categoryName}:${p.brandName}:${p.salePrice}:${p.currentStock}:${p.unit}:${p.isActive}`)
+      .map(
+        (p) =>
+          `${p.id}:${p.name}:${p.categoryName}:${p.brandName}:${p.salePrice}:${p.wholesalePrice}:${p.currentStock}:${p.baseUnit || p.unit}:${JSON.stringify(p.packagingUnits || [])}:${p.originType || ''}:${p.bottleSize || ''}:${p.storageLocation || ''}:${Boolean(p.isReturnable)}:${p.returnableUnitName || ''}:${p.depositPerReturnable ?? 0}:${p.isActive}`
+      )
       .join('|');
     const catSig = staffCatalog
-      .map((c) => `${c.productId}:${c.name}:${c.categoryName}:${c.brandName}:${c.salePrice}:${c.currentStock}:${c.unit}:${c.isActive}:${(c.allowedStaffUids || []).slice().sort().join(',')}`)
+      .map(
+        (c) =>
+          `${c.productId}:${c.name}:${c.categoryName}:${c.brandName}:${c.salePrice}:${c.wholesalePrice ?? 0}:${c.currentStock}:${c.baseUnit || c.unit}:${JSON.stringify(c.packagingUnits || [])}:${c.originType || ''}:${c.bottleSize || ''}:${c.storageLocation || ''}:${Boolean(c.isReturnable)}:${c.returnableUnitName || ''}:${c.depositPerReturnable ?? 0}:${c.isActive}:${(c.allowedStaffUids || []).slice().sort().join(',')}`
+      )
       .join('|');
     const combinedSig = `${allowedUidsKey}::${prodSig}::${catSig}`;
 
@@ -369,11 +515,11 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     void syncStaffCatalogDocuments(shopId, products, staffMembers, staffCatalog).catch((err) => {
       console.error('Staff catalog sync error:', err);
     });
-  }, [sessionRole, shopId, loading, products, staffMembers, staffCatalog]);
+  }, [sessionRole, shopId, liveListenersSettled, products, staffMembers, staffCatalog]);
 
   // Owner: backfill username-only staffLookup documents (u_<username>) for any pre-existing staff
   useEffect(() => {
-    if (sessionRole !== 'owner' || !shopId || loading || staffMembers.length === 0) return;
+    if (sessionRole !== 'owner' || !shopId || !liveListenersSettled || staffMembers.length === 0) return;
     const sig = staffMembers
       .map((s) => `${s.id}:${s.usernameLower}:${s.loginVersion}:${s.isActive}`)
       .join('|');
@@ -383,11 +529,11 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     void ensureUsernameStaffLookupIndexes(shopId, staffMembers).catch((err) => {
       console.error('Staff username index sync error:', err);
     });
-  }, [sessionRole, shopId, loading, staffMembers]);
+  }, [sessionRole, shopId, liveListenersSettled, staffMembers]);
 
   // Owner: automatically reconcile any new staffSales into the full P&L ledger and product stock
   useEffect(() => {
-    if (sessionRole !== 'owner' || !shopId || loading) return;
+    if (sessionRole !== 'owner' || !shopId || !liveListenersSettled) return;
     const pending = staffSales.filter((s) => !s.syncedToLedger && !reconcilingIdsRef.current.has(s.id));
     if (pending.length === 0) return;
 
@@ -401,11 +547,11 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
           reconcilingIdsRef.current.delete(ss.id);
         });
     }
-  }, [sessionRole, shopId, loading, staffSales]);
+  }, [sessionRole, shopId, liveListenersSettled, staffSales]);
 
   // Automatic daily backup snapshot metadata check (Owner only)
   useEffect(() => {
-    if (sessionRole !== 'owner' || !shopId || loading || !settings || !settings.autoBackupEnabled) return;
+    if (sessionRole !== 'owner' || !shopId || !liveListenersSettled || !settings || !settings.autoBackupEnabled) return;
     const todayIso = getKarachiDateIso();
     if (settings.lastBackupAt === todayIso) return;
     if (autoBackupAttemptedRef.current === `${shopId}_${todayIso}`) return;
@@ -429,7 +575,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   }, [
     sessionRole,
     shopId,
-    loading,
+    liveListenersSettled,
     settings,
     products.length,
     sales.length,
@@ -438,61 +584,138 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     stockAdjustments.length,
   ]);
 
+  // Independent per-collection memoization preserves referential identity across pages
+  // (e.g. recording a sale updates `sales`/`products` without re-sorting categories/brands/templates)
+  const sortedCategories = useMemo(
+    () => [...categories].sort((a, b) => a.name.localeCompare(b.name)),
+    [categories]
+  );
+  const sortedBrands = useMemo(
+    () => [...brands].sort((a, b) => a.name.localeCompare(b.name)),
+    [brands]
+  );
+  const sortedSuppliers = useMemo(
+    () => [...suppliers].sort((a, b) => a.name.localeCompare(b.name)),
+    [suppliers]
+  );
+  const sortedProducts = useMemo(
+    () => [...products].sort((a, b) => a.name.localeCompare(b.name)),
+    [products]
+  );
+  const sortedProductTemplates = useMemo(
+    () => [...productTemplates].sort((a, b) => a.name.localeCompare(b.name)),
+    [productTemplates]
+  );
+  const sortedSales = useMemo(
+    () =>
+      [...sales].sort((a, b) => {
+        const dateCmp = b.saleDate.localeCompare(a.saleDate);
+        if (dateCmp !== 0) return dateCmp;
+        return (b.saleDateTime || '').localeCompare(a.saleDateTime || '');
+      }),
+    [sales]
+  );
+  const sortedPurchases = useMemo(
+    () => [...purchases].sort((a, b) => b.purchaseDate.localeCompare(a.purchaseDate)),
+    [purchases]
+  );
+  const sortedExpenseCategories = useMemo(
+    () => [...expenseCategories].sort((a, b) => a.name.localeCompare(b.name)),
+    [expenseCategories]
+  );
+  const sortedExpenses = useMemo(
+    () => [...expenses].sort((a, b) => b.expenseDate.localeCompare(a.expenseDate)),
+    [expenses]
+  );
+  const sortedStockMovements = useMemo(
+    () => [...stockMovements].sort((a, b) => b.movementDate.localeCompare(a.movementDate)),
+    [stockMovements]
+  );
+  const sortedStockAdjustments = useMemo(
+    () => [...stockAdjustments].sort((a, b) => b.adjustmentDate.localeCompare(a.adjustmentDate)),
+    [stockAdjustments]
+  );
+  const sortedInventoryBatches = useMemo(
+    () => [...inventoryBatches].sort((a, b) => a.purchaseDate.localeCompare(b.purchaseDate)),
+    [inventoryBatches]
+  );
+  const sortedAuditLogs = useMemo(
+    () => [...auditLogs].sort((a, b) => timestampToMillis(b.createdAt) - timestampToMillis(a.createdAt)),
+    [auditLogs]
+  );
+  const sortedBackups = useMemo(
+    () => [...backups].sort((a, b) => timestampToMillis(b.createdAt) - timestampToMillis(a.createdAt)),
+    [backups]
+  );
+  const sortedStaffMembers = useMemo(
+    () => [...staffMembers].sort((a, b) => a.name.localeCompare(b.name)),
+    [staffMembers]
+  );
+  const sortedAdminMembers = useMemo(
+    () => [...adminMembers].sort((a, b) => a.name.localeCompare(b.name)),
+    [adminMembers]
+  );
+  const sortedStaffCatalog = useMemo(
+    () => [...staffCatalog].sort((a, b) => a.name.localeCompare(b.name)),
+    [staffCatalog]
+  );
+  const sortedStaffSales = useMemo(
+    () =>
+      [...staffSales].sort((a, b) => {
+        const dateCmp = b.saleDate.localeCompare(a.saleDate);
+        if (dateCmp !== 0) return dateCmp;
+        return (b.saleDateTime || '').localeCompare(a.saleDateTime || '');
+      }),
+    [staffSales]
+  );
+
   const value = useMemo<ShopDataContextValue>(
     () => ({
       settings,
-      categories: [...categories].sort((a, b) => a.name.localeCompare(b.name)),
-      brands: [...brands].sort((a, b) => a.name.localeCompare(b.name)),
-      suppliers: [...suppliers].sort((a, b) => a.name.localeCompare(b.name)),
-      products: [...products].sort((a, b) => a.name.localeCompare(b.name)),
-      sales: [...sales].sort((a, b) => {
-        const dateCmp = b.saleDate.localeCompare(a.saleDate);
-        if (dateCmp !== 0) return dateCmp;
-        return (b.saleDateTime || '').localeCompare(a.saleDateTime || '');
-      }),
+      categories: sortedCategories,
+      brands: sortedBrands,
+      suppliers: sortedSuppliers,
+      products: sortedProducts,
+      productTemplates: sortedProductTemplates,
+      sales: sortedSales,
       saleItems,
-      purchases: [...purchases].sort((a, b) => b.purchaseDate.localeCompare(a.purchaseDate)),
+      purchases: sortedPurchases,
       purchaseItems,
-      expenseCategories: [...expenseCategories].sort((a, b) => a.name.localeCompare(b.name)),
-      expenses: [...expenses].sort((a, b) => b.expenseDate.localeCompare(a.expenseDate)),
-      stockMovements: [...stockMovements].sort((a, b) => b.movementDate.localeCompare(a.movementDate)),
-      stockAdjustments: [...stockAdjustments].sort((a, b) => b.adjustmentDate.localeCompare(a.adjustmentDate)),
-      auditLogs: [...auditLogs].sort(
-        (a, b) => timestampToMillis(b.createdAt) - timestampToMillis(a.createdAt)
-      ),
-      backups: [...backups].sort(
-        (a, b) => timestampToMillis(b.createdAt) - timestampToMillis(a.createdAt)
-      ),
-      staffMembers: [...staffMembers].sort((a, b) => a.name.localeCompare(b.name)),
-      adminMembers: [...adminMembers].sort((a, b) => a.name.localeCompare(b.name)),
-      staffCatalog: [...staffCatalog].sort((a, b) => a.name.localeCompare(b.name)),
-      staffSales: [...staffSales].sort((a, b) => {
-        const dateCmp = b.saleDate.localeCompare(a.saleDate);
-        if (dateCmp !== 0) return dateCmp;
-        return (b.saleDateTime || '').localeCompare(a.saleDateTime || '');
-      }),
+      expenseCategories: sortedExpenseCategories,
+      expenses: sortedExpenses,
+      stockMovements: sortedStockMovements,
+      stockAdjustments: sortedStockAdjustments,
+      inventoryBatches: sortedInventoryBatches,
+      auditLogs: sortedAuditLogs,
+      backups: sortedBackups,
+      staffMembers: sortedStaffMembers,
+      adminMembers: sortedAdminMembers,
+      staffCatalog: sortedStaffCatalog,
+      staffSales: sortedStaffSales,
       loading,
     }),
     [
       settings,
-      categories,
-      brands,
-      suppliers,
-      products,
-      sales,
+      sortedCategories,
+      sortedBrands,
+      sortedSuppliers,
+      sortedProducts,
+      sortedProductTemplates,
+      sortedSales,
       saleItems,
-      purchases,
+      sortedPurchases,
       purchaseItems,
-      expenseCategories,
-      expenses,
-      stockMovements,
-      stockAdjustments,
-      auditLogs,
-      backups,
-      staffMembers,
-      adminMembers,
-      staffCatalog,
-      staffSales,
+      sortedExpenseCategories,
+      sortedExpenses,
+      sortedStockMovements,
+      sortedStockAdjustments,
+      sortedInventoryBatches,
+      sortedAuditLogs,
+      sortedBackups,
+      sortedStaffMembers,
+      sortedAdminMembers,
+      sortedStaffCatalog,
+      sortedStaffSales,
       loading,
     ]
   );

@@ -23,6 +23,8 @@ import {
   getPreviousMonthKey,
   roundMoney,
 } from '../utils/formatters';
+import { formatSaleSellerLabel, getSaleSellerKey } from '../utils/sellerAttribution';
+import { getEffectiveBaseUnit } from '../utils/packaging';
 
 export interface ShopSnapshotData {
   products: Product[];
@@ -116,7 +118,7 @@ export function mapProductsRows(products: Product[]): SheetCellValue[][] {
       p.currentStock,
       p.minStockLevel,
       p.maxStockLevel,
-      p.unit || '',
+      getEffectiveBaseUnit(p),
       p.supplierName || '',
       p.expiryDate ? formatDateDDMMYYYY(p.expiryDate) : '',
       roundMoney(p.profitMarginPct),
@@ -148,40 +150,55 @@ export function mapSalesRows(sales: Sale[]): SheetCellValue[][] {
     .map((s) => [
       s.id,
       formatDateDDMMYYYY(s.saleDate),
-      s.staffName || (s.recordedByRole === 'staff' ? 'Sales Staff' : 'Owner'),
+      formatSaleSellerLabel(s),
       roundMoney(s.totalAmount),
       s.paymentMethod,
       s.totalQuantity,
       s.notes || '',
       s.status === 'cancelled' ? 'Cancelled' : 'Completed',
       formatTsDateTime(s.createdAt) || s.saleDateTime || formatDateDDMMYYYY(s.saleDate),
+      s.customerWhatsapp || '',
     ]);
 }
 
 export function mapSalesDetailsRows(saleItems: SaleItem[], sales: Sale[]): SheetCellValue[][] {
   const saleStaffMap = new Map<string, string>();
+  const saleRoleMap = new Map<string, Sale['recordedByRole']>();
+  const saleStatusMap = new Map<string, Sale['status']>();
   for (const s of sales) {
-    saleStaffMap.set(
-      s.id,
-      s.staffName || (s.recordedByRole === 'staff' ? 'Sales Staff' : 'Owner')
-    );
+    saleStaffMap.set(s.id, formatSaleSellerLabel(s));
+    saleRoleMap.set(s.id, s.recordedByRole);
+    saleStatusMap.set(s.id, s.status);
   }
 
   return [...saleItems]
     .sort((a, b) => a.saleDate.localeCompare(b.saleDate) || a.saleId.localeCompare(b.saleId))
-    .map((item) => [
-      item.id,
-      item.saleId,
-      formatDateDDMMYYYY(item.saleDate),
-      item.productName,
-      item.productId,
-      item.quantity,
-      roundMoney(item.salePricePerUnit),
-      roundMoney(item.purchasePriceAtSale),
-      roundMoney(item.lineTotal),
-      roundMoney(item.lineProfit),
-      item.staffName || saleStaffMap.get(item.saleId) || 'Owner',
-    ]);
+    .map((item) => {
+      const isCancelled =
+        item.status === 'cancelled' || saleStatusMap.get(item.saleId) === 'cancelled';
+      const parentLabel = saleStaffMap.get(item.saleId);
+      const sellerLabel =
+        parentLabel ||
+        formatSaleSellerLabel({
+          staffId: item.staffId,
+          staffName: item.staffName,
+          recordedByRole: saleRoleMap.get(item.saleId),
+        });
+      return [
+        item.id,
+        item.saleId,
+        formatDateDDMMYYYY(item.saleDate),
+        item.unitName ? `${item.productName} (${item.unitName})` : item.productName,
+        item.productId,
+        item.unitQuantity ?? item.quantity,
+        roundMoney(item.salePricePerUnit),
+        roundMoney(item.purchasePriceAtSale),
+        roundMoney(item.lineTotal),
+        roundMoney(item.lineProfit),
+        sellerLabel,
+        isCancelled ? 'Cancelled' : 'Completed',
+      ];
+    });
 }
 
 export function mapPurchasesRows(purchases: Purchase[]): SheetCellValue[][] {
@@ -214,9 +231,9 @@ export function mapPurchaseDetailsRows(purchaseItems: PurchaseItem[]): SheetCell
       item.id,
       item.purchaseId,
       formatDateDDMMYYYY(item.purchaseDate),
-      item.productName,
+      item.unitName ? `${item.productName} (${item.unitName})` : item.productName,
       item.productId,
-      item.quantity,
+      item.unitQuantity ?? item.quantity,
       roundMoney(item.purchasePricePerUnit),
       roundMoney(item.lineTotal),
     ]);
@@ -534,11 +551,10 @@ export function mapStaffPerformanceRows(data: ShopSnapshotData): SheetCellValue[
   >();
 
   for (const s of activeSales) {
-    const staffId = s.staffId || (s.recordedByRole === 'staff' ? 'staff' : 'owner');
+    const staffId = getSaleSellerKey(s);
+    const formatted = formatSaleSellerLabel(s);
     const staffName =
-      s.staffName ||
-      staffNameLookup.get(staffId) ||
-      (s.recordedByRole === 'staff' ? 'Sales Staff' : 'Owner');
+      formatted !== 'Sales Staff' ? formatted : staffNameLookup.get(staffId) || 'Sales Staff';
     const key = `${s.saleDate}__${staffId}`;
 
     const cur = buckets.get(key) || {

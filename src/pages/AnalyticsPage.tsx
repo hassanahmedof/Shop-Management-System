@@ -15,6 +15,7 @@ import {
 } from 'recharts';
 import { CompactExpandableRow, CompactSection } from '../components/CompactSection';
 import { SearchableSelect, type SearchableSelectOption } from '../components/SearchableSelect';
+import { useAuth } from '../contexts/AuthContext';
 import { useShopData } from '../contexts/ShopDataContext';
 import { computeTopActivityValues } from '../services/recordSearchService';
 import type { PaymentMethod } from '../types/shop';
@@ -33,18 +34,29 @@ import {
   getMonthKey,
   roundMoney,
 } from '../utils/formatters';
+import { formatStockBreakdown } from '../utils/packaging';
+import {
+  buildSellerFilterOptions,
+  computeSellerPerformanceBreakdown,
+  getSaleSellerKey,
+  matchesSellerFilter,
+} from '../utils/sellerAttribution';
 
 export function AnalyticsPage() {
+  const { user, shopId } = useAuth();
+  const activeShopId = shopId || user?.uid || '';
   const {
     products,
     categories,
     brands,
     suppliers,
     staffMembers,
+    adminMembers,
     sales,
     saleItems,
     purchases,
     expenses,
+    settings,
   } = useShopData();
   const todayIso = getKarachiDateIso();
 
@@ -73,6 +85,7 @@ export function AnalyticsPage() {
   const [expandedCatId, setExpandedCatId] = useState<string | null>(null);
   const [expandedBrandId, setExpandedBrandId] = useState<string | null>(null);
   const [expandedAllProductId, setExpandedAllProductId] = useState<string | null>(null);
+  const [expandedSellerKey, setExpandedSellerKey] = useState<string | null>(null);
 
   const productOptions = useMemo<SearchableSelectOption[]>(
     () =>
@@ -80,7 +93,7 @@ export function AnalyticsPage() {
         value: p.id,
         label: p.name,
         subtitle: `${p.brandName || 'Unbranded'} · ${p.categoryName || 'Uncategorized'}`,
-        meta: `Stock: ${p.currentStock} ${p.unit}`,
+        meta: `Stock: ${formatStockBreakdown(p.currentStock, p).summaryText}`,
         keywords: [p.name, p.brandName, p.categoryName, p.supplierName],
       })),
     [products]
@@ -118,21 +131,17 @@ export function AnalyticsPage() {
   );
 
   const staffOptions = useMemo<SearchableSelectOption[]>(
-    () => [
-      {
-        value: 'owner',
-        label: 'Owner (Admin)',
-        subtitle: 'Direct owner-recorded sales',
-        keywords: ['owner', 'admin'],
-      },
-      ...staffMembers.map((m) => ({
-        value: m.id,
-        label: m.name,
-        subtitle: `@${m.username}${m.phone ? ` · ${m.phone}` : ''}`,
-        keywords: [m.name, m.username, m.phone].filter(Boolean),
-      })),
-    ],
-    [staffMembers]
+    () =>
+      buildSellerFilterOptions({
+        sales,
+        staffMembers,
+        adminMembers,
+        settings,
+        user,
+        shopId: activeShopId,
+        includeAllOwnersOption: true,
+      }),
+    [sales, staffMembers, adminMembers, settings, user, activeShopId]
   );
 
   const paymentOptions = useMemo<SearchableSelectOption[]>(
@@ -160,18 +169,14 @@ export function AnalyticsPage() {
     [purchases]
   );
   const frequentStaffIds = useMemo(
-    () => computeTopActivityValues(sales, (s) => s.staffId || 'owner', 5),
+    () => computeTopActivityValues(sales, (s) => getSaleSellerKey(s), 5),
     [sales]
   );
 
   const filteredSales = useMemo(() => {
     if (!staffId && !paymentMethod) return sales;
     return sales.filter((s) => {
-      if (staffId === 'owner') {
-        if (s.staffId && s.staffId !== 'owner') return false;
-      } else if (staffId && s.staffId !== staffId) {
-        return false;
-      }
+      if (!matchesSellerFilter(s, staffId)) return false;
       if (paymentMethod && s.paymentMethod !== paymentMethod) return false;
       return true;
     });
@@ -284,6 +289,33 @@ export function AnalyticsPage() {
     return { totalGross, totalNet, totalExpenses, bestPoint };
   }, [profitTrendSeries]);
 
+  const sellerPerformanceRows = useMemo(
+    () =>
+      computeSellerPerformanceBreakdown({
+        sales: filteredSales,
+        staffMembers,
+        adminMembers,
+        settings,
+        user,
+        shopId: activeShopId,
+        fromDate,
+        toDate,
+      }),
+    [filteredSales, staffMembers, adminMembers, settings, user, activeShopId, fromDate, toDate]
+  );
+
+  const sellerChartData = useMemo(
+    () =>
+      sellerPerformanceRows.map((row) => ({
+        name: row.sellerLabel.length > 18 ? `${row.sellerLabel.slice(0, 18)}…` : row.sellerLabel,
+        fullName: row.sellerLabel,
+        Revenue: row.revenue,
+        Profit: row.grossProfit,
+        orders: row.orders,
+      })),
+    [sellerPerformanceRows]
+  );
+
   const hasActiveFilters = Boolean(
     productId || categoryId || brandId || supplierId || staffId || paymentMethod
   );
@@ -311,17 +343,27 @@ export function AnalyticsPage() {
     paymentMethod,
   ].filter(Boolean).length;
 
+  const tooltipContentStyle = {
+    backgroundColor: 'var(--cm-chart-tooltip-bg)',
+    borderColor: 'var(--cm-chart-tooltip-border)',
+    color: 'var(--cm-text-primary)',
+    borderRadius: '8px',
+    fontSize: '12px',
+  };
+
   return (
     <div className="space-y-4">
       {/* Top Section Tabs & Searchable Filters */}
-      <div className="bg-white border border-slate-200 rounded-xl p-3 sm:p-4 space-y-2.5">
+      <div className="cm-surface border rounded-xl p-3 sm:p-4 space-y-2.5">
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-2.5">
-          <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto max-w-full">
+          <div className="flex items-center gap-1 p-1 bg-[var(--cm-bg-subtle)] rounded-lg overflow-x-auto max-w-full">
             <button
               type="button"
               onClick={() => setTab('products')}
               className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                tab === 'products' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                tab === 'products'
+                  ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-text-primary)] shadow-xs'
+                  : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
               }`}
             >
               Product Performance
@@ -330,7 +372,9 @@ export function AnalyticsPage() {
               type="button"
               onClick={() => setTab('comparison')}
               className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                tab === 'comparison' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                tab === 'comparison'
+                  ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-text-primary)] shadow-xs'
+                  : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
               }`}
             >
               Monthly & Yearly
@@ -339,7 +383,9 @@ export function AnalyticsPage() {
               type="button"
               onClick={() => setTab('pnl')}
               className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                tab === 'pnl' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                tab === 'pnl'
+                  ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-text-primary)] shadow-xs'
+                  : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
               }`}
             >
               Profit & Loss
@@ -352,22 +398,22 @@ export function AnalyticsPage() {
               value={fromDate}
               onChange={(e) => setFromDate(e.target.value)}
               aria-label="From date"
-              className="w-full sm:w-auto px-2.5 py-1.5 min-h-[38px] sm:min-h-0 border border-slate-200 rounded-lg font-mono-num"
+              className="w-full sm:w-auto px-2.5 py-1.5 min-h-[38px] sm:min-h-0 cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
             />
             <input
               type="date"
               value={toDate}
               onChange={(e) => setToDate(e.target.value)}
               aria-label="To date"
-              className="w-full sm:w-auto px-2.5 py-1.5 min-h-[38px] sm:min-h-0 border border-slate-200 rounded-lg font-mono-num"
+              className="w-full sm:w-auto px-2.5 py-1.5 min-h-[38px] sm:min-h-0 cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
             />
             <div className="col-span-2 sm:col-span-1 flex items-center justify-between sm:justify-start gap-2">
               <button
                 type="button"
                 onClick={() => setShowFilters((v) => !v)}
-                className="md:hidden inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-semibold text-slate-700 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer"
+                className="md:hidden inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-semibold text-[var(--cm-text-secondary)] bg-[var(--cm-bg-subtle)] border border-[var(--cm-border)] rounded-lg cursor-pointer"
               >
-                <Filter className="w-3.5 h-3.5 text-teal-600" />
+                <Filter className="w-3.5 h-3.5 text-[var(--cm-accent)]" />
                 Filters {activeFilterCount > 0 ? `(${activeFilterCount})` : ''}
                 <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showFilters ? 'rotate-180' : ''}`} />
               </button>
@@ -375,7 +421,7 @@ export function AnalyticsPage() {
                 <button
                   type="button"
                   onClick={clearAllFilters}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] sm:min-h-0 text-xs font-medium text-teal-700 border border-teal-200 bg-teal-50/60 hover:bg-teal-50 rounded-lg cursor-pointer"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] sm:min-h-0 text-xs font-medium text-[var(--cm-accent-text)] border border-[var(--cm-accent-border)] bg-[var(--cm-accent-soft)] rounded-lg cursor-pointer"
                 >
                   <X className="w-3.5 h-3.5" />
                   Reset
@@ -388,7 +434,7 @@ export function AnalyticsPage() {
         <div
           className={`${
             showFilters ? 'grid' : 'hidden md:grid'
-          } grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-2 pt-2 border-t border-slate-100`}
+          } grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-2 pt-2 border-t border-[var(--cm-border)]`}
         >
           <SearchableSelect
             options={productOptions}
@@ -442,10 +488,10 @@ export function AnalyticsPage() {
             options={staffOptions}
             value={staffId}
             onChange={setStaffId}
-            emptyOptionLabel="All Staff / Owner"
-            placeholder="All Staff / Owner"
-            searchPlaceholder="Search staff member..."
-            ariaLabel="Filter by staff member"
+            emptyOptionLabel="All Sellers (Admins & Staff)"
+            placeholder="All Sellers (Admins & Staff)"
+            searchPlaceholder="Search admin or staff..."
+            ariaLabel="Filter by admin or staff member"
             suggestionScope="staff"
             suggestedValues={frequentStaffIds}
             size="sm"
@@ -465,20 +511,20 @@ export function AnalyticsPage() {
       </div>
 
       {/* Profit Trends Line Chart (Daily or Monthly) */}
-      <section className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 space-y-3">
+      <section className="cm-surface border rounded-xl p-3.5 sm:p-4 space-y-3">
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2.5">
           <div className="space-y-1">
-            <h2 className="text-sm sm:text-base font-semibold text-slate-900">Profit Trends</h2>
-            <div className="flex flex-wrap items-center gap-2 text-[11px] sm:text-xs text-slate-500 font-mono-num tabular-nums">
+            <h2 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">Profit Trends</h2>
+            <div className="flex flex-wrap items-center gap-2 text-[11px] sm:text-xs text-[var(--cm-text-muted)] font-mono-num tabular-nums">
               <span>{profitGranularity === 'daily' ? 'Daily' : 'Monthly'}</span>
               <span aria-hidden="true">·</span>
               <span>
-                Gross: <strong className="text-teal-700">{formatPKR(profitTrendSummary.totalGross)}</strong>
+                Gross: <strong className="text-[var(--cm-accent-text)]">{formatPKR(profitTrendSummary.totalGross)}</strong>
               </span>
               <span aria-hidden="true">·</span>
               <span>
                 Net:{' '}
-                <strong className={profitTrendSummary.totalNet >= 0 ? 'text-emerald-700' : 'text-red-600'}>
+                <strong className={profitTrendSummary.totalNet >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
                   {formatPKR(profitTrendSummary.totalNet)}
                 </strong>
               </span>
@@ -493,14 +539,14 @@ export function AnalyticsPage() {
             </div>
           </div>
 
-          <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg self-start md:self-auto shrink-0">
+          <div className="flex items-center gap-1 p-1 bg-[var(--cm-bg-subtle)] rounded-lg self-start md:self-auto shrink-0">
             <button
               type="button"
               onClick={() => setProfitGranularity('daily')}
               className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 profitGranularity === 'daily'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
+                  ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-text-primary)] shadow-xs'
+                  : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
               }`}
             >
               Daily
@@ -510,8 +556,8 @@ export function AnalyticsPage() {
               onClick={() => setProfitGranularity('monthly')}
               className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 profitGranularity === 'monthly'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
+                  ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-text-primary)] shadow-xs'
+                  : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
               }`}
             >
               Monthly
@@ -521,41 +567,38 @@ export function AnalyticsPage() {
 
         <div className="h-52 sm:h-60">
           {profitTrendSeries.length === 0 ? (
-            <div className="h-full flex items-center justify-center text-sm text-slate-500">
+            <div className="h-full flex items-center justify-center text-sm text-[var(--cm-text-muted)]">
               No sales or expense entries recorded for this period yet. Record sales or expenses to view profit trends.
             </div>
           ) : (
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={profitTrendSeries} margin={{ top: 8, right: 16, left: 0, bottom: 4 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--cm-chart-grid)" vertical={false} />
                 <XAxis
                   dataKey="label"
-                  tick={{ fontSize: 11, fill: '#64748b' }}
+                  tick={{ fontSize: 11, fill: 'var(--cm-chart-tick)' }}
                   minTickGap={20}
                 />
-                <YAxis tick={{ fontSize: 11, fill: '#64748b' }} />
-                <Tooltip
-                  formatter={(val) => formatPKR(Number(val ?? 0))}
-                  contentStyle={{ borderRadius: '8px', borderColor: '#e2e8f0', fontSize: '12px' }}
-                />
+                <YAxis tick={{ fontSize: 11, fill: 'var(--cm-chart-tick)' }} />
+                <Tooltip formatter={(val) => formatPKR(Number(val ?? 0))} contentStyle={tooltipContentStyle} />
                 <Legend wrapperStyle={{ fontSize: '12px' }} />
-                <ReferenceLine y={0} stroke="#cbd5e1" strokeDasharray="3 3" />
+                <ReferenceLine y={0} stroke="var(--cm-border-strong)" strokeDasharray="3 3" />
                 <Line
                   type="monotone"
                   dataKey="grossProfit"
                   name="Gross Profit"
-                  stroke="#0d9488"
-                  strokeWidth={2}
-                  dot={{ r: 2.5, fill: '#0d9488' }}
+                  stroke="#65a30d"
+                  strokeWidth={2.2}
+                  dot={{ r: 2.5, fill: '#65a30d' }}
                   activeDot={{ r: 5 }}
                 />
                 <Line
                   type="monotone"
                   dataKey="netProfit"
                   name="Net Profit"
-                  stroke="#0f172a"
+                  stroke="#16a34a"
                   strokeWidth={2.5}
-                  dot={{ r: 2.5, fill: '#0f172a' }}
+                  dot={{ r: 2.5, fill: '#16a34a' }}
                   activeDot={{ r: 5 }}
                 />
               </LineChart>
@@ -563,6 +606,125 @@ export function AnalyticsPage() {
           )}
         </div>
       </section>
+
+      {/* Admin & Seller Sales Performance Comparison */}
+      <CompactSection
+        title="Admin & Seller Sales Comparison"
+        subtitle={`${formatDateDDMMYYYY(fromDate)} to ${formatDateDDMMYYYY(toDate)}`}
+        summary={`${sellerPerformanceRows.length} sellers`}
+        collapsible
+        defaultOpen
+      >
+        {sellerPerformanceRows.length === 0 ? (
+          <div className="p-5 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">
+            No sales recorded for this period yet.
+          </div>
+        ) : (
+          <div className="space-y-3 p-3.5 sm:p-4">
+            <div className="h-48 sm:h-56">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={sellerChartData} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--cm-chart-grid)" vertical={false} />
+                  <XAxis dataKey="name" tick={{ fontSize: 11, fill: 'var(--cm-chart-tick)' }} />
+                  <YAxis tick={{ fontSize: 11, fill: 'var(--cm-chart-tick)' }} />
+                  <Tooltip
+                    formatter={(val) => formatPKR(Number(val ?? 0))}
+                    labelFormatter={(_, payload) =>
+                      payload?.[0]?.payload?.fullName ? String(payload[0].payload.fullName) : ''
+                    }
+                    contentStyle={tooltipContentStyle}
+                  />
+                  <Legend wrapperStyle={{ fontSize: '12px' }} />
+                  <Bar dataKey="Revenue" name="Sales Revenue" fill="#65a30d" radius={[4, 4, 0, 0]} maxBarSize={44} />
+                  <Bar dataKey="Profit" name="Gross Profit" fill="#16a34a" radius={[4, 4, 0, 0]} maxBarSize={44} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="hidden md:block overflow-x-auto border border-[var(--cm-border)] rounded-lg">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
+                    <th className="py-2 px-3">Seller</th>
+                    <th className="py-2 px-3">Role</th>
+                    <th className="py-2 px-3 text-right">Bills</th>
+                    <th className="py-2 px-3 text-right">Units</th>
+                    <th className="py-2 px-3 text-right">Cash</th>
+                    <th className="py-2 px-3 text-right">Online</th>
+                    <th className="py-2 px-3 text-right">Total Sales</th>
+                    <th className="py-2 px-3 text-right">Gross Profit</th>
+                    <th className="py-2 px-3 text-right">Avg Bill</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
+                  {sellerPerformanceRows.map((row) => (
+                    <tr key={row.sellerKey} className="hover:bg-[var(--cm-bg-hover)]">
+                      <td className="py-2 px-3 font-semibold text-[var(--cm-text-primary)]">{row.sellerLabel}</td>
+                      <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">
+                        {row.roleType === 'owner_admin'
+                          ? 'Owner / Admin'
+                          : row.roleType === 'unassigned'
+                            ? 'Legacy Unassigned'
+                            : 'Sales Staff'}
+                      </td>
+                      <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{row.orders}</td>
+                      <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">{row.unitsSold}</td>
+                      <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">{formatPKR(row.cashTotal)}</td>
+                      <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">{formatPKR(row.onlineTotal)}</td>
+                      <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-text-primary)]">{formatPKR(row.revenue)}</td>
+                      <td
+                        className={`py-2 px-3 text-right font-mono-num font-semibold ${
+                          row.grossProfit >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'
+                        }`}
+                      >
+                        {formatPKR(row.grossProfit)}
+                      </td>
+                      <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">{formatPKR(row.avgBill)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="md:hidden divide-y divide-[var(--cm-border)] border border-[var(--cm-border)] rounded-lg overflow-hidden">
+              {sellerPerformanceRows.map((row) => (
+                <CompactExpandableRow
+                  key={row.sellerKey}
+                  title={row.sellerLabel}
+                  subtitle={`${row.orders} bills · Avg ${formatPKR(row.avgBill)}`}
+                  rightPrimary={formatPKR(row.revenue)}
+                  rightSecondary={
+                    <span className={row.grossProfit >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
+                      +{formatPKR(row.grossProfit)}
+                    </span>
+                  }
+                  isExpanded={expandedSellerKey === row.sellerKey}
+                  onToggle={() =>
+                    setExpandedSellerKey((prev) => (prev === row.sellerKey ? null : row.sellerKey))
+                  }
+                  expandedContent={
+                    <div className="grid grid-cols-2 gap-2 text-[var(--cm-text-secondary)] font-mono-num">
+                      <div>
+                        Role:{' '}
+                        <span className="font-sans text-[var(--cm-text-primary)] font-medium">
+                          {row.roleType === 'owner_admin'
+                            ? 'Owner / Admin'
+                            : row.roleType === 'unassigned'
+                              ? 'Legacy Unassigned'
+                              : 'Sales Staff'}
+                        </span>
+                      </div>
+                      <div>Units: <span className="text-[var(--cm-text-primary)]">{row.unitsSold}</span></div>
+                      <div>Cash: <span className="text-[var(--cm-text-primary)]">{formatPKR(row.cashTotal)}</span></div>
+                      <div>Online: <span className="text-[var(--cm-text-primary)]">{formatPKR(row.onlineTotal)}</span></div>
+                    </div>
+                  }
+                />
+              ))}
+            </div>
+          </div>
+        )}
+      </CompactSection>
 
       {/* TAB 1: Product Performance Analytics */}
       {tab === 'products' && (
@@ -575,8 +737,8 @@ export function AnalyticsPage() {
             collapsible
             defaultOpen
           >
-            <div className="px-3.5 py-2.5 border-b border-slate-100 bg-slate-50/70">
-              <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto max-w-full">
+            <div className="px-3.5 py-2.5 border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)]">
+              <div className="flex items-center gap-1 p-1 bg-[var(--cm-bg-app)] border border-[var(--cm-border)] rounded-lg overflow-x-auto max-w-full">
                 {(
                   [
                     { id: 'topQty', label: 'Top Qty' },
@@ -596,7 +758,9 @@ export function AnalyticsPage() {
                       setExpandedRankingId(null);
                     }}
                     className={`px-2.5 py-1 text-xs font-medium rounded-md whitespace-nowrap shrink-0 cursor-pointer ${
-                      insightView === item.id ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                      insightView === item.id
+                        ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-text-primary)] shadow-xs'
+                        : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
                     }`}
                   >
                     {item.label}
@@ -606,7 +770,7 @@ export function AnalyticsPage() {
             </div>
 
             {activeRankingRows.length === 0 ? (
-              <div className="p-5 text-center text-xs sm:text-sm text-slate-500">
+              <div className="p-5 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">
                 No products fall into this segment for the selected date range.
               </div>
             ) : (
@@ -614,7 +778,7 @@ export function AnalyticsPage() {
                 <div className="hidden md:block overflow-x-auto">
                   <table className="w-full text-left border-collapse">
                     <thead>
-                      <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                      <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                         <th className="py-2 px-3">Product</th>
                         <th className="py-2 px-3">Category · Brand</th>
                         <th className="py-2 px-3 text-right">Qty Sold</th>
@@ -626,31 +790,31 @@ export function AnalyticsPage() {
                         <th className="py-2 px-3 text-right">Margin %</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                    <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                       {activeRankingRows.slice(0, 10).map((r) => (
-                        <tr key={r.productId} className="hover:bg-slate-50">
-                          <td className="py-2 px-3 font-medium text-slate-900">{r.productName}</td>
-                          <td className="py-2 px-3 text-xs text-slate-500">
+                        <tr key={r.productId} className="hover:bg-[var(--cm-bg-hover)]">
+                          <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">{r.productName}</td>
+                          <td className="py-2 px-3 text-xs text-[var(--cm-text-muted)]">
                             {r.categoryName} · {r.brandName}
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num">{r.quantitySold}</td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{r.quantitySold}</td>
                           {insightView === 'declining' && (
-                            <td className="py-2 px-3 text-right font-mono-num text-red-600">
+                            <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-danger)]">
                               {r.previousPeriodQty} ({r.qtyChange})
                             </td>
                           )}
-                          <td className="py-2 px-3 text-right font-mono-num">{formatPKR(r.revenue)}</td>
-                          <td className="py-2 px-3 text-right font-mono-num text-emerald-700">
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{formatPKR(r.revenue)}</td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-success)]">
                             {formatPKR(r.grossProfit)}
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num">{r.profitMarginPct}%</td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">{r.profitMarginPct}%</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
 
-                <div className="md:hidden divide-y divide-slate-100">
+                <div className="md:hidden divide-y divide-[var(--cm-border)]">
                   {activeRankingRows.slice(0, 10).map((r) => (
                     <CompactExpandableRow
                       key={r.productId}
@@ -658,7 +822,7 @@ export function AnalyticsPage() {
                       subtitle={`Sold: ${r.quantitySold} · Margin ${r.profitMarginPct}%`}
                       rightPrimary={formatPKR(r.revenue)}
                       rightSecondary={
-                        <span className={r.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-600'}>
+                        <span className={r.grossProfit >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
                           +{formatPKR(r.grossProfit)}
                         </span>
                       }
@@ -667,13 +831,13 @@ export function AnalyticsPage() {
                         setExpandedRankingId((prev) => (prev === r.productId ? null : r.productId))
                       }
                       expandedContent={
-                        <div className="grid grid-cols-2 gap-2 text-slate-600">
-                          <div>Category: <span className="text-slate-900 font-medium">{r.categoryName}</span></div>
-                          <div>Brand: <span className="text-slate-900 font-medium">{r.brandName}</span></div>
-                          <div>Cost: <span className="font-mono-num text-slate-900">{formatPKR(r.cost)}</span></div>
-                          <div>Stock Left: <span className="font-mono-num text-slate-900">{r.currentStock}</span></div>
+                        <div className="grid grid-cols-2 gap-2 text-[var(--cm-text-secondary)]">
+                          <div>Category: <span className="text-[var(--cm-text-primary)] font-medium">{r.categoryName}</span></div>
+                          <div>Brand: <span className="text-[var(--cm-text-primary)] font-medium">{r.brandName}</span></div>
+                          <div>Cost: <span className="font-mono-num text-[var(--cm-text-primary)]">{formatPKR(r.cost)}</span></div>
+                          <div>Stock Left: <span className="font-mono-num text-[var(--cm-text-primary)]">{r.currentStock}</span></div>
                           {insightView === 'declining' && (
-                            <div className="col-span-2 text-red-600 font-mono-num">
+                            <div className="col-span-2 text-[var(--cm-danger)] font-mono-num">
                               Prev Qty: {r.previousPeriodQty} ({r.qtyChange})
                             </div>
                           )}
@@ -695,26 +859,26 @@ export function AnalyticsPage() {
               defaultOpen={false}
             >
               {perf.bestCategories.length === 0 ? (
-                <div className="p-4 text-xs sm:text-sm text-slate-500">No category sales in this period.</div>
+                <div className="p-4 text-xs sm:text-sm text-[var(--cm-text-muted)]">No category sales in this period.</div>
               ) : (
                 <>
                   <div className="hidden md:block overflow-x-auto">
                     <table className="w-full text-left border-collapse">
                       <thead>
-                        <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                        <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                           <th className="py-2 px-3">Category</th>
                           <th className="py-2 px-3 text-right">Qty</th>
                           <th className="py-2 px-3 text-right">Revenue</th>
                           <th className="py-2 px-3 text-right">Profit</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                      <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                         {perf.bestCategories.map((c) => (
-                          <tr key={c.id}>
-                            <td className="py-2 px-3 font-medium text-slate-900">{c.name}</td>
-                            <td className="py-2 px-3 text-right font-mono-num">{c.quantitySold}</td>
-                            <td className="py-2 px-3 text-right font-mono-num">{formatPKR(c.revenue)}</td>
-                            <td className="py-2 px-3 text-right font-mono-num text-emerald-700">
+                          <tr key={c.id} className="hover:bg-[var(--cm-bg-hover)]">
+                            <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">{c.name}</td>
+                            <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{c.quantitySold}</td>
+                            <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{formatPKR(c.revenue)}</td>
+                            <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-success)]">
                               {formatPKR(c.grossProfit)}
                             </td>
                           </tr>
@@ -722,20 +886,20 @@ export function AnalyticsPage() {
                       </tbody>
                     </table>
                   </div>
-                  <div className="md:hidden divide-y divide-slate-100">
+                  <div className="md:hidden divide-y divide-[var(--cm-border)]">
                     {perf.bestCategories.map((c) => (
                       <CompactExpandableRow
                         key={c.id}
                         title={c.name}
                         subtitle={`Qty Sold: ${c.quantitySold}`}
                         rightPrimary={formatPKR(c.revenue)}
-                        rightSecondary={<span className="text-emerald-700">+{formatPKR(c.grossProfit)}</span>}
+                        rightSecondary={<span className="text-[var(--cm-success)]">+{formatPKR(c.grossProfit)}</span>}
                         isExpanded={expandedCatId === c.id}
                         onToggle={() => setExpandedCatId((prev) => (prev === c.id ? null : c.id))}
                         expandedContent={
-                          <div className="flex justify-between text-slate-600">
-                            <span>Quantity Sold: <strong className="font-mono-num text-slate-900">{c.quantitySold}</strong></span>
-                            <span>Profit: <strong className="font-mono-num text-emerald-700">{formatPKR(c.grossProfit)}</strong></span>
+                          <div className="flex justify-between text-[var(--cm-text-secondary)]">
+                            <span>Quantity Sold: <strong className="font-mono-num text-[var(--cm-text-primary)]">{c.quantitySold}</strong></span>
+                            <span>Profit: <strong className="font-mono-num text-[var(--cm-success)]">{formatPKR(c.grossProfit)}</strong></span>
                           </div>
                         }
                       />
@@ -752,26 +916,26 @@ export function AnalyticsPage() {
               defaultOpen={false}
             >
               {perf.bestBrands.length === 0 ? (
-                <div className="p-4 text-xs sm:text-sm text-slate-500">No brand sales in this period.</div>
+                <div className="p-4 text-xs sm:text-sm text-[var(--cm-text-muted)]">No brand sales in this period.</div>
               ) : (
                 <>
                   <div className="hidden md:block overflow-x-auto">
                     <table className="w-full text-left border-collapse">
                       <thead>
-                        <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                        <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                           <th className="py-2 px-3">Brand</th>
                           <th className="py-2 px-3 text-right">Qty</th>
                           <th className="py-2 px-3 text-right">Revenue</th>
                           <th className="py-2 px-3 text-right">Profit</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                      <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                         {perf.bestBrands.map((b) => (
-                          <tr key={b.id}>
-                            <td className="py-2 px-3 font-medium text-slate-900">{b.name}</td>
-                            <td className="py-2 px-3 text-right font-mono-num">{b.quantitySold}</td>
-                            <td className="py-2 px-3 text-right font-mono-num">{formatPKR(b.revenue)}</td>
-                            <td className="py-2 px-3 text-right font-mono-num text-emerald-700">
+                          <tr key={b.id} className="hover:bg-[var(--cm-bg-hover)]">
+                            <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">{b.name}</td>
+                            <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{b.quantitySold}</td>
+                            <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{formatPKR(b.revenue)}</td>
+                            <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-success)]">
                               {formatPKR(b.grossProfit)}
                             </td>
                           </tr>
@@ -779,20 +943,20 @@ export function AnalyticsPage() {
                       </tbody>
                     </table>
                   </div>
-                  <div className="md:hidden divide-y divide-slate-100">
+                  <div className="md:hidden divide-y divide-[var(--cm-border)]">
                     {perf.bestBrands.map((b) => (
                       <CompactExpandableRow
                         key={b.id}
                         title={b.name}
                         subtitle={`Qty Sold: ${b.quantitySold}`}
                         rightPrimary={formatPKR(b.revenue)}
-                        rightSecondary={<span className="text-emerald-700">+{formatPKR(b.grossProfit)}</span>}
+                        rightSecondary={<span className="text-[var(--cm-success)]">+{formatPKR(b.grossProfit)}</span>}
                         isExpanded={expandedBrandId === b.id}
                         onToggle={() => setExpandedBrandId((prev) => (prev === b.id ? null : b.id))}
                         expandedContent={
-                          <div className="flex justify-between text-slate-600">
-                            <span>Quantity Sold: <strong className="font-mono-num text-slate-900">{b.quantitySold}</strong></span>
-                            <span>Profit: <strong className="font-mono-num text-emerald-700">{formatPKR(b.grossProfit)}</strong></span>
+                          <div className="flex justify-between text-[var(--cm-text-secondary)]">
+                            <span>Quantity Sold: <strong className="font-mono-num text-[var(--cm-text-primary)]">{b.quantitySold}</strong></span>
+                            <span>Profit: <strong className="font-mono-num text-[var(--cm-success)]">{formatPKR(b.grossProfit)}</strong></span>
                           </div>
                         }
                       />
@@ -811,19 +975,19 @@ export function AnalyticsPage() {
             defaultOpen
             actions={
               <div className="relative w-full sm:w-52">
-                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                <Search className="w-3.5 h-3.5 text-[var(--cm-text-muted)] absolute left-2.5 top-1/2 -translate-y-1/2" />
                 <input
                   type="text"
                   placeholder="Search product..."
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  className="w-full pl-8 pr-3 py-1.5 text-xs border border-slate-200 rounded-lg focus:outline-none focus:border-teal-600"
+                  className="w-full pl-8 pr-3 py-1.5 text-xs cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
                 />
               </div>
             }
           >
             {filteredTableRows.length === 0 ? (
-              <div className="p-6 text-center text-xs sm:text-sm text-slate-500">
+              <div className="p-6 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">
                 No products match your filter.
               </div>
             ) : (
@@ -831,7 +995,7 @@ export function AnalyticsPage() {
                 <div className="hidden md:block overflow-x-auto">
                   <table className="w-full text-left border-collapse">
                     <thead>
-                      <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                      <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                         <th className="py-2 px-3">Product Name</th>
                         <th className="py-2 px-3 text-right">Qty Sold</th>
                         <th className="py-2 px-3 text-right">Revenue</th>
@@ -840,35 +1004,35 @@ export function AnalyticsPage() {
                         <th className="py-2 px-3 text-right">Margin</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                    <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                       {filteredTableRows.map((r) => (
-                        <tr key={r.productId} className="hover:bg-slate-50">
-                          <td className="py-2 px-3 font-medium text-slate-900">
+                        <tr key={r.productId} className="hover:bg-[var(--cm-bg-hover)]">
+                          <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">
                             <div>{r.productName}</div>
-                            <div className="text-[11px] text-slate-500">
+                            <div className="text-[11px] text-[var(--cm-text-muted)]">
                               {r.categoryName} · {r.brandName}
                             </div>
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num">{r.quantitySold}</td>
-                          <td className="py-2 px-3 text-right font-mono-num">{formatPKR(r.revenue)}</td>
-                          <td className="py-2 px-3 text-right font-mono-num text-slate-600">
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{r.quantitySold}</td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{formatPKR(r.revenue)}</td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">
                             {formatPKR(r.cost)}
                           </td>
                           <td
                             className={`py-2 px-3 text-right font-mono-num font-semibold ${
-                              r.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-600'
+                              r.grossProfit >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'
                             }`}
                           >
                             {formatPKR(r.grossProfit)}
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num">{r.profitMarginPct}%</td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">{r.profitMarginPct}%</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
 
-                <div className="md:hidden divide-y divide-slate-100">
+                <div className="md:hidden divide-y divide-[var(--cm-border)]">
                   {filteredTableRows.map((r) => (
                     <CompactExpandableRow
                       key={r.productId}
@@ -876,7 +1040,7 @@ export function AnalyticsPage() {
                       subtitle={`Qty: ${r.quantitySold} · Margin ${r.profitMarginPct}%`}
                       rightPrimary={formatPKR(r.revenue)}
                       rightSecondary={
-                        <span className={r.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-600'}>
+                        <span className={r.grossProfit >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
                           {formatPKR(r.grossProfit)}
                         </span>
                       }
@@ -885,11 +1049,11 @@ export function AnalyticsPage() {
                         setExpandedAllProductId((prev) => (prev === r.productId ? null : r.productId))
                       }
                       expandedContent={
-                        <div className="grid grid-cols-2 gap-2 text-slate-600">
-                          <div>Category: <span className="text-slate-900 font-medium">{r.categoryName}</span></div>
-                          <div>Brand: <span className="text-slate-900 font-medium">{r.brandName}</span></div>
-                          <div>Cost: <span className="font-mono-num text-slate-900">{formatPKR(r.cost)}</span></div>
-                          <div>Stock: <span className="font-mono-num text-slate-900">{r.currentStock}</span></div>
+                        <div className="grid grid-cols-2 gap-2 text-[var(--cm-text-secondary)]">
+                          <div>Category: <span className="text-[var(--cm-text-primary)] font-medium">{r.categoryName}</span></div>
+                          <div>Brand: <span className="text-[var(--cm-text-primary)] font-medium">{r.brandName}</span></div>
+                          <div>Cost: <span className="font-mono-num text-[var(--cm-text-primary)]">{formatPKR(r.cost)}</span></div>
+                          <div>Stock: <span className="font-mono-num text-[var(--cm-text-primary)]">{r.currentStock}</span></div>
                         </div>
                       }
                     />
@@ -905,13 +1069,13 @@ export function AnalyticsPage() {
       {tab === 'comparison' && (
         <div className="space-y-4">
           {/* Monthly Comparison */}
-          <section className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 space-y-3.5">
+          <section className="cm-surface border rounded-xl p-3.5 sm:p-4 space-y-3.5">
             <div className="flex flex-wrap items-center justify-between gap-2.5">
               <div>
-                <h2 className="text-sm sm:text-base font-semibold text-slate-900">
+                <h2 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">
                   Monthly Comparison ({monthlyComp.currentLabel} vs {monthlyComp.previousLabel})
                 </h2>
-                <p className="text-[11px] sm:text-xs text-slate-500">
+                <p className="text-[11px] sm:text-xs text-[var(--cm-text-muted)]">
                   Sales, net profit, expenses, purchases, and units sold
                 </p>
               </div>
@@ -919,21 +1083,21 @@ export function AnalyticsPage() {
                 type="month"
                 value={selectedMonth}
                 onChange={(e) => setSelectedMonth(e.target.value)}
-                className="px-2.5 py-1.5 text-xs sm:text-sm border border-slate-200 rounded-lg font-mono-num"
+                className="px-2.5 py-1.5 text-xs sm:text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
 
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
-              <div className="border border-slate-200 rounded-lg p-3 space-y-1">
-                <div className="text-[11px] text-slate-500">Total Sales</div>
-                <div className="text-base sm:text-lg font-bold font-mono-num text-slate-900 truncate">
+              <div className="border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] rounded-lg p-3 space-y-1">
+                <div className="text-[11px] text-[var(--cm-text-muted)]">Total Sales</div>
+                <div className="text-base sm:text-lg font-bold font-mono-num text-[var(--cm-text-primary)] truncate">
                   {formatPKR(monthlyComp.currentSales)}
                 </div>
                 <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
-                  <span className="text-slate-500">Prev: {formatPKR(monthlyComp.previousSales)}</span>
+                  <span className="text-[var(--cm-text-muted)]">Prev: {formatPKR(monthlyComp.previousSales)}</span>
                   <span
                     className={`font-semibold font-mono-num inline-flex items-center ${
-                      (monthlyComp.revenueGrowthPct ?? 0) >= 0 ? 'text-emerald-700' : 'text-red-600'
+                      (monthlyComp.revenueGrowthPct ?? 0) >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'
                     }`}
                   >
                     {(monthlyComp.revenueGrowthPct ?? 0) >= 0 ? (
@@ -946,16 +1110,16 @@ export function AnalyticsPage() {
                 </div>
               </div>
 
-              <div className="border border-slate-200 rounded-lg p-3 space-y-1">
-                <div className="text-[11px] text-slate-500">Net Profit</div>
-                <div className="text-base sm:text-lg font-bold font-mono-num text-slate-900 truncate">
+              <div className="border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] rounded-lg p-3 space-y-1">
+                <div className="text-[11px] text-[var(--cm-text-muted)]">Net Profit</div>
+                <div className="text-base sm:text-lg font-bold font-mono-num text-[var(--cm-text-primary)] truncate">
                   {formatPKR(monthlyComp.currentProfit)}
                 </div>
                 <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
-                  <span className="text-slate-500">Prev: {formatPKR(monthlyComp.previousProfit)}</span>
+                  <span className="text-[var(--cm-text-muted)]">Prev: {formatPKR(monthlyComp.previousProfit)}</span>
                   <span
                     className={`font-semibold font-mono-num ${
-                      (monthlyComp.profitGrowthPct ?? 0) >= 0 ? 'text-emerald-700' : 'text-red-600'
+                      (monthlyComp.profitGrowthPct ?? 0) >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'
                     }`}
                   >
                     {formatGrowth(monthlyComp.profitGrowthPct)}
@@ -963,25 +1127,25 @@ export function AnalyticsPage() {
                 </div>
               </div>
 
-              <div className="border border-slate-200 rounded-lg p-3 space-y-1">
-                <div className="text-[11px] text-slate-500">Total Expenses</div>
-                <div className="text-base sm:text-lg font-bold font-mono-num text-slate-900 truncate">
+              <div className="border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] rounded-lg p-3 space-y-1">
+                <div className="text-[11px] text-[var(--cm-text-muted)]">Total Expenses</div>
+                <div className="text-base sm:text-lg font-bold font-mono-num text-[var(--cm-text-primary)] truncate">
                   {formatPKR(monthlyComp.currentExpenses)}
                 </div>
                 <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
-                  <span className="text-slate-500">Prev: {formatPKR(monthlyComp.previousExpenses)}</span>
-                  <span className="font-semibold font-mono-num text-slate-700">
+                  <span className="text-[var(--cm-text-muted)]">Prev: {formatPKR(monthlyComp.previousExpenses)}</span>
+                  <span className="font-semibold font-mono-num text-[var(--cm-text-secondary)]">
                     {formatGrowth(monthlyComp.expenseGrowthPct)}
                   </span>
                 </div>
               </div>
 
-              <div className="border border-slate-200 rounded-lg p-3 space-y-1">
-                <div className="text-[11px] text-slate-500">Purchases & Units</div>
-                <div className="text-base sm:text-lg font-bold font-mono-num text-slate-900 truncate">
+              <div className="border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] rounded-lg p-3 space-y-1">
+                <div className="text-[11px] text-[var(--cm-text-muted)]">Purchases & Units</div>
+                <div className="text-base sm:text-lg font-bold font-mono-num text-[var(--cm-text-primary)] truncate">
                   {formatPKR(monthlyComp.currentPurchases)}
                 </div>
-                <div className="text-[11px] text-slate-500 font-mono-num">
+                <div className="text-[11px] text-[var(--cm-text-muted)] font-mono-num">
                   Sold: {formatNumber(monthlyComp.currentUnitsSold)} (Prev:{' '}
                   {formatNumber(monthlyComp.previousUnitsSold)})
                 </div>
@@ -1000,26 +1164,26 @@ export function AnalyticsPage() {
                   ]}
                   margin={{ top: 8, right: 12, left: 0, bottom: 4 }}
                 >
-                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
-                  <XAxis dataKey="name" tick={{ fontSize: 11, fill: '#64748b' }} />
-                  <YAxis tick={{ fontSize: 11, fill: '#64748b' }} />
-                  <Tooltip formatter={(v) => formatPKR(Number(v ?? 0))} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--cm-chart-grid)" vertical={false} />
+                  <XAxis dataKey="name" tick={{ fontSize: 11, fill: 'var(--cm-chart-tick)' }} />
+                  <YAxis tick={{ fontSize: 11, fill: 'var(--cm-chart-tick)' }} />
+                  <Tooltip formatter={(v) => formatPKR(Number(v ?? 0))} contentStyle={tooltipContentStyle} />
                   <Legend wrapperStyle={{ fontSize: '12px' }} />
                   <Bar dataKey="Previous" name={monthlyComp.previousLabel} fill="#94a3b8" radius={[4, 4, 0, 0]} />
-                  <Bar dataKey="Current" name={monthlyComp.currentLabel} fill="#0d9488" radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="Current" name={monthlyComp.currentLabel} fill="#65a30d" radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
           </section>
 
           {/* Yearly Comparison */}
-          <section className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 space-y-3.5">
+          <section className="cm-surface border rounded-xl p-3.5 sm:p-4 space-y-3.5">
             <div className="flex flex-wrap items-center justify-between gap-2.5">
               <div>
-                <h2 className="text-sm sm:text-base font-semibold text-slate-900">
+                <h2 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">
                   Yearly Comparison ({yearlyComp.currentLabel} vs {yearlyComp.previousLabel})
                 </h2>
-                <p className="text-[11px] sm:text-xs text-slate-500">Annual sales, profit, expenses, and purchases</p>
+                <p className="text-[11px] sm:text-xs text-[var(--cm-text-muted)]">Annual sales, profit, expenses, and purchases</p>
               </div>
               <input
                 type="number"
@@ -1027,36 +1191,36 @@ export function AnalyticsPage() {
                 max={2040}
                 value={selectedYear}
                 onChange={(e) => setSelectedYear(e.target.value)}
-                className="w-24 px-2.5 py-1.5 text-xs sm:text-sm border border-slate-200 rounded-lg font-mono-num"
+                className="w-24 px-2.5 py-1.5 text-xs sm:text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
 
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
-              <div className="border border-slate-200 rounded-lg p-3">
-                <div className="text-[11px] text-slate-500">Annual Sales</div>
-                <div className="text-base sm:text-lg font-bold font-mono-num truncate">{formatPKR(yearlyComp.currentSales)}</div>
-                <div className="text-[11px] text-slate-500 font-mono-num">
+              <div className="border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] rounded-lg p-3">
+                <div className="text-[11px] text-[var(--cm-text-muted)]">Annual Sales</div>
+                <div className="text-base sm:text-lg font-bold font-mono-num text-[var(--cm-text-primary)] truncate">{formatPKR(yearlyComp.currentSales)}</div>
+                <div className="text-[11px] text-[var(--cm-text-muted)] font-mono-num">
                   Prev: {formatPKR(yearlyComp.previousSales)} · {formatGrowth(yearlyComp.revenueGrowthPct)}
                 </div>
               </div>
-              <div className="border border-slate-200 rounded-lg p-3">
-                <div className="text-[11px] text-slate-500">Annual Net Profit</div>
-                <div className="text-base sm:text-lg font-bold font-mono-num truncate">{formatPKR(yearlyComp.currentProfit)}</div>
-                <div className="text-[11px] text-slate-500 font-mono-num">
+              <div className="border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] rounded-lg p-3">
+                <div className="text-[11px] text-[var(--cm-text-muted)]">Annual Net Profit</div>
+                <div className="text-base sm:text-lg font-bold font-mono-num text-[var(--cm-text-primary)] truncate">{formatPKR(yearlyComp.currentProfit)}</div>
+                <div className="text-[11px] text-[var(--cm-text-muted)] font-mono-num">
                   Prev: {formatPKR(yearlyComp.previousProfit)} · {formatGrowth(yearlyComp.profitGrowthPct)}
                 </div>
               </div>
-              <div className="border border-slate-200 rounded-lg p-3">
-                <div className="text-[11px] text-slate-500">Annual Expenses</div>
-                <div className="text-base sm:text-lg font-bold font-mono-num truncate">{formatPKR(yearlyComp.currentExpenses)}</div>
-                <div className="text-[11px] text-slate-500 font-mono-num">
+              <div className="border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] rounded-lg p-3">
+                <div className="text-[11px] text-[var(--cm-text-muted)]">Annual Expenses</div>
+                <div className="text-base sm:text-lg font-bold font-mono-num text-[var(--cm-text-primary)] truncate">{formatPKR(yearlyComp.currentExpenses)}</div>
+                <div className="text-[11px] text-[var(--cm-text-muted)] font-mono-num">
                   Prev: {formatPKR(yearlyComp.previousExpenses)} · {formatGrowth(yearlyComp.expenseGrowthPct)}
                 </div>
               </div>
-              <div className="border border-slate-200 rounded-lg p-3">
-                <div className="text-[11px] text-slate-500">Annual Purchases</div>
-                <div className="text-base sm:text-lg font-bold font-mono-num truncate">{formatPKR(yearlyComp.currentPurchases)}</div>
-                <div className="text-[11px] text-slate-500 font-mono-num">
+              <div className="border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] rounded-lg p-3">
+                <div className="text-[11px] text-[var(--cm-text-muted)]">Annual Purchases</div>
+                <div className="text-base sm:text-lg font-bold font-mono-num text-[var(--cm-text-primary)] truncate">{formatPKR(yearlyComp.currentPurchases)}</div>
+                <div className="text-[11px] text-[var(--cm-text-muted)] font-mono-num">
                   Units Sold: {formatNumber(yearlyComp.currentUnitsSold)}
                 </div>
               </div>
@@ -1067,48 +1231,48 @@ export function AnalyticsPage() {
 
       {/* TAB 3: Profit & Loss Statement */}
       {tab === 'pnl' && (
-        <section className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-5 space-y-3.5">
+        <section className="cm-surface border rounded-xl p-3.5 sm:p-5 space-y-3.5">
           <div>
-            <h2 className="text-sm sm:text-base font-semibold text-slate-900">
+            <h2 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">
               Profit & Loss Statement ({formatDateDDMMYYYY(fromDate)} – {formatDateDDMMYYYY(toDate)})
             </h2>
-            <p className="text-[11px] sm:text-xs text-slate-500">
+            <p className="text-[11px] sm:text-xs text-[var(--cm-text-muted)]">
               Calculated from historical purchase cost of goods sold minus operating expenses.
             </p>
           </div>
 
-          <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg">
+          <div className="divide-y divide-[var(--cm-border)] border border-[var(--cm-border)] rounded-lg overflow-hidden">
             <div className="p-3 sm:p-3.5 flex items-center justify-between gap-2 text-xs sm:text-sm">
-              <span className="font-medium text-slate-700">Total Revenue (Sales − Returns)</span>
-              <span className="font-bold font-mono-num text-slate-900 whitespace-nowrap">{formatPKR(pnlBreakdown.revenue)}</span>
+              <span className="font-medium text-[var(--cm-text-secondary)]">Total Revenue (Sales − Returns)</span>
+              <span className="font-bold font-mono-num text-[var(--cm-text-primary)] whitespace-nowrap">{formatPKR(pnlBreakdown.revenue)}</span>
             </div>
             <div className="p-3 sm:p-3.5 flex items-center justify-between gap-2 text-xs sm:text-sm">
-              <span className="font-medium text-slate-700">Cost of Goods Sold</span>
-              <span className="font-mono-num text-slate-700 whitespace-nowrap">− {formatPKR(pnlBreakdown.cogs)}</span>
+              <span className="font-medium text-[var(--cm-text-secondary)]">Cost of Goods Sold</span>
+              <span className="font-mono-num text-[var(--cm-text-secondary)] whitespace-nowrap">− {formatPKR(pnlBreakdown.cogs)}</span>
             </div>
-            <div className="p-3 sm:p-3.5 flex items-center justify-between gap-2 text-xs sm:text-sm bg-slate-50">
-              <span className="font-semibold text-slate-900">
+            <div className="p-3 sm:p-3.5 flex items-center justify-between gap-2 text-xs sm:text-sm bg-[var(--cm-bg-subtle)]">
+              <span className="font-semibold text-[var(--cm-text-primary)]">
                 Gross Profit ({pnlBreakdown.grossMargin}%)
               </span>
               <span
                 className={`font-bold font-mono-num whitespace-nowrap ${
-                  pnlBreakdown.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-600'
+                  pnlBreakdown.grossProfit >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'
                 }`}
               >
                 {formatPKR(pnlBreakdown.grossProfit)}
               </span>
             </div>
             <div className="p-3 sm:p-3.5 flex items-center justify-between gap-2 text-xs sm:text-sm">
-              <span className="font-medium text-slate-700">Total Business Expenses</span>
-              <span className="font-mono-num text-red-600 whitespace-nowrap">− {formatPKR(pnlBreakdown.totalExpenses)}</span>
+              <span className="font-medium text-[var(--cm-text-secondary)]">Total Business Expenses</span>
+              <span className="font-mono-num text-[var(--cm-danger)] whitespace-nowrap">− {formatPKR(pnlBreakdown.totalExpenses)}</span>
             </div>
-            <div className="p-3 sm:p-3.5 flex items-center justify-between gap-2 text-sm sm:text-base bg-slate-50">
-              <span className="font-bold text-slate-900">
+            <div className="p-3 sm:p-3.5 flex items-center justify-between gap-2 text-sm sm:text-base bg-[var(--cm-bg-subtle)]">
+              <span className="font-bold text-[var(--cm-text-primary)]">
                 Net Profit ({pnlBreakdown.netMargin}% net)
               </span>
               <span
                 className={`font-bold font-mono-num whitespace-nowrap ${
-                  pnlBreakdown.netProfit >= 0 ? 'text-emerald-700' : 'text-red-600'
+                  pnlBreakdown.netProfit >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'
                 }`}
               >
                 {formatPKR(pnlBreakdown.netProfit)}

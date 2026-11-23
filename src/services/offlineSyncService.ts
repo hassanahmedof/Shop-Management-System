@@ -1,15 +1,21 @@
 import type {
+  Brand,
+  Category,
   PaymentMethod,
+  Product,
+  ProductTemplate,
   StaffCatalogItem,
   StaffMember,
   StaffSale,
   StaffSaleLine,
 } from '../types/shop';
-import { formatDateTimeKarachi, roundMoney } from '../utils/formatters';
+import { formatDateTimeKarachi, normalizeCustomerWhatsapp, roundMoney } from '../utils/formatters';
+import { getAllowedSaleUnits, getEffectiveBaseUnit, roundStockQty } from '../utils/packaging';
 import { createStaffSale } from './staffService';
 
 const SESSION_CACHE_PREFIX = 'cm_offline_staff_session_';
 const CATALOG_CACHE_PREFIX = 'cm_offline_staff_catalog_';
+const OWNER_CATALOG_CACHE_PREFIX = 'cm_owner_catalog_v1_';
 const SALES_CACHE_PREFIX = 'cm_offline_staff_sales_';
 const QUEUE_CACHE_PREFIX = 'cm_offline_sale_queue_';
 
@@ -26,6 +32,10 @@ export interface OfflineQueuedSaleItem {
   productId: string;
   productName: string;
   unit: string;
+  unitName: string;
+  unitQuantity: number;
+  conversionFactor: number;
+  baseQuantity: number;
   quantity: number;
   salePricePerUnit: number;
   lineTotal: number;
@@ -42,6 +52,7 @@ export interface OfflineQueuedSale {
   saleDate: string; // YYYY-MM-DD
   saleDateTime: string; // DD-MM-YYYY HH:mm
   paymentMethod: PaymentMethod;
+  customerWhatsapp?: string;
   notes: string;
   items: OfflineQueuedSaleItem[];
   totalAmount: number;
@@ -224,8 +235,17 @@ export function saveCachedStaffCatalog(
     categoryName: item.categoryName,
     brandName: item.brandName,
     salePrice: item.salePrice,
+    wholesalePrice: item.wholesalePrice ?? 0,
     currentStock: item.currentStock,
     unit: item.unit,
+    baseUnit: item.baseUnit || item.unit,
+    packagingUnits: Array.isArray(item.packagingUnits) ? item.packagingUnits : [],
+    originType: item.originType || '',
+    bottleSize: item.bottleSize || '',
+    storageLocation: item.storageLocation || '',
+    isReturnable: Boolean(item.isReturnable),
+    returnableUnitName: item.returnableUnitName || '',
+    depositPerReturnable: item.depositPerReturnable ?? 0,
     isActive: item.isActive,
     allowedStaffUids: Array.isArray(item.allowedStaffUids) ? item.allowedStaffUids : [],
   }));
@@ -263,6 +283,7 @@ export function saveCachedStaffSales(
     staffAuthUid: s.staffAuthUid,
     staffName: s.staffName,
     staffUsername: s.staffUsername,
+    ...(s.customerWhatsapp ? { customerWhatsapp: s.customerWhatsapp } : {}),
     notes: s.notes,
     status: s.status,
     syncedToLedger: Boolean(s.syncedToLedger),
@@ -274,6 +295,130 @@ export function loadCachedStaffSales(shopId: string, staffAuthUid: string): Staf
   if (!shopId || !staffAuthUid) return [];
   const data = readJson<StaffSale[]>(salesCacheKey(shopId, staffAuthUid), []);
   return Array.isArray(data) ? data : [];
+}
+
+// ---------------------------------------------------------------------------
+// Owner Permanent Catalog Cache (Offline-First Instant Startup & Search)
+// ---------------------------------------------------------------------------
+export interface CachedOwnerCatalogSnapshot {
+  shopId: string;
+  cachedAtIso: string;
+  categories: Category[];
+  brands: Brand[];
+  products: Product[];
+  productTemplates: ProductTemplate[];
+}
+
+function ownerCatalogCacheKey(shopId: string): string {
+  return `${OWNER_CATALOG_CACHE_PREFIX}${shopId}`;
+}
+
+export function saveCachedOwnerCatalog(
+  shopId: string,
+  snapshot: {
+    categories: Category[];
+    brands: Brand[];
+    products: Product[];
+    productTemplates: ProductTemplate[];
+  }
+): void {
+  if (!shopId) return;
+  const payload: CachedOwnerCatalogSnapshot = {
+    shopId,
+    cachedAtIso: new Date().toISOString(),
+    categories: snapshot.categories.map((c) => ({
+      id: c.id,
+      ownerUid: c.ownerUid,
+      name: c.name,
+      description: c.description || '',
+    })),
+    brands: snapshot.brands.map((b) => ({
+      id: b.id,
+      ownerUid: b.ownerUid,
+      name: b.name,
+      categoryIds: Array.isArray(b.categoryIds) ? b.categoryIds : [],
+      isActive: b.isActive !== false,
+    })),
+    products: snapshot.products.map((p) => ({
+      id: p.id,
+      ownerUid: p.ownerUid,
+      name: p.name,
+      categoryId: p.categoryId,
+      categoryName: p.categoryName,
+      brandId: p.brandId,
+      brandName: p.brandName,
+      purchasePrice: p.purchasePrice,
+      salePrice: p.salePrice,
+      wholesalePrice: p.wholesalePrice ?? 0,
+      currentStock: p.currentStock,
+      minStockLevel: p.minStockLevel,
+      maxStockLevel: p.maxStockLevel,
+      unit: p.unit,
+      baseUnit: p.baseUnit || p.unit,
+      packagingUnits: Array.isArray(p.packagingUnits) ? p.packagingUnits : [],
+      originType: p.originType || '',
+      bottleSize: p.bottleSize || '',
+      storageLocation: p.storageLocation || '',
+      isReturnable: Boolean(p.isReturnable),
+      returnableUnitName: p.returnableUnitName || '',
+      depositPerReturnable: p.depositPerReturnable ?? 0,
+      emptyContainersOnHand: p.emptyContainersOnHand ?? 0,
+      supplierId: p.supplierId,
+      supplierName: p.supplierName,
+      expiryDate: p.expiryDate || '',
+      profitMarginPct: p.profitMarginPct,
+      isActive: p.isActive !== false,
+    })),
+    productTemplates: snapshot.productTemplates.map((t) => ({
+      id: t.id,
+      ownerUid: t.ownerUid,
+      name: t.name,
+      categoryId: t.categoryId,
+      categoryName: t.categoryName,
+      brandId: t.brandId,
+      brandName: t.brandName,
+      variant: t.variant || '',
+      originType: t.originType || '',
+      baseUnit: t.baseUnit,
+      defaultPurchaseUnit: t.defaultPurchaseUnit,
+      defaultSaleUnit: t.defaultSaleUnit,
+      packagingUnits: Array.isArray(t.packagingUnits) ? t.packagingUnits : [],
+      hasUnconfirmedPackaging: Boolean(t.hasUnconfirmedPackaging),
+      suggestedPurchasePrice: t.suggestedPurchasePrice,
+      suggestedSalePrice: t.suggestedSalePrice,
+      suggestedWholesalePrice: t.suggestedWholesalePrice,
+      priceSource: t.priceSource,
+      priceUpdatedAt: t.priceUpdatedAt,
+      trackExpiry: Boolean(t.trackExpiry),
+      bottleSize: t.bottleSize,
+      storageLocation: t.storageLocation,
+      isReturnable: Boolean(t.isReturnable),
+      returnableUnitName: t.returnableUnitName,
+      searchKeywords: Array.isArray(t.searchKeywords) ? t.searchKeywords : [],
+      isActive: t.isActive !== false,
+      isCustom: Boolean(t.isCustom),
+    })),
+  };
+  writeJson(ownerCatalogCacheKey(shopId), payload);
+}
+
+export function loadCachedOwnerCatalog(shopId: string): CachedOwnerCatalogSnapshot | null {
+  if (!shopId) return null;
+  const data = readJson<CachedOwnerCatalogSnapshot | null>(ownerCatalogCacheKey(shopId), null);
+  if (!data || data.shopId !== shopId) return null;
+  return {
+    shopId: data.shopId,
+    cachedAtIso: data.cachedAtIso || '',
+    categories: Array.isArray(data.categories) ? data.categories : [],
+    brands: Array.isArray(data.brands) ? data.brands : [],
+    products: Array.isArray(data.products) ? data.products : [],
+    productTemplates: Array.isArray(data.productTemplates) ? data.productTemplates : [],
+  };
+}
+
+export function clearCachedOwnerCatalog(shopId: string): void {
+  if (!shopId) return;
+  removeKey(ownerCatalogCacheKey(shopId));
 }
 
 // ---------------------------------------------------------------------------
@@ -313,8 +458,14 @@ export function createAndEnqueueOfflineSale(
   input: {
     saleDate: string;
     paymentMethod: PaymentMethod;
+    customerWhatsapp?: string;
     notes: string;
-    items: Array<{ productId: string; quantity: number }>;
+    items: Array<{
+      productId: string;
+      quantity: number;
+      unitName?: string;
+      conversionFactor?: number;
+    }>;
   }
 ): OfflineQueuedSale {
   if (!staff.isActive || !staff.permissions.canAddSales) {
@@ -324,47 +475,85 @@ export function createAndEnqueueOfflineSale(
     throw new Error('Add at least one product to record a sale.');
   }
 
-  const merged = new Map<string, number>();
+  const merged = new Map<
+    string,
+    { productId: string; unitName: string; conversionFactor: number; unitQuantity: number }
+  >();
   for (const row of input.items) {
     if (!row.productId) {
       throw new Error('Select a product for every row.');
     }
-    if (!Number.isFinite(row.quantity) || row.quantity <= 0) {
+    const qty = roundStockQty(Number(row.quantity) || 0);
+    if (!Number.isFinite(qty) || qty <= 0) {
       throw new Error('Quantity must be greater than zero.');
     }
-    merged.set(row.productId, (merged.get(row.productId) || 0) + Math.floor(row.quantity));
+    const unitKey = (row.unitName || '').trim();
+    const conv = roundStockQty(Number(row.conversionFactor) || 1) || 1;
+    const key = `${row.productId}::${unitKey}`;
+    const prev = merged.get(key);
+    if (prev) {
+      prev.unitQuantity = roundStockQty(prev.unitQuantity + qty);
+    } else {
+      merged.set(key, {
+        productId: row.productId,
+        unitName: unitKey,
+        conversionFactor: conv,
+        unitQuantity: qty,
+      });
+    }
   }
 
   const lines: OfflineQueuedSaleItem[] = [];
+  const totalBaseByProduct = new Map<string, number>();
   let totalAmount = 0;
   let totalQuantity = 0;
 
-  for (const [productId, qty] of merged.entries()) {
-    const prod = effectiveCatalogMap.get(productId);
+  for (const row of merged.values()) {
+    const prod = effectiveCatalogMap.get(row.productId);
     if (!prod || !prod.isActive) {
       throw new Error('Selected product is not available in the catalog.');
     }
-    if (qty > prod.currentStock) {
+    const allowedUnits = getAllowedSaleUnits(prod);
+    const matchedUnit =
+      (row.unitName
+        ? allowedUnits.find((u) => u.unitName.toLowerCase() === row.unitName.toLowerCase())
+        : undefined) || allowedUnits[0];
+    if (!matchedUnit) {
+      throw new Error(`Invalid unit selected for "${prod.name}".`);
+    }
+
+    const conv = roundStockQty(matchedUnit.conversionQty || row.conversionFactor || 1);
+    const baseQty = roundStockQty(row.unitQuantity * conv);
+    const cumulativeBase = roundStockQty((totalBaseByProduct.get(prod.productId) || 0) + baseQty);
+    totalBaseByProduct.set(prod.productId, cumulativeBase);
+
+    const baseUnit = getEffectiveBaseUnit(prod);
+    if (cumulativeBase > prod.currentStock) {
       throw new Error(
-        `Insufficient stock for "${prod.name}". Available: ${prod.currentStock} ${prod.unit}, Requested: ${qty}.`
+        `Insufficient stock for "${prod.name}". Available: ${prod.currentStock} ${baseUnit}, Requested: ${cumulativeBase} ${baseUnit}.`
       );
     }
 
-    const lineTotal = roundMoney(qty * prod.salePrice);
+    const lineTotal = roundMoney(row.unitQuantity * matchedUnit.salePrice);
     totalAmount = roundMoney(totalAmount + lineTotal);
-    totalQuantity += qty;
+    totalQuantity = roundStockQty(totalQuantity + baseQty);
 
     lines.push({
       productId: prod.productId,
       productName: prod.name.trim().slice(0, 180),
-      unit: prod.unit,
-      quantity: qty,
-      salePricePerUnit: prod.salePrice,
+      unit: matchedUnit.unitName,
+      unitName: matchedUnit.unitName,
+      unitQuantity: row.unitQuantity,
+      conversionFactor: conv,
+      baseQuantity: baseQty,
+      quantity: row.unitQuantity,
+      salePricePerUnit: matchedUnit.salePrice,
       lineTotal,
     });
   }
 
   const now = new Date();
+  const cleanWhatsapp = normalizeCustomerWhatsapp(input.customerWhatsapp);
   const queued: OfflineQueuedSale = {
     localId: `off_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     shopId,
@@ -376,6 +565,7 @@ export function createAndEnqueueOfflineSale(
     saleDate: input.saleDate,
     saleDateTime: formatDateTimeKarachi(now),
     paymentMethod: input.paymentMethod,
+    ...(cleanWhatsapp ? { customerWhatsapp: cleanWhatsapp } : {}),
     notes: (input.notes || '').trim().slice(0, 500),
     items: lines,
     totalAmount,
@@ -425,7 +615,13 @@ export function applyPendingSalesToCatalog(
   const reservedQty = new Map<string, number>();
   for (const sale of pendingSales) {
     for (const line of sale.items) {
-      reservedQty.set(line.productId, (reservedQty.get(line.productId) || 0) + line.quantity);
+      const baseQty = roundStockQty(
+        line.baseQuantity ?? line.quantity * (line.conversionFactor || 1)
+      );
+      reservedQty.set(
+        line.productId,
+        roundStockQty((reservedQty.get(line.productId) || 0) + baseQty)
+      );
     }
   }
   if (reservedQty.size === 0) return catalog;
@@ -435,7 +631,7 @@ export function applyPendingSalesToCatalog(
     if (!reserved) return item;
     return {
       ...item,
-      currentStock: Math.max(0, item.currentStock - reserved),
+      currentStock: roundStockQty(Math.max(0, item.currentStock - reserved)),
     };
   });
 }
@@ -445,6 +641,10 @@ export function mapQueuedSaleToStaffSale(queued: OfflineQueuedSale): DisplayStaf
     productId: i.productId,
     productName: i.productName,
     quantity: i.quantity,
+    unitName: i.unitName || i.unit,
+    unitQuantity: i.unitQuantity ?? i.quantity,
+    conversionFactor: i.conversionFactor ?? 1,
+    baseQuantity: i.baseQuantity ?? i.quantity,
     salePricePerUnit: i.salePricePerUnit,
     lineTotal: i.lineTotal,
   }));
@@ -465,6 +665,7 @@ export function mapQueuedSaleToStaffSale(queued: OfflineQueuedSale): DisplayStaf
     staffAuthUid: queued.staffAuthUid,
     staffName: queued.staffName,
     staffUsername: queued.staffUsername,
+    ...(queued.customerWhatsapp ? { customerWhatsapp: queued.customerWhatsapp } : {}),
     notes: queued.notes,
     status: 'completed',
     syncedToLedger: false,
@@ -543,13 +744,16 @@ export async function syncQueuedOfflineSales(
         await createStaffSale(shopId, staff, {
           saleDate: item.saleDate,
           paymentMethod: item.paymentMethod,
+          customerWhatsapp: item.customerWhatsapp,
           notes: item.notes,
           saleNumber: item.saleNumber,
           saleDateTime: item.saleDateTime,
           clientRequestId: item.localId,
           items: item.items.map((l) => ({
             productId: l.productId,
-            quantity: l.quantity,
+            quantity: l.unitQuantity ?? l.quantity,
+            unitName: l.unitName || l.unit,
+            conversionFactor: l.conversionFactor ?? 1,
           })),
         });
 

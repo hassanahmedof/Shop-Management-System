@@ -2,12 +2,14 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx';
 import type {
+  AdminMember,
   Expense,
   Product,
   Purchase,
   Sale,
   SaleItem,
   ShopSettings,
+  StaffMember,
   StockMovement,
 } from '../types/shop';
 import { computeProductPerformance } from './analytics';
@@ -19,9 +21,16 @@ import {
   getMonthKey,
   roundMoney,
 } from './formatters';
+import { formatStockBreakdown, getEffectiveBaseUnit, roundStockQty } from './packaging';
+import {
+  type AuthUserSummary,
+  computeSellerPerformanceBreakdown,
+  formatSaleSellerLabel,
+} from './sellerAttribution';
 
 export type ReportType =
   | 'sales'
+  | 'seller_performance'
   | 'purchases'
   | 'expenses'
   | 'inventory'
@@ -51,9 +60,27 @@ export function buildReportData(
     purchases: Purchase[];
     expenses: Expense[];
     stockMovements: StockMovement[];
+    staffMembers?: StaffMember[];
+    adminMembers?: AdminMember[];
+    user?: AuthUserSummary | null;
+    shopId?: string | null;
   }
 ): ReportTableData {
-  const { fromDate, toDate, products, sales, saleItems, purchases, expenses, stockMovements } = params;
+  const {
+    fromDate,
+    toDate,
+    settings,
+    products,
+    sales,
+    saleItems,
+    purchases,
+    expenses,
+    stockMovements,
+    staffMembers = [],
+    adminMembers = [],
+    user = null,
+    shopId = null,
+  } = params;
   const rangeLabel = `${formatDateDDMMYYYY(fromDate)} to ${formatDateDDMMYYYY(toDate)}`;
   const inRange = (d: string) => (!fromDate || d >= fromDate) && (!toDate || d <= toDate);
 
@@ -69,10 +96,22 @@ export function buildReportData(
       return {
         title: 'Sales Report',
         subtitle: `Period: ${rangeLabel}`,
-        columns: ['Date', 'Sale #', 'Payment', 'Items', 'Qty', 'Total (PKR)', 'Cost (PKR)', 'Profit (PKR)', 'Status'],
+        columns: [
+          'Date',
+          'Sale #',
+          'Recorded By',
+          'Payment',
+          'Items',
+          'Qty',
+          'Total (PKR)',
+          'Cost (PKR)',
+          'Profit (PKR)',
+          'Status',
+        ],
         rows: filtered.map((s) => [
           formatDateDDMMYYYY(s.saleDate),
           s.saleNumber,
+          formatSaleSellerLabel(s),
           s.paymentMethod,
           s.itemCount,
           s.totalQuantity,
@@ -86,6 +125,52 @@ export function buildReportData(
           { label: 'Total Revenue', value: formatPKR(totalRev) },
           { label: 'Cost of Goods Sold', value: formatPKR(totalCogs) },
           { label: 'Gross Profit', value: formatPKR(totalProfit) },
+        ],
+      };
+    }
+
+    case 'seller_performance': {
+      const breakdown = computeSellerPerformanceBreakdown({
+        sales,
+        staffMembers,
+        adminMembers,
+        settings,
+        user,
+        shopId,
+        fromDate,
+        toDate,
+      });
+      const totalBills = breakdown.reduce((acc, r) => acc + r.orders, 0);
+      const totalRev = breakdown.reduce((acc, r) => roundMoney(acc + r.revenue), 0);
+      const totalProfit = breakdown.reduce((acc, r) => roundMoney(acc + r.grossProfit), 0);
+      return {
+        title: 'Admin & Staff Sales Performance Report',
+        subtitle: `Period: ${rangeLabel}`,
+        columns: [
+          'Seller / Admin',
+          'Bills',
+          'Base Units',
+          'Cash (PKR)',
+          'Online (PKR)',
+          'Total Sales (PKR)',
+          'Gross Profit (PKR)',
+          'Avg Bill (PKR)',
+        ],
+        rows: breakdown.map((r) => [
+          r.sellerLabel,
+          r.orders,
+          r.unitsSold,
+          roundMoney(r.cashTotal),
+          roundMoney(r.onlineTotal),
+          roundMoney(r.revenue),
+          roundMoney(r.grossProfit),
+          roundMoney(r.avgBill),
+        ]),
+        summaryLines: [
+          { label: 'Sellers Tracked', value: String(breakdown.length) },
+          { label: 'Total Bills', value: String(totalBills) },
+          { label: 'Total Sales', value: formatPKR(totalRev) },
+          { label: 'Total Gross Profit', value: formatPKR(totalProfit) },
         ],
       };
     }
@@ -148,28 +233,32 @@ export function buildReportData(
 
     case 'inventory': {
       const sorted = [...products].sort((a, b) => a.name.localeCompare(b.name));
-      const totalUnits = sorted.reduce((acc, p) => acc + p.currentStock, 0);
+      const totalUnits = roundStockQty(sorted.reduce((acc, p) => acc + p.currentStock, 0));
       const totalVal = sorted.reduce((acc, p) => roundMoney(acc + p.currentStock * p.purchasePrice), 0);
       const retailVal = sorted.reduce((acc, p) => roundMoney(acc + p.currentStock * p.salePrice), 0);
       return {
         title: 'Inventory Valuation Report',
         subtitle: `As of ${formatDateDDMMYYYY(getKarachiDateIso())}`,
-        columns: ['Product', 'Category', 'Brand', 'Stock', 'Unit', 'Buy Price', 'Sale Price', 'Stock Value (PKR)', 'Margin %', 'Expiry'],
-        rows: sorted.map((p) => [
-          p.name,
-          p.categoryName,
-          p.brandName,
-          p.currentStock,
-          p.unit,
-          roundMoney(p.purchasePrice),
-          roundMoney(p.salePrice),
-          roundMoney(p.currentStock * p.purchasePrice),
-          `${p.profitMarginPct}%`,
-          p.expiryDate ? formatDateDDMMYYYY(p.expiryDate) : '—',
-        ]),
+        columns: ['Product', 'Category', 'Brand', 'Stock', 'Base Unit', 'Packaging Breakdown', 'Buy Price', 'Sale Price', 'Stock Value (PKR)', 'Margin %', 'Expiry'],
+        rows: sorted.map((p) => {
+          const breakdown = formatStockBreakdown(p.currentStock, p);
+          return [
+            p.name,
+            p.categoryName,
+            p.brandName,
+            p.currentStock,
+            getEffectiveBaseUnit(p),
+            breakdown.packageBreakdownText || '—',
+            roundMoney(p.purchasePrice),
+            roundMoney(p.salePrice),
+            roundMoney(p.currentStock * p.purchasePrice),
+            `${p.profitMarginPct}%`,
+            p.expiryDate ? formatDateDDMMYYYY(p.expiryDate) : '—',
+          ];
+        }),
         summaryLines: [
           { label: 'Total SKUs', value: String(sorted.length) },
-          { label: 'Total Units in Stock', value: String(totalUnits) },
+          { label: 'Total Base Units in Stock', value: String(totalUnits) },
           { label: 'Inventory Value (Cost)', value: formatPKR(totalVal) },
           { label: 'Potential Retail Value', value: formatPKR(retailVal) },
         ],
@@ -183,11 +272,12 @@ export function buildReportData(
       return {
         title: 'Stock Movement Report',
         subtitle: `Period: ${rangeLabel}`,
-        columns: ['Date', 'Product', 'Type', 'Change', 'Prev Stock', 'New Stock', 'Notes'],
+        columns: ['Date', 'Product', 'Type', 'Unit Qty', 'Base Change', 'Prev Stock', 'New Stock', 'Notes'],
         rows: filtered.map((m) => [
           formatDateDDMMYYYY(m.movementDate),
           m.productName,
           m.movementType.replace(/_/g, ' '),
+          m.unitName && m.unitQuantity ? `${m.unitQuantity} ${m.unitName}` : '—',
           m.quantityChange > 0 ? `+${m.quantityChange}` : String(m.quantityChange),
           m.previousStock,
           m.newStock,

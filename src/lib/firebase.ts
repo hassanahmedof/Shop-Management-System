@@ -19,7 +19,7 @@ function initDb() {
     return initializeFirestore(
       app,
       {
-        experimentalForceLongPolling: true,
+        experimentalAutoDetectLongPolling: true,
         localCache: persistentLocalCache({
           tabManager: persistentMultipleTabManager(),
         }),
@@ -30,7 +30,7 @@ function initDb() {
     try {
       return initializeFirestore(
         app,
-        { experimentalForceLongPolling: true },
+        { experimentalAutoDetectLongPolling: true },
         firestoreDatabaseId
       );
     } catch {

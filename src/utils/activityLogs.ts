@@ -23,121 +23,121 @@ const ACTION_META_MAP: Record<string, ActivityActionMeta> = {
     category: 'sales',
     categoryLabel: 'Sales',
     actionLabel: 'Sale Recorded',
-    toneClass: 'text-emerald-700',
+    toneClass: 'text-[var(--cm-success)]',
   },
   SYNC_STAFF_SALE: {
     category: 'sales',
     categoryLabel: 'Sales',
     actionLabel: 'Staff Sale Recorded',
-    toneClass: 'text-teal-700',
+    toneClass: 'text-[var(--cm-accent-text)]',
   },
   EDIT_SALE: {
     category: 'sales',
     categoryLabel: 'Sales',
     actionLabel: 'Sale Edited',
-    toneClass: 'text-amber-700',
+    toneClass: 'text-[var(--cm-warning)]',
   },
   CANCEL_SALE: {
     category: 'sales',
     categoryLabel: 'Sales',
     actionLabel: 'Sale Cancelled',
-    toneClass: 'text-red-700',
+    toneClass: 'text-[var(--cm-danger)]',
   },
   STOCK_ADJUSTMENT: {
     category: 'inventory',
     categoryLabel: 'Inventory',
     actionLabel: 'Stock Adjusted',
-    toneClass: 'text-amber-700',
+    toneClass: 'text-[var(--cm-warning)]',
   },
   CREATE_PRODUCT: {
     category: 'inventory',
     categoryLabel: 'Inventory',
     actionLabel: 'Product Added',
-    toneClass: 'text-teal-700',
+    toneClass: 'text-[var(--cm-accent-text)]',
   },
   UPDATE_PRODUCT: {
     category: 'inventory',
     categoryLabel: 'Inventory',
     actionLabel: 'Product Updated',
-    toneClass: 'text-slate-800',
+    toneClass: 'text-[var(--cm-text-primary)]',
   },
   DELETE_PRODUCT: {
     category: 'inventory',
     categoryLabel: 'Inventory',
     actionLabel: 'Product Deleted',
-    toneClass: 'text-red-700',
+    toneClass: 'text-[var(--cm-danger)]',
   },
   STAFF_LOGIN: {
     category: 'staff',
     categoryLabel: 'Staff & Logins',
     actionLabel: 'Staff Login',
-    toneClass: 'text-teal-700',
+    toneClass: 'text-[var(--cm-accent-text)]',
   },
   OWNER_LOGIN: {
     category: 'staff',
     categoryLabel: 'Staff & Logins',
     actionLabel: 'Owner Login',
-    toneClass: 'text-slate-700',
+    toneClass: 'text-[var(--cm-text-secondary)]',
   },
   CREATE_STAFF: {
     category: 'staff',
     categoryLabel: 'Staff & Logins',
     actionLabel: 'Staff Created',
-    toneClass: 'text-emerald-700',
+    toneClass: 'text-[var(--cm-success)]',
   },
   UPDATE_STAFF: {
     category: 'staff',
     categoryLabel: 'Staff & Logins',
     actionLabel: 'Staff Updated',
-    toneClass: 'text-amber-700',
+    toneClass: 'text-[var(--cm-warning)]',
   },
   RESET_STAFF_PASSWORD: {
     category: 'staff',
     categoryLabel: 'Staff & Logins',
     actionLabel: 'Password Reset',
-    toneClass: 'text-amber-700',
+    toneClass: 'text-[var(--cm-warning)]',
   },
   CREATE_PURCHASE: {
     category: 'purchases',
     categoryLabel: 'Purchases',
     actionLabel: 'Purchase Recorded',
-    toneClass: 'text-teal-700',
+    toneClass: 'text-[var(--cm-accent-text)]',
   },
   SETTLE_SUPPLIER_BALANCE: {
     category: 'purchases',
     categoryLabel: 'Purchases',
     actionLabel: 'Supplier Payment',
-    toneClass: 'text-emerald-700',
+    toneClass: 'text-[var(--cm-success)]',
   },
   CANCEL_PURCHASE: {
     category: 'purchases',
     categoryLabel: 'Purchases',
     actionLabel: 'Purchase Cancelled',
-    toneClass: 'text-red-700',
+    toneClass: 'text-[var(--cm-danger)]',
   },
   CREATE_EXPENSE: {
     category: 'expenses',
     categoryLabel: 'Expenses',
     actionLabel: 'Expense Added',
-    toneClass: 'text-slate-800',
+    toneClass: 'text-[var(--cm-text-primary)]',
   },
   UPDATE_EXPENSE: {
     category: 'expenses',
     categoryLabel: 'Expenses',
     actionLabel: 'Expense Edited',
-    toneClass: 'text-amber-700',
+    toneClass: 'text-[var(--cm-warning)]',
   },
   DELETE_EXPENSE: {
     category: 'expenses',
     categoryLabel: 'Expenses',
     actionLabel: 'Expense Deleted',
-    toneClass: 'text-red-700',
+    toneClass: 'text-[var(--cm-danger)]',
   },
   UPDATE_SETTINGS: {
     category: 'settings',
     categoryLabel: 'Settings',
     actionLabel: 'Settings Updated',
-    toneClass: 'text-slate-700',
+    toneClass: 'text-[var(--cm-text-secondary)]',
   },
 };
 
@@ -153,7 +153,7 @@ export function getActivityActionMeta(log: AuditLog): ActivityActionMeta {
       category: 'sales',
       categoryLabel: 'Sales',
       actionLabel: log.action.replace(/_/g, ' '),
-      toneClass: 'text-slate-800',
+      toneClass: 'text-[var(--cm-text-primary)]',
     };
   }
   if (action.includes('STOCK') || action.includes('PRODUCT') || entity === 'product' || entity === 'stockadjustment') {
@@ -161,7 +161,7 @@ export function getActivityActionMeta(log: AuditLog): ActivityActionMeta {
       category: 'inventory',
       categoryLabel: 'Inventory',
       actionLabel: log.action.replace(/_/g, ' '),
-      toneClass: 'text-slate-800',
+      toneClass: 'text-[var(--cm-text-primary)]',
     };
   }
   if (action.includes('STAFF') || action.includes('LOGIN') || entity === 'staff' || entity === 'auth') {
@@ -169,7 +169,7 @@ export function getActivityActionMeta(log: AuditLog): ActivityActionMeta {
       category: 'staff',
       categoryLabel: 'Staff & Logins',
       actionLabel: log.action.replace(/_/g, ' '),
-      toneClass: 'text-slate-800',
+      toneClass: 'text-[var(--cm-text-primary)]',
     };
   }
   if (action.includes('PURCHASE') || action.includes('SUPPLIER') || entity === 'purchase') {
@@ -177,7 +177,7 @@ export function getActivityActionMeta(log: AuditLog): ActivityActionMeta {
       category: 'purchases',
       categoryLabel: 'Purchases',
       actionLabel: log.action.replace(/_/g, ' '),
-      toneClass: 'text-slate-800',
+      toneClass: 'text-[var(--cm-text-primary)]',
     };
   }
   if (action.includes('EXPENSE') || entity === 'expense') {
@@ -185,7 +185,7 @@ export function getActivityActionMeta(log: AuditLog): ActivityActionMeta {
       category: 'expenses',
       categoryLabel: 'Expenses',
       actionLabel: log.action.replace(/_/g, ' '),
-      toneClass: 'text-slate-800',
+      toneClass: 'text-[var(--cm-text-primary)]',
     };
   }
 
@@ -193,7 +193,7 @@ export function getActivityActionMeta(log: AuditLog): ActivityActionMeta {
     category: 'settings',
     categoryLabel: 'Settings',
     actionLabel: log.action.replace(/_/g, ' ') || 'Activity',
-    toneClass: 'text-slate-700',
+    toneClass: 'text-[var(--cm-text-secondary)]',
   };
 }
 

@@ -2,6 +2,7 @@ import type { User } from 'firebase/auth';
 import {
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
   getDocs,
@@ -14,15 +15,22 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { enqueueSheetsBackgroundTask } from './backgroundTaskQueue';
 import { notifyDiscordTransaction } from './discordNotificationService';
 import type {
   AdjustmentType,
+  BatchAllocation,
   Brand,
   Category,
   Expense,
   ExpenseCategory,
+  InventoryBatch,
+  OriginType,
   PaymentMethod,
   Product,
+  ProductPackagingUnit,
+  ProductTemplate,
+  ProductTemplatePackaging,
   Purchase,
   PurchaseItem,
   Sale,
@@ -34,8 +42,34 @@ import {
   calcProfitMarginPct,
   formatDateTimeKarachi,
   getKarachiDateIso,
+  normalizeCustomerWhatsapp,
   roundMoney,
 } from '../utils/formatters';
+import {
+  allocateFifoFromBatches,
+  CATEGORY_MERGE_RULES,
+  DEFAULT_PRODUCT_CATEGORIES,
+  getEffectiveBaseUnit,
+  isImportedCategoryName,
+  normalizeCategoryKey,
+  normalizePackagingUnits,
+  resolveCanonicalCategoryName,
+  roundStockQty,
+} from '../utils/packaging';
+
+import {
+  DEFAULT_PRODUCT_BRANDS,
+  findExactBrandMatch,
+  normalizeBrandKey,
+  resolveBrandCategoryIds,
+} from '../utils/brands';
+import {
+  DEFAULT_PRODUCT_TEMPLATES,
+  normalizeTemplateKey,
+  resolveTemplateCategoryAndBrand,
+} from '../utils/productTemplates';
+import { recordPerfMetric, startPerfTimer } from '../utils/perfMonitor';
+import { formatOwnerAdminLabel, OWNER_PRIMARY_ID } from '../utils/sellerAttribution';
 
 function clip(val: string | undefined | null, maxLen: number): string {
   return (val || '').trim().slice(0, maxLen);
@@ -58,25 +92,8 @@ function generateTxnNumber(prefix: string): string {
   return `${prefix}-${y}${m}${d}-${rand}`;
 }
 
-const DEFAULT_CATEGORIES: Array<{ id: string; name: string; description: string }> = [
-  { id: 'cat_diapers', name: 'Baby Diapers & Pampers', description: 'Disposable diapers, pull-ups, and newborn packs' },
-  { id: 'cat_wipes', name: 'Baby Wipes', description: 'Sensitive, unscented, and fragrance baby wet wipes' },
-  { id: 'cat_tissues', name: 'Facial & Toilet Tissues', description: 'Tissue boxes, pocket packs, toilet rolls, and kitchen towels' },
-  { id: 'cat_baby_care', name: 'Baby Bath & Skincare', description: 'Baby lotions, shampoos, oils, powders, and rash creams' },
-  { id: 'cat_personal_care', name: 'Personal Care & Toiletries', description: 'Soaps, body washes, shampoos, deodorants, and oral care' },
-  { id: 'cat_hygiene', name: 'Hygiene & Sanitary', description: 'Sanitary pads, adult diapers, sanitizers, and cotton swabs' },
-];
-
-const DEFAULT_BRANDS: Array<{ id: string; name: string }> = [
-  { id: 'brand_pampers', name: 'Pampers' },
-  { id: 'brand_huggies', name: 'Huggies' },
-  { id: 'brand_molfix', name: 'Molfix' },
-  { id: 'brand_bonapapa', name: 'Bona Papa' },
-  { id: 'brand_rosepetal', name: 'Rose Petal' },
-  { id: 'brand_johnsons', name: "Johnson's" },
-  { id: 'brand_lifebuoy', name: 'Lifebuoy' },
-  { id: 'brand_dove', name: 'Dove' },
-];
+const DEFAULT_CATEGORIES = DEFAULT_PRODUCT_CATEGORIES;
+const DEFAULT_BRANDS = DEFAULT_PRODUCT_BRANDS;
 
 const DEFAULT_EXPENSE_CATEGORIES: Array<{ id: string; name: string }> = [
   { id: 'exp_rent', name: 'Shop Rent' },
@@ -286,15 +303,6 @@ export async function ensureShopInitialized(
         });
       }
 
-      for (const brand of DEFAULT_BRANDS) {
-        batch.set(shopDoc(uid, 'brands', brand.id), {
-          ownerUid: uid,
-          name: brand.name,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
       for (const expCat of DEFAULT_EXPENSE_CATEGORIES) {
         batch.set(shopDoc(uid, 'expenseCategories', expCat.id), {
           ownerUid: uid,
@@ -306,6 +314,47 @@ export async function ensureShopInitialized(
       }
 
       await batch.commit();
+
+      // Chunk brand writes (<= 350 ops/batch) to stay safely under Firestore's 500-write batch limit
+      for (let i = 0; i < DEFAULT_BRANDS.length; i += 350) {
+        const brandBatch = writeBatch(db);
+        const brandChunk = DEFAULT_BRANDS.slice(i, i + 350);
+        for (const brand of brandChunk) {
+          brandBatch.set(shopDoc(uid, 'brands', brand.id), {
+            ownerUid: uid,
+            name: clip(brand.name, 100),
+            categoryIds: brand.categoryIds.slice(0, 25),
+            isActive: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        await brandBatch.commit();
+      }
+
+      // Seed default product suggestion catalog right after base workspace entities
+      const templateChunks: typeof DEFAULT_PRODUCT_TEMPLATES[] = [];
+      for (let i = 0; i < DEFAULT_PRODUCT_TEMPLATES.length; i += 350) {
+        templateChunks.push(DEFAULT_PRODUCT_TEMPLATES.slice(i, i + 350));
+      }
+      const catNameById = new Map(DEFAULT_CATEGORIES.map((c) => [c.id, c.name]));
+      const brandNameById = new Map(DEFAULT_BRANDS.map((b) => [b.id, b.name]));
+      for (const chunk of templateChunks) {
+        const tplBatch = writeBatch(db);
+        for (const tpl of chunk) {
+          tplBatch.set(
+            shopDoc(uid, 'productTemplates', tpl.id),
+            buildProductTemplateWritePayload(uid, {
+              ...tpl,
+              categoryName: catNameById.get(tpl.categoryId) || 'Other Products',
+              brandName: brandNameById.get(tpl.brandId) || 'Generic',
+              isActive: true,
+              isCustom: false,
+            })
+          );
+        }
+        await tplBatch.commit();
+      }
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `shops/${uid}/settings/general`);
     }
@@ -315,12 +364,315 @@ export async function ensureShopInitialized(
 // ------------------------------------------------------------------
 // Categories, Brands, Suppliers, Expense Categories
 // ------------------------------------------------------------------
+export async function ensureDefaultCategories(
+  uid: string,
+  existingCategories: Category[],
+  existingProducts: Product[] = []
+): Promise<void> {
+  try {
+    type BatchOp =
+      | { type: 'set'; ref: ReturnType<typeof shopDoc>; data: Record<string, unknown> }
+      | { type: 'update'; ref: ReturnType<typeof shopDoc>; data: Record<string, unknown> }
+      | { type: 'delete'; ref: ReturnType<typeof shopDoc> };
+
+    const ops: BatchOp[] = [];
+    const existingIds = new Set(existingCategories.map((c) => c.id));
+    const handledCatIds = new Set<string>();
+    const deletedCatIds = new Set<string>();
+    const idRemap = new Map<string, { id: string; name: string }>();
+    const aliasNameRemap = new Map<string, { id: string; name: string }>();
+    const mergeRuleCanonicalIds = new Set(CATEGORY_MERGE_RULES.map((r) => r.canonicalId));
+
+    // 1. Handle the 3 consolidated / renamed categories while preserving IDs wherever possible
+    for (const rule of CATEGORY_MERGE_RULES) {
+      const legacyIdSet = new Set(rule.legacyIds || []);
+      const matches = existingCategories.filter(
+        (c) =>
+          !deletedCatIds.has(c.id) &&
+          (c.id === rule.canonicalId ||
+            legacyIdSet.has(c.id) ||
+            rule.aliases.includes(normalizeCategoryKey(c.name)))
+      );
+
+      const keeper =
+        matches.find((c) => c.id === rule.canonicalId) ||
+        matches.find((c) => normalizeCategoryKey(c.name) === normalizeCategoryKey(rule.canonicalName)) ||
+        matches[0];
+
+      let targetId: string;
+      if (keeper) {
+        targetId = keeper.id;
+        handledCatIds.add(keeper.id);
+        if (keeper.name !== rule.canonicalName || (keeper.description || '') !== rule.description) {
+          ops.push({
+            type: 'update',
+            ref: shopDoc(uid, 'categories', keeper.id),
+            data: {
+              name: clip(rule.canonicalName, 100),
+              description: clip(rule.description, 300),
+              updatedAt: serverTimestamp(),
+            },
+          });
+        }
+      } else {
+        const freshRef = existingIds.has(rule.canonicalId)
+          ? doc(shopCol(uid, 'categories'))
+          : shopDoc(uid, 'categories', rule.canonicalId);
+        targetId = freshRef.id;
+        existingIds.add(targetId);
+        ops.push({
+          type: 'set',
+          ref: freshRef,
+          data: {
+            ownerUid: uid,
+            name: clip(rule.canonicalName, 100),
+            description: clip(rule.description, 300),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+        });
+      }
+
+      idRemap.set(targetId, { id: targetId, name: rule.canonicalName });
+      for (const alias of rule.aliases) {
+        aliasNameRemap.set(alias, { id: targetId, name: rule.canonicalName });
+      }
+
+      for (const dup of matches) {
+        if (dup.id === targetId) continue;
+        handledCatIds.add(dup.id);
+        deletedCatIds.add(dup.id);
+        idRemap.set(dup.id, { id: targetId, name: rule.canonicalName });
+        ops.push({
+          type: 'delete',
+          ref: shopDoc(uid, 'categories', dup.id),
+        });
+      }
+    }
+
+    // 2. Ensure the remaining 8 standalone standard categories exist and are deduplicated
+    for (const def of DEFAULT_CATEGORIES) {
+      if (mergeRuleCanonicalIds.has(def.id)) continue;
+      const defKey = normalizeCategoryKey(def.name);
+      const matches = existingCategories.filter(
+        (c) =>
+          !deletedCatIds.has(c.id) &&
+          !handledCatIds.has(c.id) &&
+          (c.id === def.id || normalizeCategoryKey(c.name) === defKey)
+      );
+
+      const keeper = matches.find((c) => c.id === def.id) || matches[0];
+      let targetId: string;
+
+      if (keeper) {
+        targetId = keeper.id;
+        handledCatIds.add(keeper.id);
+        if (keeper.name !== def.name) {
+          ops.push({
+            type: 'update',
+            ref: shopDoc(uid, 'categories', keeper.id),
+            data: {
+              name: clip(def.name, 100),
+              description: clip(keeper.description || def.description, 300),
+              updatedAt: serverTimestamp(),
+            },
+          });
+        }
+      } else {
+        const freshRef = existingIds.has(def.id)
+          ? doc(shopCol(uid, 'categories'))
+          : shopDoc(uid, 'categories', def.id);
+        targetId = freshRef.id;
+        existingIds.add(targetId);
+        ops.push({
+          type: 'set',
+          ref: freshRef,
+          data: {
+            ownerUid: uid,
+            name: clip(def.name, 100),
+            description: clip(def.description, 300),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+        });
+      }
+
+      idRemap.set(targetId, { id: targetId, name: def.name });
+      aliasNameRemap.set(defKey, { id: targetId, name: def.name });
+
+      for (const dup of matches) {
+        if (dup.id === targetId) continue;
+        handledCatIds.add(dup.id);
+        deletedCatIds.add(dup.id);
+        idRemap.set(dup.id, { id: targetId, name: def.name });
+        ops.push({
+          type: 'delete',
+          ref: shopDoc(uid, 'categories', dup.id),
+        });
+      }
+    }
+
+    // 3. Remove legacy "Imported Products" category (migrating products to originType='imported' + Other Products)
+    const importedMatches = existingCategories.filter(
+      (c) =>
+        !deletedCatIds.has(c.id) &&
+        (c.id === 'cat_imported' || isImportedCategoryName(c.name))
+    );
+    const importedCatIds = new Set<string>(['cat_imported']);
+    for (const impCat of importedMatches) {
+      importedCatIds.add(impCat.id);
+      handledCatIds.add(impCat.id);
+      deletedCatIds.add(impCat.id);
+      ops.push({
+        type: 'delete',
+        ref: shopDoc(uid, 'categories', impCat.id),
+      });
+    }
+
+    // 4. Deduplicate any remaining custom categories with matching normalized names
+    const customKeepers = new Map<string, Category>();
+    for (const c of existingCategories) {
+      if (handledCatIds.has(c.id) || deletedCatIds.has(c.id)) continue;
+      const key = normalizeCategoryKey(c.name);
+      if (!key) continue;
+      const existingKeeper = customKeepers.get(key);
+      if (!existingKeeper) {
+        customKeepers.set(key, c);
+      } else {
+        deletedCatIds.add(c.id);
+        idRemap.set(c.id, { id: existingKeeper.id, name: existingKeeper.name });
+        ops.push({
+          type: 'delete',
+          ref: shopDoc(uid, 'categories', c.id),
+        });
+      }
+    }
+
+    // 5. Migrate products assigned to merged, renamed, duplicate, or Imported Products categories
+    const otherTarget = aliasNameRemap.get('other products') || {
+      id: 'cat_other',
+      name: 'Other Products',
+    };
+
+    const needsProductMigration =
+      ops.some((op) => op.type !== 'set') ||
+      importedMatches.length > 0 ||
+      existingCategories.some(
+        (c) =>
+          isImportedCategoryName(c.name) ||
+          CATEGORY_MERGE_RULES.some(
+            (r) =>
+              (r.legacyIds && r.legacyIds.includes(c.id)) ||
+              r.aliases.includes(normalizeCategoryKey(c.name))
+          )
+      );
+
+    const productsToCheck =
+      existingProducts.length > 0
+        ? existingProducts
+        : needsProductMigration
+          ? await getDocs(query(shopCol(uid, 'products'), where('ownerUid', '==', uid))).then(
+              (snap) => snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Product, 'id'>) }))
+            )
+          : [];
+
+    for (const p of productsToCheck) {
+      const fromImportedCat =
+        importedCatIds.has(p.categoryId) || isImportedCategoryName(p.categoryName || '');
+
+      if (fromImportedCat) {
+        const nextOrigin: OriginType = p.originType === 'local' ? 'local' : 'imported';
+        if (
+          p.categoryId !== otherTarget.id ||
+          p.categoryName !== otherTarget.name ||
+          p.originType !== nextOrigin
+        ) {
+          ops.push({
+            type: 'update',
+            ref: shopDoc(uid, 'products', p.id),
+            data: {
+              categoryId: otherTarget.id,
+              categoryName: clip(otherTarget.name, 100),
+              originType: nextOrigin,
+              updatedAt: serverTimestamp(),
+            },
+          });
+        }
+        continue;
+      }
+
+      const target =
+        idRemap.get(p.categoryId) || aliasNameRemap.get(normalizeCategoryKey(p.categoryName || ''));
+      if (target && (p.categoryId !== target.id || p.categoryName !== target.name)) {
+        ops.push({
+          type: 'update',
+          ref: shopDoc(uid, 'products', p.id),
+          data: {
+            categoryId: target.id,
+            categoryName: clip(target.name, 100),
+            updatedAt: serverTimestamp(),
+          },
+        });
+      }
+    }
+
+    if (ops.length === 0) return;
+
+    const CHUNK_SIZE = 400;
+    for (let i = 0; i < ops.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      const chunk = ops.slice(i, i + CHUNK_SIZE);
+      for (const op of chunk) {
+        if (op.type === 'set') batch.set(op.ref, op.data);
+        else if (op.type === 'update') batch.update(op.ref, op.data);
+        else batch.delete(op.ref);
+      }
+      await batch.commit();
+    }
+  } catch (err) {
+    console.warn('Category cleanup & backfill skipped:', err);
+  }
+}
+
 export async function createCategory(uid: string, name: string, description: string): Promise<string> {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error('Category name is required.');
+  }
+  if (isImportedCategoryName(trimmed)) {
+    throw new Error(
+      '"Imported Products" is handled via the Product Origin (Local / Imported) field instead of a separate category.'
+    );
+  }
+
+  const canonicalName = resolveCanonicalCategoryName(trimmed);
+  const canonicalKey = normalizeCategoryKey(canonicalName);
+
+  try {
+    const snap = await getDocs(query(shopCol(uid, 'categories'), where('ownerUid', '==', uid)));
+    const existingMatch = snap.docs.find((d) => {
+      const existingName = String(d.data()?.name || '');
+      return (
+        normalizeCategoryKey(resolveCanonicalCategoryName(existingName)) === canonicalKey ||
+        normalizeCategoryKey(existingName) === normalizeCategoryKey(trimmed)
+      );
+    });
+    if (existingMatch) {
+      const existingName = String(existingMatch.data()?.name || canonicalName);
+      throw new Error(`Category "${existingName}" already exists.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/categories`);
+  }
+
   const ref = doc(shopCol(uid, 'categories'));
   try {
     await setDoc(ref, {
       ownerUid: uid,
-      name: clip(name, 100),
+      name: clip(canonicalName, 100),
       description: clip(description, 300),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
@@ -332,10 +684,41 @@ export async function createCategory(uid: string, name: string, description: str
 }
 
 export async function updateCategory(uid: string, id: string, name: string, description: string): Promise<void> {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error('Category name is required.');
+  }
+  if (isImportedCategoryName(trimmed)) {
+    throw new Error(
+      '"Imported Products" is handled via the Product Origin (Local / Imported) field instead of a separate category.'
+    );
+  }
+
+  const canonicalName = resolveCanonicalCategoryName(trimmed);
+  const canonicalKey = normalizeCategoryKey(canonicalName);
+
+  try {
+    const snap = await getDocs(query(shopCol(uid, 'categories'), where('ownerUid', '==', uid)));
+    const duplicate = snap.docs.find((d) => {
+      if (d.id === id) return false;
+      const existingName = String(d.data()?.name || '');
+      return normalizeCategoryKey(resolveCanonicalCategoryName(existingName)) === canonicalKey;
+    });
+    if (duplicate) {
+      const existingName = String(duplicate.data()?.name || canonicalName);
+      throw new Error(`Another category named "${existingName}" already exists.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/categories`);
+  }
+
   const ref = shopDoc(uid, 'categories', id);
   try {
     await updateDoc(ref, {
-      name: clip(name, 100),
+      name: clip(canonicalName, 100),
       description: clip(description, 300),
       updatedAt: serverTimestamp(),
     });
@@ -353,12 +736,251 @@ export async function deleteCategory(uid: string, id: string): Promise<void> {
   }
 }
 
-export async function createBrand(uid: string, name: string): Promise<string> {
+function sanitizeBrandCategoryIds(categoryIds?: string[]): string[] {
+  if (!Array.isArray(categoryIds)) return [];
+  const seen = new Set<string>();
+  const cleaned: string[] = [];
+  for (const raw of categoryIds) {
+    const val = clip(raw, 128);
+    if (!val || seen.has(val)) continue;
+    seen.add(val);
+    cleaned.push(val);
+    if (cleaned.length >= 25) break;
+  }
+  return cleaned;
+}
+
+interface BrandBackfillStats {
+  brandsAdded: number;
+  brandsUpdated: number;
+  addedByCategory: Record<string, number>;
+}
+
+async function runDefaultBrandsSync(
+  uid: string,
+  existingBrands: Brand[] = [],
+  existingCategories?: Category[],
+  options?: { forceCheck?: boolean }
+): Promise<BrandBackfillStats> {
+  const stats: BrandBackfillStats = {
+    brandsAdded: 0,
+    brandsUpdated: 0,
+    addedByCategory: {},
+  };
+
+  const storageKey = `cm_brands_v4_seeded_${uid}`;
+  const alreadySeededLocally =
+    !options?.forceCheck &&
+    typeof window !== 'undefined' &&
+    window.localStorage.getItem(storageKey) === '1';
+
+  const hasMissingLegacyMeta = (list: Brand[]) =>
+    list.some(
+      (b) =>
+        [
+          'brand_pampers',
+          'brand_huggies',
+          'brand_molfix',
+          'brand_bonapapa',
+          'brand_rosepetal',
+          'brand_johnsons',
+          'brand_lifebuoy',
+          'brand_dove',
+        ].includes(b.id) &&
+        (!Array.isArray(b.categoryIds) || b.categoryIds.length === 0 || b.isActive === undefined)
+    );
+
+  const hasExpandedV4Library = (list: Brand[]) => {
+    const idSet = new Set(list.map((b) => b.id));
+    return (
+      list.length >= 220 &&
+      idSet.has('brand_durex') &&
+      idSet.has('brand_cerave') &&
+      idSet.has('brand_morinaga') &&
+      idSet.has('brand_vitaltea') &&
+      idSet.has('brand_brookebond') &&
+      idSet.has('brand_indomie') &&
+      idSet.has('brand_guard')
+    );
+  };
+
+  const isBrandsDone = (list: Brand[]) =>
+    !hasMissingLegacyMeta(list) &&
+    ((alreadySeededLocally && list.length >= 120) || hasExpandedV4Library(list));
+
+  // Fast path: if caller already has live listener data and v4 brands are seeded, skip all Firestore reads
+  if (!options?.forceCheck && existingBrands.length > 0 && isBrandsDone(existingBrands)) {
+    if (typeof window !== 'undefined' && !alreadySeededLocally) {
+      window.localStorage.setItem(storageKey, '1');
+    }
+    return stats;
+  }
+
+  const currentBrands: Brand[] =
+    existingBrands.length > 0
+      ? existingBrands
+      : await getDocs(query(shopCol(uid, 'brands'), where('ownerUid', '==', uid))).then(
+          (brandsSnap) =>
+            brandsSnap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<Brand, 'id'>),
+            }))
+        );
+
+  if (!options?.forceCheck && currentBrands.length > 0 && isBrandsDone(currentBrands)) {
+    if (typeof window !== 'undefined' && !alreadySeededLocally) {
+      window.localStorage.setItem(storageKey, '1');
+    }
+    return stats;
+  }
+
+  const liveCategories: Category[] =
+    existingCategories && existingCategories.length > 0
+      ? existingCategories
+      : await getDocs(query(shopCol(uid, 'categories'), where('ownerUid', '==', uid))).then(
+          (catsSnap) =>
+            catsSnap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<Category, 'id'>),
+            }))
+        );
+
+  const existingIds = new Set(currentBrands.map((b) => b.id));
+  const existingById = new Map(currentBrands.map((b) => [b.id, b]));
+  const existingByKey = new Map<string, Brand>();
+  for (const b of currentBrands) {
+    const k = normalizeBrandKey(b.name);
+    if (k && !existingByKey.has(k)) {
+      existingByKey.set(k, b);
+    }
+  }
+
+  type BatchOp =
+    | { type: 'set'; ref: ReturnType<typeof shopDoc>; data: Record<string, unknown> }
+    | { type: 'update'; ref: ReturnType<typeof shopDoc>; data: Record<string, unknown> };
+
+  const ops: BatchOp[] = [];
+
+  for (const def of DEFAULT_BRANDS) {
+    const resolvedCatIds = resolveBrandCategoryIds(def.categoryIds, liveCategories);
+    const matched = existingById.get(def.id) || existingByKey.get(normalizeBrandKey(def.name));
+
+    if (matched) {
+      const existingCats = Array.isArray(matched.categoryIds) ? matched.categoryIds : [];
+      const existingCatSet = new Set(existingCats);
+      const mergedCats = sanitizeBrandCategoryIds([...existingCats, ...resolvedCatIds]);
+      const addedCats = mergedCats.some((cid) => !existingCatSet.has(cid));
+      const needsActive = matched.isActive === undefined;
+      if (addedCats || existingCats.length === 0 || needsActive) {
+        ops.push({
+          type: 'update',
+          ref: shopDoc(uid, 'brands', matched.id),
+          data: {
+            categoryIds: mergedCats.length > 0 ? mergedCats : resolvedCatIds,
+            isActive: matched.isActive !== false,
+            updatedAt: serverTimestamp(),
+          },
+        });
+        stats.brandsUpdated += 1;
+      }
+      continue;
+    }
+
+    const targetRef = existingIds.has(def.id)
+      ? doc(shopCol(uid, 'brands'))
+      : shopDoc(uid, 'brands', def.id);
+    existingIds.add(targetRef.id);
+    ops.push({
+      type: 'set',
+      ref: targetRef,
+      data: {
+        ownerUid: uid,
+        name: clip(def.name, 100),
+        categoryIds: resolvedCatIds,
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    });
+    stats.brandsAdded += 1;
+    for (const cid of resolvedCatIds) {
+      stats.addedByCategory[cid] = (stats.addedByCategory[cid] || 0) + 1;
+    }
+  }
+
+  if (ops.length > 0) {
+    const CHUNK_SIZE = 350;
+    for (let i = 0; i < ops.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      const chunk = ops.slice(i, i + CHUNK_SIZE);
+      for (const op of chunk) {
+        if (op.type === 'set') batch.set(op.ref, op.data);
+        else batch.update(op.ref, op.data);
+      }
+      await batch.commit();
+    }
+  }
+
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(storageKey, '1');
+  }
+  return stats;
+}
+
+export async function ensureDefaultBrands(
+  uid: string,
+  existingBrands: Brand[] = [],
+  existingCategories?: Category[]
+): Promise<void> {
+  try {
+    await runDefaultBrandsSync(uid, existingBrands, existingCategories);
+  } catch (err) {
+    console.warn('Default brand library backfill skipped:', err);
+  }
+}
+
+export type BrandInput =
+  | string
+  | {
+      name: string;
+      categoryIds?: string[];
+      isActive?: boolean;
+    };
+
+export async function createBrand(uid: string, input: BrandInput): Promise<string> {
+  const rawName = typeof input === 'string' ? input : input.name;
+  const trimmed = rawName.trim().replace(/\s+/g, ' ');
+  if (!trimmed) {
+    throw new Error('Brand name is required.');
+  }
+
+  try {
+    const snap = await getDocs(query(shopCol(uid, 'brands'), where('ownerUid', '==', uid)));
+    const existingBrands: Brand[] = snap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Omit<Brand, 'id'>),
+    }));
+    const duplicate = findExactBrandMatch(trimmed, existingBrands);
+    if (duplicate) {
+      throw new Error(`Brand "${duplicate.name}" already exists.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/brands`);
+  }
+
+  const categoryIds = typeof input === 'string' ? [] : sanitizeBrandCategoryIds(input.categoryIds);
+  const isActive = typeof input === 'string' ? true : input.isActive !== false;
+
   const ref = doc(shopCol(uid, 'brands'));
   try {
     await setDoc(ref, {
       ownerUid: uid,
-      name: clip(name, 100),
+      name: clip(trimmed, 100),
+      categoryIds,
+      isActive,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -368,11 +990,102 @@ export async function createBrand(uid: string, name: string): Promise<string> {
   }
 }
 
-export async function updateBrand(uid: string, id: string, name: string): Promise<void> {
+export async function updateBrand(uid: string, id: string, input: BrandInput): Promise<void> {
+  const rawName = typeof input === 'string' ? input : input.name;
+  const trimmed = rawName.trim().replace(/\s+/g, ' ');
+  if (!trimmed) {
+    throw new Error('Brand name is required.');
+  }
+
+  let existingBrands: Brand[] = [];
+  try {
+    const snap = await getDocs(query(shopCol(uid, 'brands'), where('ownerUid', '==', uid)));
+    existingBrands = snap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Omit<Brand, 'id'>),
+    }));
+    const duplicate = findExactBrandMatch(trimmed, existingBrands, id);
+    if (duplicate) {
+      throw new Error(`Another brand named "${duplicate.name}" already exists.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/brands`);
+  }
+
+  const currentBrand = existingBrands.find((b) => b.id === id);
+  const clippedName = clip(trimmed, 100);
+  const nameChanged = Boolean(currentBrand && currentBrand.name !== clippedName);
+
+  const updatePayload: Record<string, unknown> = {
+    name: clippedName,
+    updatedAt: serverTimestamp(),
+  };
+  if (typeof input !== 'string') {
+    if (input.categoryIds !== undefined) {
+      updatePayload.categoryIds = sanitizeBrandCategoryIds(input.categoryIds);
+    }
+    if (input.isActive !== undefined) {
+      updatePayload.isActive = Boolean(input.isActive);
+    }
+  }
+
+  const ref = shopDoc(uid, 'brands', id);
+  try {
+    await updateDoc(ref, updatePayload);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/brands/${id}`);
+  }
+
+  if (nameChanged) {
+    try {
+      const prodSnap = await getDocs(
+        query(shopCol(uid, 'products'), where('ownerUid', '==', uid), where('brandId', '==', id))
+      );
+      if (!prodSnap.empty) {
+        const CHUNK_SIZE = 400;
+        for (let i = 0; i < prodSnap.docs.length; i += CHUNK_SIZE) {
+          const batch = writeBatch(db);
+          const chunk = prodSnap.docs.slice(i, i + CHUNK_SIZE);
+          for (const prodDoc of chunk) {
+            batch.update(prodDoc.ref, {
+              brandName: clippedName,
+              updatedAt: serverTimestamp(),
+            });
+          }
+          await batch.commit();
+        }
+      }
+      const tplSnap = await getDocs(
+        query(shopCol(uid, 'productTemplates'), where('ownerUid', '==', uid), where('brandId', '==', id))
+      );
+      if (!tplSnap.empty) {
+        const CHUNK_SIZE = 400;
+        for (let i = 0; i < tplSnap.docs.length; i += CHUNK_SIZE) {
+          const batch = writeBatch(db);
+          const chunk = tplSnap.docs.slice(i, i + CHUNK_SIZE);
+          for (const tplDoc of chunk) {
+            batch.update(tplDoc.ref, {
+              brandName: clippedName,
+              updatedAt: serverTimestamp(),
+            });
+          }
+          await batch.commit();
+        }
+      }
+    } catch (err) {
+      console.warn('Brand rename product sync skipped:', err);
+    }
+  }
+}
+
+export async function toggleBrandStatus(uid: string, id: string, isActive: boolean): Promise<void> {
   const ref = shopDoc(uid, 'brands', id);
   try {
     await updateDoc(ref, {
-      name: clip(name, 100),
+      isActive: Boolean(isActive),
       updatedAt: serverTimestamp(),
     });
   } catch (err) {
@@ -482,6 +1195,15 @@ export interface ProductInput {
   minStockLevel: number;
   maxStockLevel: number;
   unit: string;
+  baseUnit?: string;
+  packagingUnits?: ProductPackagingUnit[];
+  originType?: OriginType;
+  bottleSize?: string;
+  storageLocation?: string;
+  isReturnable?: boolean;
+  returnableUnitName?: string;
+  depositPerReturnable?: number;
+  emptyContainersOnHand?: number;
   supplierId: string;
   supplierName: string;
   expiryDate: string;
@@ -490,8 +1212,13 @@ export interface ProductInput {
 
 export async function createProduct(uid: string, input: ProductInput): Promise<string> {
   const prodRef = doc(shopCol(uid, 'products'));
-  const profitMarginPct = calcProfitMarginPct(input.purchasePrice, input.salePrice);
-  const initialStock = Math.max(0, Number(input.currentStock) || 0);
+  const baseUnit = clip(input.baseUnit || input.unit || 'Piece', 40) || 'Piece';
+  const packagingUnits = normalizePackagingUnits(input.packagingUnits, baseUnit);
+  const purchasePrice = Math.max(0, roundMoney(input.purchasePrice));
+  const salePrice = Math.max(0, roundMoney(input.salePrice));
+  const wholesalePrice = Math.max(0, roundMoney(input.wholesalePrice));
+  const profitMarginPct = calcProfitMarginPct(purchasePrice, salePrice);
+  const initialStock = roundStockQty(Math.max(0, Number(input.currentStock) || 0));
   const todayIso = getKarachiDateIso();
 
   try {
@@ -503,13 +1230,24 @@ export async function createProduct(uid: string, input: ProductInput): Promise<s
       categoryName: clip(input.categoryName, 100),
       brandId: clip(input.brandId, 128),
       brandName: clip(input.brandName, 100),
-      purchasePrice: Math.max(0, roundMoney(input.purchasePrice)),
-      salePrice: Math.max(0, roundMoney(input.salePrice)),
-      wholesalePrice: Math.max(0, roundMoney(input.wholesalePrice)),
+      purchasePrice,
+      salePrice,
+      wholesalePrice,
       currentStock: initialStock,
-      minStockLevel: Math.max(0, Number(input.minStockLevel) || 0),
-      maxStockLevel: Math.max(0, Number(input.maxStockLevel) || 0),
-      unit: clip(input.unit || 'Pack', 40),
+      minStockLevel: roundStockQty(Math.max(0, Number(input.minStockLevel) || 0)),
+      maxStockLevel: roundStockQty(Math.max(0, Number(input.maxStockLevel) || 0)),
+      unit: baseUnit,
+      baseUnit,
+      packagingUnits,
+      originType: (input.originType === 'local' || input.originType === 'imported'
+        ? input.originType
+        : '') as OriginType,
+      bottleSize: clip(input.bottleSize, 40),
+      storageLocation: clip(input.storageLocation, 80),
+      isReturnable: Boolean(input.isReturnable),
+      returnableUnitName: clip(input.returnableUnitName, 40),
+      depositPerReturnable: Math.max(0, roundMoney(Number(input.depositPerReturnable) || 0)),
+      emptyContainersOnHand: roundStockQty(Math.max(0, Number(input.emptyContainersOnHand) || 0)),
       supplierId: clip(input.supplierId, 128),
       supplierName: clip(input.supplierName, 150),
       expiryDate: clip(input.expiryDate, 20),
@@ -530,9 +1268,32 @@ export async function createProduct(uid: string, input: ProductInput): Promise<s
         quantityChange: initialStock,
         previousStock: 0,
         newStock: initialStock,
+        unitName: baseUnit,
+        unitQuantity: initialStock,
+        conversionFactor: 1,
+        baseQuantity: initialStock,
         referenceId: prodRef.id,
         notes: 'Initial opening stock on product creation',
         createdAt: serverTimestamp(),
+      });
+
+      const batchRef = doc(shopCol(uid, 'inventoryBatches'));
+      batch.set(batchRef, {
+        ownerUid: uid,
+        productId: prodRef.id,
+        productName: clip(input.name, 180),
+        purchaseId: 'opening',
+        purchaseNumber: 'OPENING',
+        purchaseDate: todayIso,
+        supplierId: clip(input.supplierId, 128),
+        supplierName: clip(input.supplierName || 'Opening Stock', 150),
+        initialBaseQty: initialStock,
+        remainingBaseQty: initialStock,
+        unitCostInBase: purchasePrice,
+        expiryDate: clip(input.expiryDate, 20),
+        status: 'active',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
       });
     }
 
@@ -542,11 +1303,20 @@ export async function createProduct(uid: string, input: ProductInput): Promise<s
       action: 'CREATE_PRODUCT',
       entityType: 'product',
       entityId: prodRef.id,
-      summary: clip(`Added product ${input.name} (Stock: ${initialStock} ${input.unit})`, 400),
+      summary: clip(`Added product ${input.name} (Stock: ${initialStock} ${baseUnit})`, 400),
       createdAt: serverTimestamp(),
     });
 
     await batch.commit();
+    enqueueSheetsBackgroundTask({
+      dedupeId: prodRef.id,
+      shopId: uid,
+      entityType: 'product',
+      entityId: prodRef.id,
+      action: 'CREATE_PRODUCT',
+      summary: clip(`Product "${input.name}"`, 180),
+      targetSheets: ['Products', 'Inventory', 'Daily Summary'],
+    });
     return prodRef.id;
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, `shops/${uid}/products/${prodRef.id}`);
@@ -559,7 +1329,12 @@ export async function updateProduct(
   input: Omit<ProductInput, 'currentStock'>
 ): Promise<void> {
   const prodRef = shopDoc(uid, 'products', productId);
-  const profitMarginPct = calcProfitMarginPct(input.purchasePrice, input.salePrice);
+  const baseUnit = clip(input.baseUnit || input.unit || 'Piece', 40) || 'Piece';
+  const packagingUnits = normalizePackagingUnits(input.packagingUnits, baseUnit);
+  const purchasePrice = Math.max(0, roundMoney(input.purchasePrice));
+  const salePrice = Math.max(0, roundMoney(input.salePrice));
+  const wholesalePrice = Math.max(0, roundMoney(input.wholesalePrice));
+  const profitMarginPct = calcProfitMarginPct(purchasePrice, salePrice);
 
   try {
     const batch = writeBatch(db);
@@ -569,12 +1344,23 @@ export async function updateProduct(
       categoryName: clip(input.categoryName, 100),
       brandId: clip(input.brandId, 128),
       brandName: clip(input.brandName, 100),
-      purchasePrice: Math.max(0, roundMoney(input.purchasePrice)),
-      salePrice: Math.max(0, roundMoney(input.salePrice)),
-      wholesalePrice: Math.max(0, roundMoney(input.wholesalePrice)),
-      minStockLevel: Math.max(0, Number(input.minStockLevel) || 0),
-      maxStockLevel: Math.max(0, Number(input.maxStockLevel) || 0),
-      unit: clip(input.unit || 'Pack', 40),
+      purchasePrice,
+      salePrice,
+      wholesalePrice,
+      minStockLevel: roundStockQty(Math.max(0, Number(input.minStockLevel) || 0)),
+      maxStockLevel: roundStockQty(Math.max(0, Number(input.maxStockLevel) || 0)),
+      unit: baseUnit,
+      baseUnit,
+      packagingUnits,
+      originType: (input.originType === 'local' || input.originType === 'imported'
+        ? input.originType
+        : '') as OriginType,
+      bottleSize: clip(input.bottleSize, 40),
+      storageLocation: clip(input.storageLocation, 80),
+      isReturnable: Boolean(input.isReturnable),
+      returnableUnitName: clip(input.returnableUnitName, 40),
+      depositPerReturnable: Math.max(0, roundMoney(Number(input.depositPerReturnable) || 0)),
+      emptyContainersOnHand: roundStockQty(Math.max(0, Number(input.emptyContainersOnHand) || 0)),
       supplierId: clip(input.supplierId, 128),
       supplierName: clip(input.supplierName, 150),
       expiryDate: clip(input.expiryDate, 20),
@@ -589,11 +1375,20 @@ export async function updateProduct(
       action: 'UPDATE_PRODUCT',
       entityType: 'product',
       entityId: productId,
-      summary: clip(`Updated product ${input.name} (Buy: ${input.purchasePrice}, Sell: ${input.salePrice})`, 400),
+      summary: clip(`Updated product ${input.name} (Buy: ${purchasePrice}/${baseUnit}, Sell: ${salePrice}/${baseUnit})`, 400),
       createdAt: serverTimestamp(),
     });
 
     await batch.commit();
+    enqueueSheetsBackgroundTask({
+      dedupeId: `${productId}:update:${Date.now()}`,
+      shopId: uid,
+      entityType: 'product',
+      entityId: productId,
+      action: 'UPDATE_PRODUCT',
+      summary: clip(`Updated product "${input.name}"`, 180),
+      targetSheets: ['Products', 'Inventory', 'Daily Summary'],
+    });
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/products/${productId}`);
   }
@@ -614,16 +1409,672 @@ export async function deleteProduct(uid: string, product: Product): Promise<void
       createdAt: serverTimestamp(),
     });
     await batch.commit();
+    enqueueSheetsBackgroundTask({
+      dedupeId: `${product.id}:delete`,
+      shopId: uid,
+      entityType: 'product',
+      entityId: product.id,
+      action: 'DELETE_PRODUCT',
+      summary: clip(`Deleted product "${product.name}"`, 180),
+      targetSheets: ['Products', 'Inventory', 'Daily Summary'],
+    });
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `shops/${uid}/products/${product.id}`);
   }
 }
 
 // ------------------------------------------------------------------
-// Sales Management (Atomic Transactions + Historical COGS Snapshot)
+// Product Suggestion Templates Catalog CRUD & Backfill
+// ------------------------------------------------------------------
+export interface ProductTemplateInput {
+  name: string;
+  categoryId: string;
+  categoryName: string;
+  brandId: string;
+  brandName: string;
+  variant: string;
+  originType?: OriginType;
+  baseUnit: string;
+  defaultPurchaseUnit?: string;
+  defaultSaleUnit?: string;
+  packagingUnits?: ProductTemplatePackaging[];
+  hasUnconfirmedPackaging?: boolean;
+  suggestedPurchasePrice?: number;
+  suggestedSalePrice?: number;
+  suggestedWholesalePrice?: number;
+  priceSource?: string;
+  priceUpdatedAt?: string;
+  trackExpiry?: boolean;
+  bottleSize?: string;
+  storageLocation?: string;
+  isReturnable?: boolean;
+  returnableUnitName?: string;
+  searchKeywords?: string[];
+  isActive?: boolean;
+  isCustom?: boolean;
+}
+
+function sanitizeTemplatePackaging(
+  units: ProductTemplatePackaging[] | undefined,
+  baseUnit: string
+): ProductTemplatePackaging[] {
+  if (!Array.isArray(units)) return [];
+  const baseLower = baseUnit.trim().toLowerCase();
+  const seen = new Set<string>();
+  const cleaned: ProductTemplatePackaging[] = [];
+  for (const u of units) {
+    const unitName = clip(u.unitName, 40);
+    if (!unitName || unitName.toLowerCase() === baseLower || seen.has(unitName.toLowerCase())) {
+      continue;
+    }
+    const containsQty = roundStockQty(Number(u.containsQty) || 0);
+    const conversionQty = roundStockQty(Number(u.conversionQty) || containsQty);
+    if (containsQty <= 0 || conversionQty <= 0) continue;
+    seen.add(unitName.toLowerCase());
+    cleaned.push({
+      unitName,
+      containsQty,
+      parentUnitName: clip(u.parentUnitName || baseUnit, 40) || baseUnit,
+      conversionQty,
+      allowPurchase: u.allowPurchase !== false,
+      allowSale: u.allowSale !== false,
+      isDefaultPurchase: Boolean(u.isDefaultPurchase),
+      isDefaultSale: Boolean(u.isDefaultSale),
+      needsConfirmation: Boolean(u.needsConfirmation),
+    });
+    if (cleaned.length >= 15) break;
+  }
+  return cleaned;
+}
+
+function sanitizeTemplateKeywords(keywords?: string[]): string[] {
+  if (!Array.isArray(keywords)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const kw of keywords) {
+    const clean = clip(kw, 50).toLowerCase();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+    if (out.length >= 15) break;
+  }
+  return out;
+}
+
+function buildProductTemplateWritePayload(
+  uid: string,
+  input: ProductTemplateInput,
+  options?: { isUpdate?: boolean }
+): Record<string, unknown> {
+  const baseUnit = clip(input.baseUnit || 'Piece', 40) || 'Piece';
+  const packagingUnits = sanitizeTemplatePackaging(input.packagingUnits, baseUnit);
+  const originType: OriginType =
+    input.originType === 'local' || input.originType === 'imported' ? input.originType : '';
+  const hasUnconfirmed =
+    Boolean(input.hasUnconfirmedPackaging) ||
+    packagingUnits.some((u) => Boolean(u.needsConfirmation));
+
+  const payload: Record<string, unknown> = {
+    name: clip(input.name, 180),
+    categoryId: clip(input.categoryId, 128),
+    categoryName: clip(input.categoryName || 'Other Products', 100),
+    brandId: clip(input.brandId, 128),
+    brandName: clip(input.brandName || 'Generic', 100),
+    variant: clip(input.variant, 120),
+    originType,
+    baseUnit,
+    defaultPurchaseUnit: clip(input.defaultPurchaseUnit, 40),
+    defaultSaleUnit: clip(input.defaultSaleUnit, 40),
+    packagingUnits,
+    hasUnconfirmedPackaging: hasUnconfirmed,
+    trackExpiry: Boolean(input.trackExpiry),
+    bottleSize: clip(input.bottleSize, 40),
+    storageLocation: clip(input.storageLocation, 80),
+    isReturnable: Boolean(input.isReturnable),
+    returnableUnitName: clip(input.returnableUnitName, 40),
+    searchKeywords: sanitizeTemplateKeywords(input.searchKeywords),
+    isActive: input.isActive !== false,
+    isCustom: Boolean(input.isCustom),
+    updatedAt: serverTimestamp(),
+  };
+
+  if (
+    input.suggestedPurchasePrice !== undefined &&
+    Number.isFinite(Number(input.suggestedPurchasePrice)) &&
+    Number(input.suggestedPurchasePrice) >= 0
+  ) {
+    payload.suggestedPurchasePrice = roundMoney(Number(input.suggestedPurchasePrice));
+  }
+  if (
+    input.suggestedSalePrice !== undefined &&
+    Number.isFinite(Number(input.suggestedSalePrice)) &&
+    Number(input.suggestedSalePrice) >= 0
+  ) {
+    payload.suggestedSalePrice = roundMoney(Number(input.suggestedSalePrice));
+  }
+  if (
+    input.suggestedWholesalePrice !== undefined &&
+    Number.isFinite(Number(input.suggestedWholesalePrice)) &&
+    Number(input.suggestedWholesalePrice) >= 0
+  ) {
+    payload.suggestedWholesalePrice = roundMoney(Number(input.suggestedWholesalePrice));
+  }
+  if (input.priceSource !== undefined) {
+    payload.priceSource = clip(input.priceSource, 150);
+  }
+  if (input.priceUpdatedAt !== undefined) {
+    payload.priceUpdatedAt = clip(input.priceUpdatedAt, 40);
+  }
+
+  if (!options?.isUpdate) {
+    payload.ownerUid = uid;
+    payload.createdAt = serverTimestamp();
+  }
+
+  return payload;
+}
+
+interface TemplateBackfillStats {
+  templatesAdded: number;
+  templatesSkippedExisting: number;
+  addedByCategory: Record<string, number>;
+  skippedByCategory: Record<string, number>;
+}
+
+async function runDefaultProductTemplatesSync(
+  uid: string,
+  existingTemplates?: ProductTemplate[],
+  existingCategories?: Category[],
+  existingBrands?: Brand[],
+  options?: { forceCheck?: boolean }
+): Promise<TemplateBackfillStats> {
+  const stats: TemplateBackfillStats = {
+    templatesAdded: 0,
+    templatesSkippedExisting: 0,
+    addedByCategory: {},
+    skippedByCategory: {},
+  };
+
+  const storageKey = `cm_templates_v3_seeded_${uid}`;
+  const alreadySeededLocally =
+    !options?.forceCheck &&
+    typeof window !== 'undefined' &&
+    window.localStorage.getItem(storageKey) === '1';
+
+  const hasExpandedV3Templates = (list: ProductTemplate[]) => {
+    const idSet = new Set(list.map((t) => t.id));
+    return (
+      list.length >= 400 &&
+      idSet.has('tpl_cerelac_wheat_340g') &&
+      idSet.has('tpl_tapal_danedar_900g') &&
+      idSet.has('tpl_fruitavitals_chaunsa_1l') &&
+      idSet.has('tpl_shan_karahi_50g') &&
+      idSet.has('tpl_sw_durex_featherlite_12')
+    );
+  };
+
+  const isTemplatesDone = (list: ProductTemplate[]) =>
+    (alreadySeededLocally && list.length >= 250) || hasExpandedV3Templates(list);
+
+  // Fast path: reuse live listener data without triggering Firestore collection scans
+  if (!options?.forceCheck && existingTemplates && isTemplatesDone(existingTemplates)) {
+    if (typeof window !== 'undefined' && !alreadySeededLocally) {
+      window.localStorage.setItem(storageKey, '1');
+    }
+    return stats;
+  }
+
+  const liveTemplates: ProductTemplate[] =
+    existingTemplates && existingTemplates.length > 0
+      ? existingTemplates
+      : await getDocs(
+          query(shopCol(uid, 'productTemplates'), where('ownerUid', '==', uid))
+        ).then((snap) =>
+          snap.docs.map((d) => ({
+            id: d.id,
+            ...(d.data() as Omit<ProductTemplate, 'id'>),
+          }))
+        );
+
+  if (!options?.forceCheck && liveTemplates.length > 0 && isTemplatesDone(liveTemplates)) {
+    if (typeof window !== 'undefined' && !alreadySeededLocally) {
+      window.localStorage.setItem(storageKey, '1');
+    }
+    return stats;
+  }
+
+  const [liveCategories, liveBrands] = await Promise.all([
+    existingCategories && existingCategories.length > 0
+      ? Promise.resolve(existingCategories)
+      : getDocs(query(shopCol(uid, 'categories'), where('ownerUid', '==', uid))).then(
+          (catsSnap) =>
+            catsSnap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<Category, 'id'>),
+            }))
+        ),
+    existingBrands && existingBrands.length > 0
+      ? Promise.resolve(existingBrands)
+      : getDocs(query(shopCol(uid, 'brands'), where('ownerUid', '==', uid))).then(
+          (brandsSnap) =>
+            brandsSnap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<Brand, 'id'>),
+            }))
+        ),
+  ]);
+
+  const existingIds = new Set(liveTemplates.map((t) => t.id));
+  const existingKeys = new Set(
+    liveTemplates.map((t) => normalizeTemplateKey(t.categoryId, t.brandId, t.name, t.variant))
+  );
+
+  const toInsert: Array<{ id: string; data: Record<string, unknown> }> = [];
+  for (const def of DEFAULT_PRODUCT_TEMPLATES) {
+    const resolved = resolveTemplateCategoryAndBrand(def, liveCategories, liveBrands);
+    const key = normalizeTemplateKey(
+      resolved.categoryId,
+      resolved.brandId,
+      def.name,
+      def.variant
+    );
+    if (existingIds.has(def.id) || existingKeys.has(key)) {
+      stats.templatesSkippedExisting += 1;
+      stats.skippedByCategory[resolved.categoryId] =
+        (stats.skippedByCategory[resolved.categoryId] || 0) + 1;
+      continue;
+    }
+    existingIds.add(def.id);
+    existingKeys.add(key);
+    toInsert.push({
+      id: def.id,
+      data: buildProductTemplateWritePayload(uid, {
+        ...def,
+        categoryId: resolved.categoryId,
+        categoryName: resolved.categoryName,
+        brandId: resolved.brandId,
+        brandName: resolved.brandName,
+        isActive: true,
+        isCustom: false,
+      }),
+    });
+    stats.templatesAdded += 1;
+    stats.addedByCategory[resolved.categoryId] =
+      (stats.addedByCategory[resolved.categoryId] || 0) + 1;
+  }
+
+  if (toInsert.length > 0) {
+    const CHUNK_SIZE = 350;
+    for (let i = 0; i < toInsert.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      const chunk = toInsert.slice(i, i + CHUNK_SIZE);
+      for (const item of chunk) {
+        batch.set(shopDoc(uid, 'productTemplates', item.id), item.data);
+      }
+      await batch.commit();
+    }
+  }
+
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(storageKey, '1');
+  }
+  return stats;
+}
+
+export async function ensureDefaultProductTemplates(
+  uid: string,
+  existingTemplates?: ProductTemplate[],
+  existingCategories?: Category[],
+  existingBrands?: Brand[]
+): Promise<void> {
+  try {
+    await runDefaultProductTemplatesSync(
+      uid,
+      existingTemplates,
+      existingCategories,
+      existingBrands
+    );
+  } catch (err) {
+    console.warn('Default product templates backfill skipped:', err);
+  }
+}
+
+export interface CatalogAuditCategorySummary {
+  categoryId: string;
+  categoryName: string;
+  description: string;
+  isCanonical: boolean;
+  liveBrandCount: number;
+  brandsAdded: number;
+  liveTemplateCount: number;
+  activeTemplateCount: number;
+  templatesAdded: number;
+  templatesSkippedExisting: number;
+  liveStoreProductCount: number;
+  unconfirmedPackagingCount: number;
+  unpricedTemplateCount: number;
+  sampleBrands: string[];
+}
+
+export interface CatalogAuditReport {
+  auditedAtIso: string;
+  totalLiveCategories: number;
+  canonicalCategoryCount: number;
+  customCategoryCount: number;
+  totalLiveBrands: number;
+  brandsAdded: number;
+  brandsCategoryMerged: number;
+  totalLiveTemplates: number;
+  totalActiveTemplates: number;
+  templatesAdded: number;
+  templatesSkippedExisting: number;
+  totalLiveStoreProducts: number;
+  totalUnconfirmedPackaging: number;
+  totalUnpricedTemplates: number;
+  categories: CatalogAuditCategorySummary[];
+}
+
+export async function runLiveCatalogAuditAndSync(
+  uid: string,
+  options?: { syncMissing?: boolean }
+): Promise<CatalogAuditReport> {
+  const syncMissing = options?.syncMissing !== false;
+
+  const [catSnap0, brandSnap0, tplSnap0, prodSnap0] = await Promise.all([
+    getDocs(query(shopCol(uid, 'categories'), where('ownerUid', '==', uid))),
+    getDocs(query(shopCol(uid, 'brands'), where('ownerUid', '==', uid))),
+    getDocs(query(shopCol(uid, 'productTemplates'), where('ownerUid', '==', uid))),
+    getDocs(query(shopCol(uid, 'products'), where('ownerUid', '==', uid))),
+  ]);
+
+  let liveCats: Category[] = catSnap0.docs.map((d) => ({
+    id: d.id,
+    ...(d.data() as Omit<Category, 'id'>),
+  }));
+  let liveBrands: Brand[] = brandSnap0.docs.map((d) => ({
+    id: d.id,
+    ...(d.data() as Omit<Brand, 'id'>),
+  }));
+  let liveTemplates: ProductTemplate[] = tplSnap0.docs.map((d) => ({
+    id: d.id,
+    ...(d.data() as Omit<ProductTemplate, 'id'>),
+  }));
+  const liveProducts: Product[] = prodSnap0.docs.map((d) => ({
+    id: d.id,
+    ...(d.data() as Omit<Product, 'id'>),
+  }));
+
+  let brandStats: BrandBackfillStats = {
+    brandsAdded: 0,
+    brandsUpdated: 0,
+    addedByCategory: {},
+  };
+  let tplStats: TemplateBackfillStats = {
+    templatesAdded: 0,
+    templatesSkippedExisting: 0,
+    addedByCategory: {},
+    skippedByCategory: {},
+  };
+
+  if (syncMissing) {
+    await ensureDefaultCategories(uid, liveCats, liveProducts);
+    const refreshedCatsSnap = await getDocs(
+      query(shopCol(uid, 'categories'), where('ownerUid', '==', uid))
+    );
+    liveCats = refreshedCatsSnap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Omit<Category, 'id'>),
+    }));
+
+    brandStats = await runDefaultBrandsSync(uid, liveBrands, liveCats, { forceCheck: true });
+    if (brandStats.brandsAdded > 0 || brandStats.brandsUpdated > 0) {
+      const refreshedBrandsSnap = await getDocs(
+        query(shopCol(uid, 'brands'), where('ownerUid', '==', uid))
+      );
+      liveBrands = refreshedBrandsSnap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<Brand, 'id'>),
+      }));
+    }
+
+    tplStats = await runDefaultProductTemplatesSync(
+      uid,
+      liveTemplates,
+      liveCats,
+      liveBrands,
+      { forceCheck: true }
+    );
+    if (tplStats.templatesAdded > 0) {
+      const refreshedTplSnap = await getDocs(
+        query(shopCol(uid, 'productTemplates'), where('ownerUid', '==', uid))
+      );
+      liveTemplates = refreshedTplSnap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<ProductTemplate, 'id'>),
+      }));
+    }
+  } else {
+    // Audit-only counts: determine how many templates already exist vs canonical set
+    const existingIds = new Set(liveTemplates.map((t) => t.id));
+    const existingKeys = new Set(
+      liveTemplates.map((t) => normalizeTemplateKey(t.categoryId, t.brandId, t.name, t.variant))
+    );
+    for (const def of DEFAULT_PRODUCT_TEMPLATES) {
+      const resolved = resolveTemplateCategoryAndBrand(def, liveCats, liveBrands);
+      const key = normalizeTemplateKey(resolved.categoryId, resolved.brandId, def.name, def.variant);
+      if (existingIds.has(def.id) || existingKeys.has(key)) {
+        tplStats.templatesSkippedExisting += 1;
+        tplStats.skippedByCategory[resolved.categoryId] =
+          (tplStats.skippedByCategory[resolved.categoryId] || 0) + 1;
+      }
+    }
+  }
+
+  const canonicalIdSet = new Set(DEFAULT_CATEGORIES.map((c) => c.id));
+  const canonicalNameSet = new Set(DEFAULT_CATEGORIES.map((c) => normalizeCategoryKey(c.name)));
+
+  const categorySummaries: CatalogAuditCategorySummary[] = [...liveCats]
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((cat) => {
+      const isCanonical =
+        canonicalIdSet.has(cat.id) || canonicalNameSet.has(normalizeCategoryKey(cat.name));
+      const catBrands = liveBrands.filter((b) => (b.categoryIds || []).includes(cat.id));
+      const catTemplates = liveTemplates.filter(
+        (t) =>
+          t.categoryId === cat.id ||
+          normalizeCategoryKey(t.categoryName) === normalizeCategoryKey(cat.name)
+      );
+      const catProducts = liveProducts.filter(
+        (p) =>
+          p.categoryId === cat.id ||
+          normalizeCategoryKey(p.categoryName) === normalizeCategoryKey(cat.name)
+      );
+      const unconfirmedPackagingCount = catTemplates.filter((t) =>
+        Boolean(t.hasUnconfirmedPackaging)
+      ).length;
+      const unpricedTemplateCount = catTemplates.filter(
+        (t) => !t.suggestedSalePrice || t.suggestedSalePrice <= 0
+      ).length;
+
+      return {
+        categoryId: cat.id,
+        categoryName: cat.name,
+        description: cat.description || '',
+        isCanonical,
+        liveBrandCount: catBrands.length,
+        brandsAdded: brandStats.addedByCategory[cat.id] || 0,
+        liveTemplateCount: catTemplates.length,
+        activeTemplateCount: catTemplates.filter((t) => t.isActive !== false).length,
+        templatesAdded: tplStats.addedByCategory[cat.id] || 0,
+        templatesSkippedExisting: tplStats.skippedByCategory[cat.id] || 0,
+        liveStoreProductCount: catProducts.length,
+        unconfirmedPackagingCount,
+        unpricedTemplateCount,
+        sampleBrands: catBrands
+          .map((b) => b.name)
+          .sort((a, b) => a.localeCompare(b))
+          .slice(0, 8),
+      };
+    });
+
+  return {
+    auditedAtIso: new Date().toISOString(),
+    totalLiveCategories: liveCats.length,
+    canonicalCategoryCount: categorySummaries.filter((c) => c.isCanonical).length,
+    customCategoryCount: categorySummaries.filter((c) => !c.isCanonical).length,
+    totalLiveBrands: liveBrands.length,
+    brandsAdded: brandStats.brandsAdded,
+    brandsCategoryMerged: brandStats.brandsUpdated,
+    totalLiveTemplates: liveTemplates.length,
+    totalActiveTemplates: liveTemplates.filter((t) => t.isActive !== false).length,
+    templatesAdded: tplStats.templatesAdded,
+    templatesSkippedExisting: tplStats.templatesSkippedExisting,
+    totalLiveStoreProducts: liveProducts.length,
+    totalUnconfirmedPackaging: liveTemplates.filter((t) => Boolean(t.hasUnconfirmedPackaging)).length,
+    totalUnpricedTemplates: liveTemplates.filter(
+      (t) => !t.suggestedSalePrice || t.suggestedSalePrice <= 0
+    ).length,
+    categories: categorySummaries,
+  };
+}
+
+export async function createProductTemplate(
+  uid: string,
+  input: ProductTemplateInput
+): Promise<string> {
+  const trimmedName = input.name.trim().replace(/\s+/g, ' ');
+  if (!trimmedName) {
+    throw new Error('Template product name is required.');
+  }
+
+  const candidateKey = normalizeTemplateKey(
+    input.categoryId,
+    input.brandId,
+    trimmedName,
+    input.variant
+  );
+
+  try {
+    const snap = await getDocs(
+      query(shopCol(uid, 'productTemplates'), where('ownerUid', '==', uid))
+    );
+    const duplicate = snap.docs.find((d) => {
+      const data = d.data() as ProductTemplate;
+      return (
+        normalizeTemplateKey(data.categoryId, data.brandId, data.name, data.variant) ===
+        candidateKey
+      );
+    });
+    if (duplicate) {
+      const dData = duplicate.data() as ProductTemplate;
+      throw new Error(`Catalog template "${dData.name}" already exists for this variant.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/productTemplates`);
+  }
+
+  const ref = doc(shopCol(uid, 'productTemplates'));
+  try {
+    await setDoc(
+      ref,
+      buildProductTemplateWritePayload(uid, {
+        ...input,
+        name: trimmedName,
+        isCustom: input.isCustom !== false,
+      })
+    );
+    return ref.id;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, `shops/${uid}/productTemplates/${ref.id}`);
+  }
+}
+
+export async function updateProductTemplate(
+  uid: string,
+  templateId: string,
+  input: ProductTemplateInput
+): Promise<void> {
+  const trimmedName = input.name.trim().replace(/\s+/g, ' ');
+  if (!trimmedName) {
+    throw new Error('Template product name is required.');
+  }
+
+  const candidateKey = normalizeTemplateKey(
+    input.categoryId,
+    input.brandId,
+    trimmedName,
+    input.variant
+  );
+
+  try {
+    const snap = await getDocs(
+      query(shopCol(uid, 'productTemplates'), where('ownerUid', '==', uid))
+    );
+    const duplicate = snap.docs.find((d) => {
+      if (d.id === templateId) return false;
+      const data = d.data() as ProductTemplate;
+      return (
+        normalizeTemplateKey(data.categoryId, data.brandId, data.name, data.variant) ===
+        candidateKey
+      );
+    });
+    if (duplicate) {
+      const dData = duplicate.data() as ProductTemplate;
+      throw new Error(`Another catalog template named "${dData.name}" already exists for this variant.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/productTemplates`);
+  }
+
+  const ref = shopDoc(uid, 'productTemplates', templateId);
+  try {
+    await updateDoc(
+      ref,
+      buildProductTemplateWritePayload(uid, { ...input, name: trimmedName }, { isUpdate: true })
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/productTemplates/${templateId}`);
+  }
+}
+
+export async function toggleProductTemplateStatus(
+  uid: string,
+  templateId: string,
+  isActive: boolean
+): Promise<void> {
+  const ref = shopDoc(uid, 'productTemplates', templateId);
+  try {
+    await updateDoc(ref, {
+      isActive: Boolean(isActive),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/productTemplates/${templateId}`);
+  }
+}
+
+export async function deleteProductTemplate(uid: string, templateId: string): Promise<void> {
+  const ref = shopDoc(uid, 'productTemplates', templateId);
+  try {
+    await deleteDoc(ref);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, `shops/${uid}/productTemplates/${templateId}`);
+  }
+}
+
+// ------------------------------------------------------------------
+// Sales Management (Atomic Transactions + Multi-Unit + FIFO COGS)
 // ------------------------------------------------------------------
 export interface SaleLineDraft {
   productId: string;
+  unitName?: string;
+  conversionFactor?: number;
   quantity: number;
   salePricePerUnit: number;
 }
@@ -633,11 +2084,17 @@ export async function createSale(
   input: {
     saleDate: string;
     paymentMethod: PaymentMethod;
+    customerWhatsapp?: string;
     notes: string;
     items: SaleLineDraft[];
   },
   options?: {
     allowStockOverride?: boolean;
+    activeBatchIds?: string[];
+    recordedBy?: {
+      staffId?: string;
+      staffName?: string;
+    };
   }
 ): Promise<string> {
   if (!input.items.length) {
@@ -646,58 +2103,182 @@ export async function createSale(
 
   const allowStockOverride = Boolean(options?.allowStockOverride);
 
-  // Merge duplicate product rows if any
-  const merged = new Map<string, { quantity: number; salePricePerUnit: number }>();
-  for (const row of input.items) {
-    if (row.quantity <= 0) throw new Error('Quantity must be greater than zero.');
-    if (row.salePricePerUnit < 0) throw new Error('Selling price cannot be negative.');
-    const existing = merged.get(row.productId);
-    if (existing) {
-      existing.quantity += row.quantity;
-      existing.salePricePerUnit = row.salePricePerUnit;
+  // Resolve exact authenticated Owner / Admin identity when a sale is saved
+  const currentUser = auth.currentUser;
+  let sellerId = clip(options?.recordedBy?.staffId || '', 128);
+  let sellerName = clip(options?.recordedBy?.staffName || '', 120);
+
+  if (!sellerId || !sellerName) {
+    if (currentUser && currentUser.uid !== uid) {
+      let resolvedName = '';
+      let resolvedMemberId = '';
+      try {
+        const mapSnap = await getDoc(doc(db, 'adminAuthMap', currentUser.uid));
+        const adminMemberId = mapSnap.exists() ? String(mapSnap.data()?.adminMemberId || '') : '';
+        if (adminMemberId) {
+          resolvedMemberId = adminMemberId;
+          const memberSnap = await getDoc(shopDoc(uid, 'adminMembers', adminMemberId));
+          if (memberSnap.exists()) {
+            const mData = memberSnap.data() as { name?: string; username?: string };
+            resolvedName = (mData.name || mData.username || '').trim();
+          }
+        }
+      } catch {
+        // Ignore lookup error and fall back to Auth profile
+      }
+      const fallbackAdminName =
+        resolvedName ||
+        currentUser.displayName?.trim() ||
+        currentUser.email?.split('@')[0]?.trim() ||
+        'Admin';
+      sellerId = resolvedMemberId ? `admin:${resolvedMemberId}` : `admin_uid:${currentUser.uid}`;
+      sellerName = clip(formatOwnerAdminLabel(fallbackAdminName), 120);
     } else {
-      merged.set(row.productId, {
-        quantity: row.quantity,
-        salePricePerUnit: row.salePricePerUnit,
+      let ownerDisplayName = currentUser?.displayName?.trim() || '';
+      if (!ownerDisplayName) {
+        try {
+          const settingsSnap = await getDoc(shopDoc(uid, 'settings', 'general'));
+          if (settingsSnap.exists()) {
+            const sData = settingsSnap.data() as { ownerName?: string };
+            const configured = (sData.ownerName || '').trim();
+            if (configured && configured.toLowerCase() !== 'shop owner') {
+              ownerDisplayName = configured;
+            }
+          }
+        } catch {
+          // Ignore settings fallback lookup failure
+        }
+      }
+      if (!ownerDisplayName) {
+        ownerDisplayName = currentUser?.email?.split('@')[0]?.trim() || 'Primary Owner';
+      }
+      sellerId = OWNER_PRIMARY_ID;
+      sellerName = clip(formatOwnerAdminLabel(ownerDisplayName), 120);
+    }
+  }
+
+  // Merge duplicate (productId, unitName) rows while preserving separate unit lines (e.g. Pack + Piece)
+  interface MergedSaleLine {
+    key: string;
+    productId: string;
+    unitName: string;
+    conversionFactor: number;
+    unitQuantity: number;
+    baseQuantity: number;
+    salePricePerUnit: number;
+  }
+  const merged = new Map<string, MergedSaleLine>();
+  const involvedProductIds = new Set<string>();
+
+  for (const row of input.items) {
+    const unitQty = roundStockQty(Number(row.quantity) || 0);
+    const conv = roundStockQty(Number(row.conversionFactor) || 1);
+    if (unitQty <= 0) throw new Error('Quantity must be greater than zero.');
+    if (conv <= 0) throw new Error('Unit conversion factor must be greater than zero.');
+    if (row.salePricePerUnit < 0) throw new Error('Selling price cannot be negative.');
+
+    const cleanUnit = clip(row.unitName || '', 40);
+    const key = `${row.productId}::${cleanUnit.toLowerCase() || '__base__'}`;
+    involvedProductIds.add(row.productId);
+
+    const existing = merged.get(key);
+    if (existing) {
+      existing.unitQuantity = roundStockQty(existing.unitQuantity + unitQty);
+      existing.baseQuantity = roundStockQty(existing.unitQuantity * existing.conversionFactor);
+      existing.salePricePerUnit = roundMoney(row.salePricePerUnit);
+    } else {
+      merged.set(key, {
+        key,
+        productId: row.productId,
+        unitName: cleanUnit,
+        conversionFactor: conv,
+        unitQuantity: unitQty,
+        baseQuantity: roundStockQty(unitQty * conv),
+        salePricePerUnit: roundMoney(row.salePricePerUnit),
       });
+    }
+  }
+
+  // Reuse caller's live activeBatchIds when available to avoid a full inventoryBatches scan per sale
+  let candidateBatchIds: string[] = [];
+  if (options?.activeBatchIds !== undefined) {
+    candidateBatchIds = options.activeBatchIds;
+  } else {
+    try {
+      const batchSnap = await getDocs(
+        query(shopCol(uid, 'inventoryBatches'), where('ownerUid', '==', uid))
+      );
+      candidateBatchIds = batchSnap.docs
+        .filter((d) => {
+          const data = d.data() as InventoryBatch;
+          return (
+            involvedProductIds.has(data.productId) &&
+            data.status === 'active' &&
+            Number(data.remainingBaseQty) > 0
+          );
+        })
+        .map((d) => d.id);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, `shops/${uid}/inventoryBatches`);
     }
   }
 
   const saleRef = doc(shopCol(uid, 'sales'));
   const saleNumber = generateTxnNumber('SL');
+  const stopTx = startPerfTimer();
 
   try {
     let discordPayload: Parameters<typeof notifyDiscordTransaction>[1] | null = null;
 
     await runTransaction(db, async (tx) => {
-      const productEntries: Array<{
-        productId: string;
-        product: Product;
-        qty: number;
-        salePrice: number;
-      }> = [];
+      // Phase 1: ALL reads before ANY writes (parallelized via Promise.all)
+      const involvedPids = Array.from(involvedProductIds);
+      const [prodSnaps, batchSnaps] = await Promise.all([
+        Promise.all(involvedPids.map((pid) => tx.get(shopDoc(uid, 'products', pid)))),
+        Promise.all(candidateBatchIds.map((batchId) => tx.get(shopDoc(uid, 'inventoryBatches', batchId)))),
+      ]);
 
-      // All reads must come before writes in a Firestore transaction
-      for (const [productId, line] of merged.entries()) {
-        const pRef = shopDoc(uid, 'products', productId);
-        const pSnap = await tx.get(pRef);
+      const productMap = new Map<string, Product>();
+      for (let i = 0; i < involvedPids.length; i += 1) {
+        const pid = involvedPids[i];
+        const pSnap = prodSnaps[i];
         if (!pSnap.exists()) {
           throw new Error('Selected product no longer exists.');
         }
-        const product = { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) };
-        if (!allowStockOverride && product.currentStock < line.quantity) {
-          throw new Error(
-            `Insufficient stock for "${product.name}". Available: ${product.currentStock} ${product.unit}, Requested: ${line.quantity}.`
-          );
-        }
-        productEntries.push({
-          productId,
-          product,
-          qty: line.quantity,
-          salePrice: roundMoney(line.salePricePerUnit),
-        });
+        productMap.set(pid, { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) });
       }
 
+      const batchesByProduct = new Map<string, InventoryBatch[]>();
+      for (const bSnap of batchSnaps) {
+        if (!bSnap.exists()) continue;
+        const bData = { id: bSnap.id, ...(bSnap.data() as Omit<InventoryBatch, 'id'>) };
+        if (bData.status === 'active' && roundStockQty(bData.remainingBaseQty) > 0) {
+          const arr = batchesByProduct.get(bData.productId) || [];
+          arr.push(bData);
+          batchesByProduct.set(bData.productId, arr);
+        }
+      }
+
+      // Sum total base units requested per product across all unit lines
+      const requestedBaseByProduct = new Map<string, number>();
+      for (const line of merged.values()) {
+        requestedBaseByProduct.set(
+          line.productId,
+          roundStockQty((requestedBaseByProduct.get(line.productId) || 0) + line.baseQuantity)
+        );
+      }
+
+      for (const [pid, reqBase] of requestedBaseByProduct.entries()) {
+        const product = productMap.get(pid)!;
+        const baseUnit = getEffectiveBaseUnit(product);
+        if (!allowStockOverride && product.currentStock < reqBase) {
+          throw new Error(
+            `Insufficient stock for "${product.name}". Available: ${product.currentStock} ${baseUnit}, Requested: ${reqBase} ${baseUnit}.`
+          );
+        }
+      }
+
+      // Phase 2: Calculate FIFO costs, prepare writes
       let totalAmount = 0;
       let totalCost = 0;
       let totalQuantity = 0;
@@ -709,51 +2290,78 @@ export async function createSale(
         unit: string;
       }> = [];
 
-      for (const entry of productEntries) {
-        const lineTotal = roundMoney(entry.qty * entry.salePrice);
-        const purchasePriceAtSale = roundMoney(entry.product.purchasePrice);
-        const lineCost = roundMoney(entry.qty * purchasePriceAtSale);
+      const runningStock = new Map<string, number>();
+      for (const [pid, prod] of productMap.entries()) {
+        runningStock.set(pid, roundStockQty(prod.currentStock));
+      }
+
+      const batchMutations = new Map<string, { remainingBaseQty: number; status: 'active' | 'exhausted' }>();
+
+      for (const line of merged.values()) {
+        const product = productMap.get(line.productId)!;
+        const baseUnit = getEffectiveBaseUnit(product);
+        const unitLabel = line.unitName || baseUnit;
+        const productBatches = batchesByProduct.get(line.productId) || [];
+
+        const fifo = allocateFifoFromBatches(
+          productBatches,
+          line.baseQuantity,
+          product.purchasePrice
+        );
+        for (const mut of fifo.updatedBatches) {
+          batchMutations.set(mut.batchId, {
+            remainingBaseQty: mut.nextRemainingBaseQty,
+            status: mut.nextStatus,
+          });
+        }
+
+        const lineTotal = roundMoney(line.unitQuantity * line.salePricePerUnit);
+        const lineCost = fifo.totalCost;
         const lineProfit = roundMoney(lineTotal - lineCost);
 
         totalAmount = roundMoney(totalAmount + lineTotal);
         totalCost = roundMoney(totalCost + lineCost);
-        totalQuantity += entry.qty;
+        totalQuantity = roundStockQty(totalQuantity + line.baseQuantity);
 
         discordItems.push({
-          productName: clip(entry.product.name, 180),
-          quantity: entry.qty,
-          unitPrice: entry.salePrice,
+          productName: clip(product.name, 180),
+          quantity: line.unitQuantity,
+          unitPrice: line.salePricePerUnit,
           lineTotal,
-          unit: clip(entry.product.unit || '', 40),
+          unit:
+            line.conversionFactor > 1
+              ? clip(`${unitLabel} (${line.conversionFactor} ${baseUnit})`, 40)
+              : clip(unitLabel, 40),
         });
 
-        const prevStock = entry.product.currentStock;
-        const newStock = Math.max(0, prevStock - entry.qty);
-
-        tx.update(shopDoc(uid, 'products', entry.productId), {
-          currentStock: newStock,
-          updatedAt: serverTimestamp(),
-        });
+        const prevStock = runningStock.get(line.productId) ?? product.currentStock;
+        const nextStock = roundStockQty(Math.max(0, prevStock - line.baseQuantity));
+        runningStock.set(line.productId, nextStock);
 
         const itemRef = doc(shopCol(uid, 'saleItems'));
         tx.set(itemRef, {
           ownerUid: uid,
           saleId: saleRef.id,
           saleDate: input.saleDate,
-          productId: entry.productId,
-          productName: clip(entry.product.name, 180),
-          categoryId: clip(entry.product.categoryId, 128),
-          categoryName: clip(entry.product.categoryName, 100),
-          brandId: clip(entry.product.brandId, 128),
-          brandName: clip(entry.product.brandName, 100),
-          quantity: entry.qty,
-          salePricePerUnit: entry.salePrice,
-          purchasePriceAtSale,
+          productId: line.productId,
+          productName: clip(product.name, 180),
+          categoryId: clip(product.categoryId, 128),
+          categoryName: clip(product.categoryName, 100),
+          brandId: clip(product.brandId, 128),
+          brandName: clip(product.brandName, 100),
+          quantity: line.unitQuantity,
+          unitName: clip(unitLabel, 40),
+          unitQuantity: line.unitQuantity,
+          conversionFactor: line.conversionFactor,
+          baseQuantity: line.baseQuantity,
+          salePricePerUnit: line.salePricePerUnit,
+          purchasePriceAtSale: fifo.weightedBaseUnitCost,
           lineTotal,
           lineCost,
           lineProfit,
-          staffId: 'owner',
-          staffName: 'Owner',
+          batchAllocations: fifo.allocations.slice(0, 50),
+          staffId: sellerId,
+          staffName: sellerName,
           status: 'completed',
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -762,21 +2370,41 @@ export async function createSale(
         const movRef = doc(shopCol(uid, 'stockMovements'));
         tx.set(movRef, {
           ownerUid: uid,
-          productId: entry.productId,
-          productName: clip(entry.product.name, 180),
+          productId: line.productId,
+          productName: clip(product.name, 180),
           movementDate: input.saleDate,
           movementType: 'sale',
-          quantityChange: -entry.qty,
+          quantityChange: -line.baseQuantity,
           previousStock: prevStock,
-          newStock,
+          newStock: nextStock,
+          unitName: clip(unitLabel, 40),
+          unitQuantity: line.unitQuantity,
+          conversionFactor: line.conversionFactor,
+          baseQuantity: line.baseQuantity,
           referenceId: saleRef.id,
-          notes: clip(`Sale ${saleNumber}`, 500),
+          notes: clip(`Sale ${saleNumber} (${line.unitQuantity} ${unitLabel})`, 500),
           createdAt: serverTimestamp(),
+        });
+      }
+
+      for (const [pid, nextStock] of runningStock.entries()) {
+        tx.update(shopDoc(uid, 'products', pid), {
+          currentStock: nextStock,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      for (const [batchId, mut] of batchMutations.entries()) {
+        tx.update(shopDoc(uid, 'inventoryBatches', batchId), {
+          remainingBaseQty: mut.remainingBaseQty,
+          status: mut.status,
+          updatedAt: serverTimestamp(),
         });
       }
 
       const totalProfit = roundMoney(totalAmount - totalCost);
       const saleDateTime = formatDateTimeKarachi(new Date());
+      const cleanWhatsapp = normalizeCustomerWhatsapp(input.customerWhatsapp);
 
       tx.set(saleRef, {
         ownerUid: uid,
@@ -788,10 +2416,11 @@ export async function createSale(
         totalCost,
         totalProfit,
         totalQuantity,
-        itemCount: productEntries.length,
-        staffId: 'owner',
-        staffName: 'Owner',
+        itemCount: merged.size,
+        staffId: sellerId,
+        staffName: sellerName,
         recordedByRole: 'owner',
+        ...(cleanWhatsapp ? { customerWhatsapp: clip(cleanWhatsapp, 32) } : {}),
         notes: clip(input.notes, 500),
         status: 'completed',
         createdAt: serverTimestamp(),
@@ -805,20 +2434,19 @@ export async function createSale(
         entityType: 'sale',
         entityId: saleRef.id,
         summary: clip(
-          `Recorded sale ${saleNumber} (${input.paymentMethod}): PKR ${totalAmount} · Profit PKR ${totalProfit}`,
+          `Recorded sale ${saleNumber} (${input.paymentMethod}) by ${sellerName}: PKR ${totalAmount} · Profit PKR ${totalProfit}`,
           400
         ),
         createdAt: serverTimestamp(),
       });
 
-      const actorName = auth.currentUser?.displayName?.trim() || 'Owner';
       discordPayload = {
         type: 'sale',
         dedupeId: saleRef.id,
         saleId: saleNumber,
         saleDate: input.saleDate,
         saleDateTime,
-        staffName: actorName,
+        staffName: sellerName,
         paymentMethod: input.paymentMethod,
         items: discordItems,
         totalAmount,
@@ -830,6 +2458,30 @@ export async function createSale(
     if (discordPayload) {
       void notifyDiscordTransaction(uid, discordPayload);
     }
+
+    recordPerfMetric('firebase_tx', 'create_sale', stopTx(), {
+      items: merged.size,
+      batches: candidateBatchIds.length,
+    });
+
+    enqueueSheetsBackgroundTask({
+      dedupeId: saleRef.id,
+      shopId: uid,
+      entityType: 'sale',
+      entityId: saleRef.id,
+      action: 'CREATE_SALE',
+      summary: `Sale ${saleNumber}`,
+      targetSheets: [
+        'Sales',
+        'Sales Details',
+        'Products',
+        'Inventory',
+        'Stock Movements',
+        'Daily Summary',
+        'Monthly Summary',
+        'Staff Performance',
+      ],
+    });
 
     return saleRef.id;
   } catch (err) {
@@ -847,6 +2499,7 @@ export async function editSale(
   updated: {
     saleDate: string;
     paymentMethod: PaymentMethod;
+    customerWhatsapp?: string;
     notes: string;
     items: SaleLineDraft[];
   },
@@ -863,50 +2516,164 @@ export async function editSale(
 
   const allowStockOverride = Boolean(options?.allowStockOverride);
 
-  // Merge updated items by productId
-  const newMap = new Map<string, { quantity: number; salePricePerUnit: number }>();
+  interface MergedEditLine {
+    key: string;
+    productId: string;
+    unitName: string;
+    conversionFactor: number;
+    unitQuantity: number;
+    baseQuantity: number;
+    salePricePerUnit: number;
+  }
+  const newMap = new Map<string, MergedEditLine>();
+  const newProductIds = new Set<string>();
+
   for (const row of updated.items) {
-    if (row.quantity <= 0) throw new Error('Quantity must be greater than zero.');
+    const unitQty = roundStockQty(Number(row.quantity) || 0);
+    const conv = roundStockQty(Number(row.conversionFactor) || 1);
+    if (unitQty <= 0) throw new Error('Quantity must be greater than zero.');
+    if (conv <= 0) throw new Error('Unit conversion factor must be greater than zero.');
     if (row.salePricePerUnit < 0) throw new Error('Selling price cannot be negative.');
-    const cur = newMap.get(row.productId);
+    const cleanUnit = clip(row.unitName || '', 40);
+    const key = `${row.productId}::${cleanUnit.toLowerCase() || '__base__'}`;
+    newProductIds.add(row.productId);
+
+    const cur = newMap.get(key);
     if (cur) {
-      cur.quantity += row.quantity;
-      cur.salePricePerUnit = row.salePricePerUnit;
+      cur.unitQuantity = roundStockQty(cur.unitQuantity + unitQty);
+      cur.baseQuantity = roundStockQty(cur.unitQuantity * cur.conversionFactor);
+      cur.salePricePerUnit = roundMoney(row.salePricePerUnit);
     } else {
-      newMap.set(row.productId, { quantity: row.quantity, salePricePerUnit: roundMoney(row.salePricePerUnit) });
+      newMap.set(key, {
+        key,
+        productId: row.productId,
+        unitName: cleanUnit,
+        conversionFactor: conv,
+        unitQuantity: unitQty,
+        baseQuantity: roundStockQty(unitQty * conv),
+        salePricePerUnit: roundMoney(row.salePricePerUnit),
+      });
     }
   }
 
-  const oldMap = new Map<string, SaleItem>();
+  // Group old items safely (supporting legacy single-row-per-product and new multi-unit keys)
+  const oldItemsById = new Map<string, SaleItem>();
+  const oldKeyMap = new Map<string, SaleItem>();
+  const oldProductIds = new Set<string>();
+  const referencedBatchIds = new Set<string>();
+
   for (const item of existingItems) {
-    oldMap.set(item.productId, item);
+    oldItemsById.set(item.id, item);
+    oldProductIds.add(item.productId);
+    const uKey = `${item.productId}::${(item.unitName || '').trim().toLowerCase() || '__base__'}`;
+    if (!oldKeyMap.has(uKey)) {
+      oldKeyMap.set(uKey, item);
+    }
+    if (Array.isArray(item.batchAllocations)) {
+      for (const alloc of item.batchAllocations) {
+        if (alloc?.batchId) referencedBatchIds.add(alloc.batchId);
+      }
+    }
   }
 
-  const allProductIds = Array.from(new Set([...oldMap.keys(), ...newMap.keys()]));
+  const allProductIds = Array.from(new Set([...oldProductIds, ...newProductIds]));
+
+  // Pre-query batches for involved products + referenced batch IDs
+  let candidateBatchIds: string[] = [];
+  try {
+    const batchSnap = await getDocs(
+      query(shopCol(uid, 'inventoryBatches'), where('ownerUid', '==', uid))
+    );
+    const allPidSet = new Set(allProductIds);
+    candidateBatchIds = batchSnap.docs
+      .filter((d) => {
+        const b = d.data() as InventoryBatch;
+        return (
+          referencedBatchIds.has(d.id) ||
+          (allPidSet.has(b.productId) && b.status !== 'cancelled')
+        );
+      })
+      .map((d) => d.id);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/inventoryBatches`);
+  }
 
   try {
     await runTransaction(db, async (tx) => {
       const saleRef = shopDoc(uid, 'sales', sale.id);
       const ssRef = shopDoc(uid, 'staffSales', sale.id);
-      const saleSnap = await tx.get(saleRef);
-      const ssSnap = await tx.get(ssRef);
+      const [saleSnap, ssSnap, prodSnaps, batchSnaps] = await Promise.all([
+        tx.get(saleRef),
+        tx.get(ssRef),
+        Promise.all(allProductIds.map((pid) => tx.get(shopDoc(uid, 'products', pid)))),
+        Promise.all(candidateBatchIds.map((bId) => tx.get(shopDoc(uid, 'inventoryBatches', bId)))),
+      ]);
       if (!saleSnap.exists() || saleSnap.data()?.status === 'cancelled') {
         throw new Error('Sale no longer active.');
       }
 
       const productMap = new Map<string, Product>();
-      for (const pid of allProductIds) {
-        const pSnap = await tx.get(shopDoc(uid, 'products', pid));
+      for (let i = 0; i < allProductIds.length; i += 1) {
+        const pSnap = prodSnaps[i];
         if (pSnap.exists()) {
-          productMap.set(pid, { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) });
+          productMap.set(allProductIds[i], { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) });
         }
       }
 
-      // Compute stock delta: delta = oldQty - newQty (positive returns stock, negative deducts more stock)
+      const batchMap = new Map<string, InventoryBatch>();
+      const batchesByProduct = new Map<string, InventoryBatch[]>();
+      for (const bSnap of batchSnaps) {
+        if (!bSnap.exists()) continue;
+        const bData = { id: bSnap.id, ...(bSnap.data() as Omit<InventoryBatch, 'id'>) };
+        if (bData.status === 'cancelled') continue;
+        batchMap.set(bData.id, bData);
+        const arr = batchesByProduct.get(bData.productId) || [];
+        arr.push(bData);
+        batchesByProduct.set(bData.productId, arr);
+      }
+
+      // Compute total old vs new base quantities per product
+      const oldBaseByProduct = new Map<string, number>();
+      for (const item of existingItems) {
+        if (item.status === 'cancelled') continue;
+        const baseQ = roundStockQty(item.baseQuantity ?? item.quantity * (item.conversionFactor || 1));
+        oldBaseByProduct.set(item.productId, roundStockQty((oldBaseByProduct.get(item.productId) || 0) + baseQ));
+      }
+
+      const newBaseByProduct = new Map<string, number>();
+      for (const line of newMap.values()) {
+        newBaseByProduct.set(
+          line.productId,
+          roundStockQty((newBaseByProduct.get(line.productId) || 0) + line.baseQuantity)
+        );
+      }
+
+      // Track original batch remaining qty to detect changes
+      const originalBatchRemaining = new Map<string, { remainingBaseQty: number; status: InventoryBatch['status'] }>();
+      for (const [bId, b] of batchMap.entries()) {
+        originalBatchRemaining.set(bId, {
+          remainingBaseQty: b.remainingBaseQty,
+          status: b.status,
+        });
+      }
+
+      // Restore batch allocations from active existing items in memory
+      for (const item of existingItems) {
+        if (item.status === 'cancelled' || !Array.isArray(item.batchAllocations)) continue;
+        for (const alloc of item.batchAllocations) {
+          const b = batchMap.get(alloc.batchId);
+          if (!b) continue;
+          const nextRem = roundStockQty(Math.min(b.initialBaseQty, b.remainingBaseQty + alloc.consumedBaseQty));
+          b.remainingBaseQty = nextRem;
+          b.status = nextRem > 0 ? 'active' : 'exhausted';
+        }
+      }
+
+      // Validate and apply stock delta per product
       for (const pid of allProductIds) {
-        const oldQty = oldMap.get(pid)?.quantity ?? 0;
-        const newQty = newMap.get(pid)?.quantity ?? 0;
-        const stockDelta = oldQty - newQty;
+        const oldBase = oldBaseByProduct.get(pid) ?? 0;
+        const newBase = newBaseByProduct.get(pid) ?? 0;
+        const stockDelta = roundStockQty(oldBase - newBase);
         if (stockDelta !== 0) {
           const prod = productMap.get(pid);
           if (!prod) {
@@ -915,7 +2682,7 @@ export async function editSale(
             }
             continue;
           }
-          const rawNextStock = prod.currentStock + stockDelta;
+          const rawNextStock = roundStockQty(prod.currentStock + stockDelta);
           if (!allowStockOverride && rawNextStock < 0) {
             throw new Error(
               `Insufficient stock for "${prod.name}". Available: ${prod.currentStock}, Extra needed: ${Math.abs(stockDelta)}.`
@@ -934,7 +2701,7 @@ export async function editSale(
             productName: clip(prod.name, 180),
             movementDate: updated.saleDate,
             movementType: 'sale_edit',
-            quantityChange: nextStock - prod.currentStock,
+            quantityChange: roundStockQty(nextStock - prod.currentStock),
             previousStock: prod.currentStock,
             newStock: nextStock,
             referenceId: sale.id,
@@ -944,41 +2711,88 @@ export async function editSale(
         }
       }
 
-      let totalAmount = 0;
-      let totalCost = 0;
-      let totalQuantity = 0;
+      // Match reusable existing saleItem docs cleanly
+      const reusedItemIds = new Set<string>();
+      const matchedOldItemForKey = new Map<string, SaleItem>();
 
-      // Delete removed items
-      for (const [pid, oldItem] of oldMap.entries()) {
-        if (!newMap.has(pid)) {
+      for (const [key, line] of newMap.entries()) {
+        const direct = oldKeyMap.get(key);
+        if (direct && !reusedItemIds.has(direct.id)) {
+          matchedOldItemForKey.set(key, direct);
+          reusedItemIds.add(direct.id);
+        } else {
+          // Fallback for legacy item missing unitName
+          const fallback = existingItems.find(
+            (i) => i.productId === line.productId && !reusedItemIds.has(i.id)
+          );
+          if (fallback) {
+            matchedOldItemForKey.set(key, fallback);
+            reusedItemIds.add(fallback.id);
+          }
+        }
+      }
+
+      // Delete any old items not reused
+      for (const oldItem of oldItemsById.values()) {
+        if (!reusedItemIds.has(oldItem.id)) {
           tx.delete(shopDoc(uid, 'saleItems', oldItem.id));
         }
       }
 
-      // Update existing or create new items (preserving historical purchasePriceAtSale for existing items!)
-      for (const [pid, line] of newMap.entries()) {
-        const oldItem = oldMap.get(pid);
-        const prod = productMap.get(pid);
-        const historicalCost = oldItem
-          ? oldItem.purchasePriceAtSale
+      let totalAmount = 0;
+      let totalCost = 0;
+      let totalQuantity = 0;
+
+      for (const [key, line] of newMap.entries()) {
+        const oldItem = matchedOldItemForKey.get(key);
+        const prod = productMap.get(line.productId);
+        const baseUnit = getEffectiveBaseUnit(prod);
+        const unitLabel = line.unitName || oldItem?.unitName || baseUnit;
+        const fallbackBaseCost = oldItem
+          ? roundMoney(oldItem.purchasePriceAtSale)
           : roundMoney(prod?.purchasePrice ?? 0);
 
-        const lineTotal = roundMoney(line.quantity * line.salePricePerUnit);
-        const lineCost = roundMoney(line.quantity * historicalCost);
+        let weightedBaseUnitCost = fallbackBaseCost;
+        let lineCost = 0;
+        let nextAllocations: BatchAllocation[] = [];
+
+        const prodBatches = (batchesByProduct.get(line.productId) || []).filter(
+          (b) => (b.purchaseDate || '') <= updated.saleDate || (oldItem?.batchAllocations || []).some((a) => a.batchId === b.id)
+        );
+
+        const oldHadBatches = Boolean(oldItem?.batchAllocations && oldItem.batchAllocations.length > 0);
+        if (prodBatches.length > 0 && (oldHadBatches || !oldItem)) {
+          const fifo = allocateFifoFromBatches(prodBatches, line.baseQuantity, fallbackBaseCost);
+          weightedBaseUnitCost = fifo.weightedBaseUnitCost;
+          lineCost = fifo.totalCost;
+          nextAllocations = fifo.allocations.slice(0, 50);
+        } else {
+          // Legacy unbatched sale item: preserve historical purchasePriceAtSale per base unit
+          weightedBaseUnitCost = fallbackBaseCost;
+          lineCost = roundMoney(line.baseQuantity * weightedBaseUnitCost);
+        }
+
+        const lineTotal = roundMoney(line.unitQuantity * line.salePricePerUnit);
         const lineProfit = roundMoney(lineTotal - lineCost);
 
         totalAmount = roundMoney(totalAmount + lineTotal);
         totalCost = roundMoney(totalCost + lineCost);
-        totalQuantity += line.quantity;
+        totalQuantity = roundStockQty(totalQuantity + line.baseQuantity);
 
         if (oldItem) {
           tx.update(shopDoc(uid, 'saleItems', oldItem.id), {
             saleDate: updated.saleDate,
-            quantity: line.quantity,
+            quantity: line.unitQuantity,
+            unitName: clip(unitLabel, 40),
+            unitQuantity: line.unitQuantity,
+            conversionFactor: line.conversionFactor,
+            baseQuantity: line.baseQuantity,
             salePricePerUnit: line.salePricePerUnit,
+            purchasePriceAtSale: weightedBaseUnitCost,
             lineTotal,
             lineCost,
             lineProfit,
+            batchAllocations: nextAllocations,
             updatedAt: serverTimestamp(),
           });
         } else if (prod) {
@@ -987,18 +2801,25 @@ export async function editSale(
             ownerUid: uid,
             saleId: sale.id,
             saleDate: updated.saleDate,
-            productId: pid,
+            productId: line.productId,
             productName: clip(prod.name, 180),
             categoryId: clip(prod.categoryId, 128),
             categoryName: clip(prod.categoryName, 100),
             brandId: clip(prod.brandId, 128),
             brandName: clip(prod.brandName, 100),
-            quantity: line.quantity,
+            quantity: line.unitQuantity,
+            unitName: clip(unitLabel, 40),
+            unitQuantity: line.unitQuantity,
+            conversionFactor: line.conversionFactor,
+            baseQuantity: line.baseQuantity,
             salePricePerUnit: line.salePricePerUnit,
-            purchasePriceAtSale: historicalCost,
+            purchasePriceAtSale: weightedBaseUnitCost,
             lineTotal,
             lineCost,
             lineProfit,
+            batchAllocations: nextAllocations,
+            ...(sale.staffId ? { staffId: sale.staffId } : {}),
+            ...(sale.staffName ? { staffName: sale.staffName } : {}),
             status: 'completed',
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
@@ -1006,7 +2827,27 @@ export async function editSale(
         }
       }
 
+      // Persist all modified inventory batches
+      for (const [bId, b] of batchMap.entries()) {
+        const orig = originalBatchRemaining.get(bId);
+        if (!orig) continue;
+        if (orig.remainingBaseQty !== b.remainingBaseQty || orig.status !== b.status) {
+          tx.update(shopDoc(uid, 'inventoryBatches', bId), {
+            remainingBaseQty: b.remainingBaseQty,
+            status: b.status,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
       const totalProfit = roundMoney(totalAmount - totalCost);
+      const cleanWhatsapp = normalizeCustomerWhatsapp(updated.customerWhatsapp);
+      const existingSaleWhatsapp = saleSnap.data()?.customerWhatsapp;
+      const whatsappPatch = cleanWhatsapp
+        ? { customerWhatsapp: clip(cleanWhatsapp, 32) }
+        : existingSaleWhatsapp !== undefined
+        ? { customerWhatsapp: deleteField() }
+        : {};
 
       tx.update(saleRef, {
         saleDate: updated.saleDate,
@@ -1016,23 +2857,35 @@ export async function editSale(
         totalProfit,
         totalQuantity,
         itemCount: newMap.size,
+        ...whatsappPatch,
         notes: clip(updated.notes, 500),
         updatedAt: serverTimestamp(),
       });
 
       if (ssSnap.exists()) {
-        const staffLines = Array.from(newMap.entries()).map(([pid, line]) => {
-          const oldItem = oldMap.get(pid);
-          const prod = productMap.get(pid);
+        const staffLines = Array.from(newMap.values()).map((line) => {
+          const oldItem = matchedOldItemForKey.get(line.key);
+          const prod = productMap.get(line.productId);
+          const baseUnit = getEffectiveBaseUnit(prod);
           const productName = prod?.name || oldItem?.productName || 'Product';
           return {
-            productId: pid,
+            productId: line.productId,
             productName: clip(productName, 180),
-            quantity: line.quantity,
+            quantity: line.unitQuantity,
+            unitName: clip(line.unitName || oldItem?.unitName || baseUnit, 40),
+            unitQuantity: line.unitQuantity,
+            conversionFactor: line.conversionFactor,
+            baseQuantity: line.baseQuantity,
             salePricePerUnit: line.salePricePerUnit,
-            lineTotal: roundMoney(line.quantity * line.salePricePerUnit),
+            lineTotal: roundMoney(line.unitQuantity * line.salePricePerUnit),
           };
         });
+        const existingSsWhatsapp = ssSnap.data()?.customerWhatsapp;
+        const ssWhatsappPatch = cleanWhatsapp
+          ? { customerWhatsapp: clip(cleanWhatsapp, 32) }
+          : existingSsWhatsapp !== undefined
+          ? { customerWhatsapp: deleteField() }
+          : {};
         tx.update(ssRef, {
           saleDate: updated.saleDate,
           paymentMethod: updated.paymentMethod,
@@ -1040,6 +2893,7 @@ export async function editSale(
           totalQuantity,
           itemCount: staffLines.length,
           items: staffLines,
+          ...ssWhatsappPatch,
           notes: clip(updated.notes, 500),
           updatedAt: serverTimestamp(),
         });
@@ -1055,6 +2909,25 @@ export async function editSale(
         createdAt: serverTimestamp(),
       });
     });
+
+    enqueueSheetsBackgroundTask({
+      dedupeId: `${sale.id}:edit:${Date.now()}`,
+      shopId: uid,
+      entityType: 'sale',
+      entityId: sale.id,
+      action: 'EDIT_SALE',
+      summary: `Edited sale ${sale.saleNumber}`,
+      targetSheets: [
+        'Sales',
+        'Sales Details',
+        'Products',
+        'Inventory',
+        'Stock Movements',
+        'Daily Summary',
+        'Monthly Summary',
+        'Staff Performance',
+      ],
+    });
   } catch (err) {
     if (err instanceof Error && (err.message.includes('Insufficient stock') || err.message.includes('Cancelled'))) {
       throw err;
@@ -1066,13 +2939,24 @@ export async function editSale(
 export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by owner'): Promise<void> {
   if (sale.status === 'cancelled') return;
 
-  const itemsQuery = query(shopCol(uid, 'saleItems'), where('saleId', '==', sale.id));
+  const itemsQuery = query(shopCol(uid, 'saleItems'), where('ownerUid', '==', uid));
   let items: SaleItem[] = [];
   try {
     const snap = await getDocs(itemsQuery);
-    items = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<SaleItem, 'id'>) }));
+    items = snap.docs
+      .map((d) => ({ id: d.id, ...(d.data() as Omit<SaleItem, 'id'>) }))
+      .filter((item) => item.saleId === sale.id);
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, `shops/${uid}/saleItems`);
+  }
+
+  const referencedBatchIds = new Set<string>();
+  for (const item of items) {
+    if (item.status !== 'cancelled' && Array.isArray(item.batchAllocations)) {
+      for (const alloc of item.batchAllocations) {
+        if (alloc?.batchId) referencedBatchIds.add(alloc.batchId);
+      }
+    }
   }
 
   const todayIso = getKarachiDateIso();
@@ -1081,26 +2965,40 @@ export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by
     await runTransaction(db, async (tx) => {
       const saleRef = shopDoc(uid, 'sales', sale.id);
       const ssRef = shopDoc(uid, 'staffSales', sale.id);
-      const saleSnap = await tx.get(saleRef);
-      const ssSnap = await tx.get(ssRef);
+      const uniqueProdIds = Array.from(new Set(items.map((item) => item.productId)));
+      const batchIdList = Array.from(referencedBatchIds);
+
+      const [saleSnap, ssSnap, prodDocs, batchDocs] = await Promise.all([
+        tx.get(saleRef),
+        tx.get(ssRef),
+        Promise.all(uniqueProdIds.map((pid) => tx.get(shopDoc(uid, 'products', pid)))),
+        Promise.all(batchIdList.map((bId) => tx.get(shopDoc(uid, 'inventoryBatches', bId)))),
+      ]);
       if (!saleSnap.exists() || saleSnap.data()?.status === 'cancelled') {
         throw new Error('Sale is already cancelled.');
       }
 
       const prodSnaps = new Map<string, Product>();
-      for (const item of items) {
-        if (!prodSnaps.has(item.productId)) {
-          const pSnap = await tx.get(shopDoc(uid, 'products', item.productId));
-          if (pSnap.exists()) {
-            prodSnaps.set(item.productId, { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) });
-          }
+      for (let i = 0; i < uniqueProdIds.length; i += 1) {
+        const pSnap = prodDocs[i];
+        if (pSnap.exists()) {
+          prodSnaps.set(uniqueProdIds[i], { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) });
+        }
+      }
+
+      const batchSnaps = new Map<string, InventoryBatch>();
+      for (const bSnap of batchDocs) {
+        if (bSnap.exists()) {
+          batchSnaps.set(bSnap.id, { id: bSnap.id, ...(bSnap.data() as Omit<InventoryBatch, 'id'>) });
         }
       }
 
       const runningStock = new Map<string, number>();
       for (const [pid, prod] of prodSnaps.entries()) {
-        runningStock.set(pid, prod.currentStock);
+        runningStock.set(pid, roundStockQty(prod.currentStock));
       }
+
+      const batchRestoreAccum = new Map<string, number>();
 
       for (const item of items) {
         if (item.status !== 'cancelled') {
@@ -1108,9 +3006,13 @@ export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by
             status: 'cancelled',
             updatedAt: serverTimestamp(),
           });
+
+          const restoreBase = roundStockQty(
+            item.baseQuantity ?? item.quantity * (item.conversionFactor || 1)
+          );
           const cur = runningStock.get(item.productId);
           if (cur !== undefined) {
-            const next = cur + item.quantity;
+            const next = roundStockQty(cur + restoreBase);
             runningStock.set(item.productId, next);
             const movRef = doc(shopCol(uid, 'stockMovements'));
             tx.set(movRef, {
@@ -1119,15 +3021,40 @@ export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by
               productName: clip(item.productName, 180),
               movementDate: todayIso,
               movementType: 'sale_cancel',
-              quantityChange: item.quantity,
+              quantityChange: restoreBase,
               previousStock: cur,
               newStock: next,
+              unitName: clip(item.unitName || '', 40),
+              unitQuantity: item.unitQuantity ?? item.quantity,
+              conversionFactor: item.conversionFactor ?? 1,
+              baseQuantity: restoreBase,
               referenceId: sale.id,
               notes: clip(`Returned from cancelled sale ${sale.saleNumber}`, 500),
               createdAt: serverTimestamp(),
             });
           }
+
+          if (Array.isArray(item.batchAllocations)) {
+            for (const alloc of item.batchAllocations) {
+              if (!alloc?.batchId || !alloc.consumedBaseQty) continue;
+              batchRestoreAccum.set(
+                alloc.batchId,
+                roundStockQty((batchRestoreAccum.get(alloc.batchId) || 0) + alloc.consumedBaseQty)
+              );
+            }
+          }
         }
+      }
+
+      for (const [bId, addQty] of batchRestoreAccum.entries()) {
+        const batch = batchSnaps.get(bId);
+        if (!batch || batch.status === 'cancelled') continue;
+        const nextRem = roundStockQty(Math.min(batch.initialBaseQty, batch.remainingBaseQty + addQty));
+        tx.update(shopDoc(uid, 'inventoryBatches', bId), {
+          remainingBaseQty: nextRem,
+          status: nextRem > 0 ? 'active' : 'exhausted',
+          updatedAt: serverTimestamp(),
+        });
       }
 
       for (const [pid, nextStock] of runningStock.entries()) {
@@ -1162,6 +3089,25 @@ export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by
         createdAt: serverTimestamp(),
       });
     });
+
+    enqueueSheetsBackgroundTask({
+      dedupeId: `${sale.id}:cancel`,
+      shopId: uid,
+      entityType: 'sale',
+      entityId: sale.id,
+      action: 'CANCEL_SALE',
+      summary: `Cancelled sale ${sale.saleNumber}`,
+      targetSheets: [
+        'Sales',
+        'Sales Details',
+        'Products',
+        'Inventory',
+        'Stock Movements',
+        'Daily Summary',
+        'Monthly Summary',
+        'Staff Performance',
+      ],
+    });
   } catch (err) {
     if (err instanceof Error && err.message.includes('already cancelled')) throw err;
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/sales/${sale.id}`);
@@ -1169,10 +3115,13 @@ export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by
 }
 
 // ------------------------------------------------------------------
-// Purchases & Supplier Balances
+// Purchases & Supplier Balances (Multi-Unit + FIFO Batch Creation)
 // ------------------------------------------------------------------
 export interface PurchaseLineDraft {
   productId: string;
+  unitName?: string;
+  conversionFactor?: number;
+  expiryDate?: string;
   quantity: number;
   purchasePricePerUnit: number;
 }
@@ -1191,18 +3140,45 @@ export async function createPurchase(
   if (!input.supplierId) throw new Error('Please select a supplier.');
   if (!input.items.length) throw new Error('Please add at least one product.');
 
-  const merged = new Map<string, { quantity: number; purchasePricePerUnit: number }>();
+  interface MergedPurchaseLine {
+    productId: string;
+    unitName: string;
+    conversionFactor: number;
+    unitQuantity: number;
+    baseQuantity: number;
+    purchasePricePerUnit: number;
+    expiryDate: string;
+  }
+
+  const merged = new Map<string, MergedPurchaseLine>();
+  const involvedProductIds = new Set<string>();
+
   for (const row of input.items) {
-    if (row.quantity <= 0) throw new Error('Quantity purchased must be greater than zero.');
+    const unitQty = roundStockQty(Number(row.quantity) || 0);
+    const conv = roundStockQty(Number(row.conversionFactor) || 1);
+    if (unitQty <= 0) throw new Error('Quantity purchased must be greater than zero.');
+    if (conv <= 0) throw new Error('Unit conversion factor must be greater than zero.');
     if (row.purchasePricePerUnit < 0) throw new Error('Purchase price cannot be negative.');
-    const cur = merged.get(row.productId);
+
+    const cleanUnit = clip(row.unitName || '', 40);
+    const exp = clip(row.expiryDate || '', 20);
+    const key = `${row.productId}::${cleanUnit.toLowerCase() || '__base__'}::${exp}`;
+    involvedProductIds.add(row.productId);
+
+    const cur = merged.get(key);
     if (cur) {
-      cur.quantity += row.quantity;
-      cur.purchasePricePerUnit = row.purchasePricePerUnit;
+      cur.unitQuantity = roundStockQty(cur.unitQuantity + unitQty);
+      cur.baseQuantity = roundStockQty(cur.unitQuantity * cur.conversionFactor);
+      cur.purchasePricePerUnit = roundMoney(row.purchasePricePerUnit);
     } else {
-      merged.set(row.productId, {
-        quantity: row.quantity,
+      merged.set(key, {
+        productId: row.productId,
+        unitName: cleanUnit,
+        conversionFactor: conv,
+        unitQuantity: unitQty,
+        baseQuantity: roundStockQty(unitQty * conv),
         purchasePricePerUnit: roundMoney(row.purchasePricePerUnit),
+        expiryDate: exp,
       });
     }
   }
@@ -1215,26 +3191,19 @@ export async function createPurchase(
 
     await runTransaction(db, async (tx) => {
       const supRef = shopDoc(uid, 'suppliers', input.supplierId);
-      const supSnap = await tx.get(supRef);
+      const involvedPids = Array.from(involvedProductIds);
+      const [supSnap, prodSnaps] = await Promise.all([
+        tx.get(supRef),
+        Promise.all(involvedPids.map((pid) => tx.get(shopDoc(uid, 'products', pid)))),
+      ]);
       if (!supSnap.exists()) throw new Error('Selected supplier not found.');
       const supplier = { id: supSnap.id, ...(supSnap.data() as Omit<Supplier, 'id'>) };
 
-      const productEntries: Array<{
-        productId: string;
-        product: Product;
-        qty: number;
-        unitCost: number;
-      }> = [];
-
-      for (const [pid, line] of merged.entries()) {
-        const pSnap = await tx.get(shopDoc(uid, 'products', pid));
+      const productMap = new Map<string, Product>();
+      for (let i = 0; i < involvedPids.length; i += 1) {
+        const pSnap = prodSnaps[i];
         if (!pSnap.exists()) throw new Error('Selected product not found.');
-        productEntries.push({
-          productId: pid,
-          product: { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) },
-          qty: line.quantity,
-          unitCost: line.purchasePricePerUnit,
-        });
+        productMap.set(involvedPids[i], { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) });
       }
 
       let totalAmount = 0;
@@ -1247,34 +3216,49 @@ export async function createPurchase(
         unit: string;
       }> = [];
 
-      for (const entry of productEntries) {
-        const lineTotal = roundMoney(entry.qty * entry.unitCost);
+      const runningProductState = new Map<
+        string,
+        { currentStock: number; purchasePrice: number; salePrice: number }
+      >();
+      for (const [pid, prod] of productMap.entries()) {
+        runningProductState.set(pid, {
+          currentStock: roundStockQty(Math.max(0, prod.currentStock)),
+          purchasePrice: Math.max(0, roundMoney(prod.purchasePrice)),
+          salePrice: Math.max(0, roundMoney(prod.salePrice)),
+        });
+      }
+
+      for (const line of merged.values()) {
+        const product = productMap.get(line.productId)!;
+        const baseUnit = getEffectiveBaseUnit(product);
+        const unitLabel = line.unitName || baseUnit;
+        const lineTotal = roundMoney(line.unitQuantity * line.purchasePricePerUnit);
+        const unitCostInBase =
+          line.baseQuantity > 0 ? roundMoney(lineTotal / line.baseQuantity) : 0;
+
         totalAmount = roundMoney(totalAmount + lineTotal);
-        totalQuantity += entry.qty;
+        totalQuantity = roundStockQty(totalQuantity + line.baseQuantity);
 
         discordItems.push({
-          productName: clip(entry.product.name, 180),
-          quantity: entry.qty,
-          unitPrice: entry.unitCost,
+          productName: clip(product.name, 180),
+          quantity: line.unitQuantity,
+          unitPrice: line.purchasePricePerUnit,
           lineTotal,
-          unit: clip(entry.product.unit || '', 40),
+          unit:
+            line.conversionFactor > 1
+              ? clip(`${unitLabel} (${line.conversionFactor} ${baseUnit})`, 40)
+              : clip(unitLabel, 40),
         });
 
-        const oldStock = Math.max(0, entry.product.currentStock);
-        const newStock = oldStock + entry.qty;
-        // Weighted average purchase cost keeps inventory valuation accurate across price changes
-        const weightedCost =
+        const state = runningProductState.get(line.productId)!;
+        const oldStock = state.currentStock;
+        const newStock = roundStockQty(oldStock + line.baseQuantity);
+        const weightedBaseCost =
           newStock > 0
-            ? roundMoney((oldStock * entry.product.purchasePrice + entry.qty * entry.unitCost) / newStock)
-            : entry.unitCost;
-        const newMargin = calcProfitMarginPct(weightedCost, entry.product.salePrice);
-
-        tx.update(shopDoc(uid, 'products', entry.productId), {
-          currentStock: newStock,
-          purchasePrice: weightedCost,
-          profitMarginPct: newMargin,
-          updatedAt: serverTimestamp(),
-        });
+            ? roundMoney((oldStock * state.purchasePrice + lineTotal) / newStock)
+            : unitCostInBase;
+        state.currentStock = newStock;
+        state.purchasePrice = weightedBaseCost;
 
         const itemRef = doc(shopCol(uid, 'purchaseItems'));
         tx.set(itemRef, {
@@ -1282,12 +3266,37 @@ export async function createPurchase(
           purchaseId: purchaseRef.id,
           purchaseDate: input.purchaseDate,
           supplierId: supplier.id,
-          productId: entry.productId,
-          productName: clip(entry.product.name, 180),
-          quantity: entry.qty,
-          purchasePricePerUnit: entry.unitCost,
+          productId: line.productId,
+          productName: clip(product.name, 180),
+          quantity: line.unitQuantity,
+          unitName: clip(unitLabel, 40),
+          unitQuantity: line.unitQuantity,
+          conversionFactor: line.conversionFactor,
+          baseQuantity: line.baseQuantity,
+          expiryDate: clip(line.expiryDate, 20),
+          purchasePricePerUnit: line.purchasePricePerUnit,
           lineTotal,
           status: 'completed',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        // Create dedicated FIFO Inventory Batch preserving exact cost & expiry of this lot
+        const batchRef = doc(shopCol(uid, 'inventoryBatches'));
+        tx.set(batchRef, {
+          ownerUid: uid,
+          productId: line.productId,
+          productName: clip(product.name, 180),
+          purchaseId: purchaseRef.id,
+          purchaseNumber,
+          purchaseDate: input.purchaseDate,
+          supplierId: supplier.id,
+          supplierName: clip(supplier.name, 150),
+          initialBaseQty: line.baseQuantity,
+          remainingBaseQty: line.baseQuantity,
+          unitCostInBase,
+          expiryDate: clip(line.expiryDate, 20),
+          status: 'active',
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -1295,16 +3304,33 @@ export async function createPurchase(
         const movRef = doc(shopCol(uid, 'stockMovements'));
         tx.set(movRef, {
           ownerUid: uid,
-          productId: entry.productId,
-          productName: clip(entry.product.name, 180),
+          productId: line.productId,
+          productName: clip(product.name, 180),
           movementDate: input.purchaseDate,
           movementType: 'purchase',
-          quantityChange: entry.qty,
+          quantityChange: line.baseQuantity,
           previousStock: oldStock,
           newStock,
+          unitName: clip(unitLabel, 40),
+          unitQuantity: line.unitQuantity,
+          conversionFactor: line.conversionFactor,
+          baseQuantity: line.baseQuantity,
           referenceId: purchaseRef.id,
-          notes: clip(`Purchase ${purchaseNumber} from ${supplier.name}`, 500),
+          notes: clip(
+            `Purchase ${purchaseNumber} (${line.unitQuantity} ${unitLabel} = +${line.baseQuantity} ${baseUnit}) from ${supplier.name}`,
+            500
+          ),
           createdAt: serverTimestamp(),
+        });
+      }
+
+      for (const [pid, state] of runningProductState.entries()) {
+        const newMargin = calcProfitMarginPct(state.purchasePrice, state.salePrice);
+        tx.update(shopDoc(uid, 'products', pid), {
+          currentStock: state.currentStock,
+          purchasePrice: state.purchasePrice,
+          profitMarginPct: newMargin,
+          updatedAt: serverTimestamp(),
         });
       }
 
@@ -1322,7 +3348,7 @@ export async function createPurchase(
         balanceDue,
         paymentMethod: input.paymentMethod,
         totalQuantity,
-        itemCount: productEntries.length,
+        itemCount: merged.size,
         notes: clip(input.notes, 500),
         status: 'completed',
         createdAt: serverTimestamp(),
@@ -1368,6 +3394,25 @@ export async function createPurchase(
       void notifyDiscordTransaction(uid, discordPayload);
     }
 
+    enqueueSheetsBackgroundTask({
+      dedupeId: purchaseRef.id,
+      shopId: uid,
+      entityType: 'purchase',
+      entityId: purchaseRef.id,
+      action: 'CREATE_PURCHASE',
+      summary: `Purchase ${purchaseNumber}`,
+      targetSheets: [
+        'Purchases',
+        'Purchase Details',
+        'Products',
+        'Inventory',
+        'Stock Movements',
+        'Suppliers',
+        'Daily Summary',
+        'Monthly Summary',
+      ],
+    });
+
     return purchaseRef.id;
   } catch (err) {
     if (err instanceof Error && (err.message.includes('Selected') || err.message.includes('Please'))) {
@@ -1393,8 +3438,7 @@ export async function settlePurchaseBalance(
     await runTransaction(db, async (tx) => {
       const pRef = shopDoc(uid, 'purchases', purchase.id);
       const sRef = shopDoc(uid, 'suppliers', purchase.supplierId);
-      const pSnap = await tx.get(pRef);
-      const sSnap = await tx.get(sRef);
+      const [pSnap, sSnap] = await Promise.all([tx.get(pRef), tx.get(sRef)]);
       if (!pSnap.exists()) throw new Error('Purchase not found.');
 
       const curP = pSnap.data() as Purchase;
@@ -1431,6 +3475,16 @@ export async function settlePurchaseBalance(
         createdAt: serverTimestamp(),
       });
     });
+
+    enqueueSheetsBackgroundTask({
+      dedupeId: `${purchase.id}:settle:${Date.now()}`,
+      shopId: uid,
+      entityType: 'purchase',
+      entityId: purchase.id,
+      action: 'SETTLE_SUPPLIER_BALANCE',
+      summary: `Settled balance for ${purchase.purchaseNumber}`,
+      targetSheets: ['Purchases', 'Suppliers', 'Daily Summary', 'Monthly Summary'],
+    });
   } catch (err) {
     if (err instanceof Error && (err.message.includes('Payment') || err.message.includes('cancelled'))) throw err;
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/purchases/${purchase.id}`);
@@ -1440,11 +3494,20 @@ export async function settlePurchaseBalance(
 export async function cancelPurchase(uid: string, purchase: Purchase, reason = 'Cancelled by owner'): Promise<void> {
   if (purchase.status === 'cancelled') return;
 
-  const itemsQuery = query(shopCol(uid, 'purchaseItems'), where('purchaseId', '==', purchase.id));
+  const itemsQuery = query(shopCol(uid, 'purchaseItems'), where('ownerUid', '==', uid));
   let items: PurchaseItem[] = [];
+  let linkedBatchIds: string[] = [];
   try {
-    const snap = await getDocs(itemsQuery);
-    items = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<PurchaseItem, 'id'>) }));
+    const [itemsSnap, batchesSnap] = await Promise.all([
+      getDocs(itemsQuery),
+      getDocs(query(shopCol(uid, 'inventoryBatches'), where('ownerUid', '==', uid))),
+    ]);
+    items = itemsSnap.docs
+      .map((d) => ({ id: d.id, ...(d.data() as Omit<PurchaseItem, 'id'>) }))
+      .filter((item) => item.purchaseId === purchase.id);
+    linkedBatchIds = batchesSnap.docs
+      .filter((d) => (d.data() as InventoryBatch).purchaseId === purchase.id)
+      .map((d) => d.id);
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, `shops/${uid}/purchaseItems`);
   }
@@ -1455,36 +3518,57 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
     await runTransaction(db, async (tx) => {
       const pRef = shopDoc(uid, 'purchases', purchase.id);
       const supRef = shopDoc(uid, 'suppliers', purchase.supplierId);
-      const pSnap = await tx.get(pRef);
-      const supSnap = await tx.get(supRef);
+      const uniqueProdIds = Array.from(new Set(items.map((item) => item.productId)));
+
+      const [pSnap, supSnap, prodSnaps, batchSnaps] = await Promise.all([
+        tx.get(pRef),
+        tx.get(supRef),
+        Promise.all(uniqueProdIds.map((pid) => tx.get(shopDoc(uid, 'products', pid)))),
+        Promise.all(linkedBatchIds.map((bId) => tx.get(shopDoc(uid, 'inventoryBatches', bId)))),
+      ]);
       if (!pSnap.exists() || pSnap.data()?.status === 'cancelled') {
         throw new Error('Purchase is already cancelled.');
       }
 
       const prodMap = new Map<string, Product>();
-      for (const item of items) {
-        if (!prodMap.has(item.productId)) {
-          const prodSnap = await tx.get(shopDoc(uid, 'products', item.productId));
-          if (prodSnap.exists()) {
-            prodMap.set(item.productId, { id: prodSnap.id, ...(prodSnap.data() as Omit<Product, 'id'>) });
+      for (let i = 0; i < uniqueProdIds.length; i += 1) {
+        const prodSnap = prodSnaps[i];
+        if (prodSnap.exists()) {
+          prodMap.set(uniqueProdIds[i], { id: prodSnap.id, ...(prodSnap.data() as Omit<Product, 'id'>) });
+        }
+      }
+
+      const batchDocs: InventoryBatch[] = [];
+      for (const bSnap of batchSnaps) {
+        if (bSnap.exists()) {
+          const bData = { id: bSnap.id, ...(bSnap.data() as Omit<InventoryBatch, 'id'>) };
+          if (bData.status !== 'cancelled') {
+            if (roundStockQty(bData.remainingBaseQty) < roundStockQty(bData.initialBaseQty)) {
+              throw new Error(
+                `Cannot cancel purchase: some units from "${bData.productName}" (${purchase.purchaseNumber}) have already been sold or adjusted.`
+              );
+            }
+            batchDocs.push(bData);
           }
         }
       }
 
       const runningStock = new Map<string, number>();
       for (const [pid, prod] of prodMap.entries()) {
-        runningStock.set(pid, prod.currentStock);
+        runningStock.set(pid, roundStockQty(prod.currentStock));
       }
 
       for (const item of items) {
+        if (item.status === 'cancelled') continue;
+        const baseQty = roundStockQty(item.baseQuantity ?? item.quantity * (item.conversionFactor || 1));
         const cur = runningStock.get(item.productId);
         if (cur !== undefined) {
-          if (cur < item.quantity) {
+          if (cur < baseQty) {
             throw new Error(
-              `Cannot cancel purchase: "${item.productName}" only has ${cur} in stock (purchased ${item.quantity}).`
+              `Cannot cancel purchase: "${item.productName}" only has ${cur} in stock (purchased ${baseQty}).`
             );
           }
-          const next = cur - item.quantity;
+          const next = roundStockQty(cur - baseQty);
           runningStock.set(item.productId, next);
 
           const movRef = doc(shopCol(uid, 'stockMovements'));
@@ -1494,15 +3578,27 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
             productName: clip(item.productName, 180),
             movementDate: todayIso,
             movementType: 'purchase_cancel',
-            quantityChange: -item.quantity,
+            quantityChange: -baseQty,
             previousStock: cur,
             newStock: next,
+            unitName: clip(item.unitName || '', 40),
+            unitQuantity: item.unitQuantity ?? item.quantity,
+            conversionFactor: item.conversionFactor ?? 1,
+            baseQuantity: baseQty,
             referenceId: purchase.id,
             notes: clip(`Reversed from cancelled purchase ${purchase.purchaseNumber}`, 500),
             createdAt: serverTimestamp(),
           });
         }
         tx.update(shopDoc(uid, 'purchaseItems', item.id), {
+          status: 'cancelled',
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      for (const batchDoc of batchDocs) {
+        tx.update(shopDoc(uid, 'inventoryBatches', batchDoc.id), {
+          remainingBaseQty: 0,
           status: 'cancelled',
           updatedAt: serverTimestamp(),
         });
@@ -1541,6 +3637,25 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
         summary: clip(`Cancelled purchase ${purchase.purchaseNumber} and reversed stock`, 400),
         createdAt: serverTimestamp(),
       });
+    });
+
+    enqueueSheetsBackgroundTask({
+      dedupeId: `${purchase.id}:cancel`,
+      shopId: uid,
+      entityType: 'purchase',
+      entityId: purchase.id,
+      action: 'CANCEL_PURCHASE',
+      summary: `Cancelled purchase ${purchase.purchaseNumber}`,
+      targetSheets: [
+        'Purchases',
+        'Purchase Details',
+        'Products',
+        'Inventory',
+        'Stock Movements',
+        'Suppliers',
+        'Daily Summary',
+        'Monthly Summary',
+      ],
     });
   } catch (err) {
     if (err instanceof Error && (err.message.includes('Cannot cancel') || err.message.includes('already cancelled'))) {
@@ -1609,6 +3724,16 @@ export async function createExpense(
       notes: expenseNotes,
     });
 
+    enqueueSheetsBackgroundTask({
+      dedupeId: ref.id,
+      shopId: uid,
+      entityType: 'expense',
+      entityId: ref.id,
+      action: 'CREATE_EXPENSE',
+      summary: clip(`Expense "${expenseTitle}"`, 180),
+      targetSheets: ['Expenses', 'Daily Summary', 'Monthly Summary'],
+    });
+
     return ref.id;
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, `shops/${uid}/expenses/${ref.id}`);
@@ -1652,6 +3777,15 @@ export async function updateExpense(
       createdAt: serverTimestamp(),
     });
     await batch.commit();
+    enqueueSheetsBackgroundTask({
+      dedupeId: `${expenseId}:update:${Date.now()}`,
+      shopId: uid,
+      entityType: 'expense',
+      entityId: expenseId,
+      action: 'UPDATE_EXPENSE',
+      summary: clip(`Updated expense "${input.title}"`, 180),
+      targetSheets: ['Expenses', 'Daily Summary', 'Monthly Summary'],
+    });
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/expenses/${expenseId}`);
   }
@@ -1672,49 +3806,137 @@ export async function deleteExpense(uid: string, expense: Expense): Promise<void
       createdAt: serverTimestamp(),
     });
     await batch.commit();
+    enqueueSheetsBackgroundTask({
+      dedupeId: `${expense.id}:delete`,
+      shopId: uid,
+      entityType: 'expense',
+      entityId: expense.id,
+      action: 'DELETE_EXPENSE',
+      summary: clip(`Deleted expense "${expense.title}"`, 180),
+      targetSheets: ['Expenses', 'Daily Summary', 'Monthly Summary'],
+    });
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `shops/${uid}/expenses/${expense.id}`);
   }
 }
 
 // ------------------------------------------------------------------
-// Stock Adjustments
+// Stock Adjustments (Multi-Unit + FIFO Batch Reconciliation)
 // ------------------------------------------------------------------
 export async function createStockAdjustment(
   uid: string,
   input: {
     productId: string;
     quantity: number;
+    unitName?: string;
+    conversionFactor?: number;
     adjustmentDate: string;
     adjustmentType: AdjustmentType;
     reason: string;
     notes: string;
+    emptyContainerDelta?: number;
   }
 ): Promise<string> {
-  if (input.quantity <= 0) throw new Error('Adjustment quantity must be greater than zero.');
+  const unitQty = roundStockQty(Number(input.quantity) || 0);
+  const conv = roundStockQty(Number(input.conversionFactor) || 1);
+  if (unitQty <= 0) throw new Error('Adjustment quantity must be greater than zero.');
+  if (conv <= 0) throw new Error('Unit conversion factor must be greater than zero.');
+
+  const baseQuantity = roundStockQty(unitQty * conv);
   const adjRef = doc(shopCol(uid, 'stockAdjustments'));
+
+  let activeBatchIds: string[] = [];
+  if (input.adjustmentType !== 'add') {
+    try {
+      const snap = await getDocs(
+        query(shopCol(uid, 'inventoryBatches'), where('ownerUid', '==', uid))
+      );
+      activeBatchIds = snap.docs
+        .filter((d) => {
+          const b = d.data() as InventoryBatch;
+          return (
+            b.productId === input.productId &&
+            b.status === 'active' &&
+            Number(b.remainingBaseQty) > 0
+          );
+        })
+        .map((d) => d.id);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, `shops/${uid}/inventoryBatches`);
+    }
+  }
 
   try {
     await runTransaction(db, async (tx) => {
       const pRef = shopDoc(uid, 'products', input.productId);
-      const pSnap = await tx.get(pRef);
+      const [pSnap, batchSnaps] = await Promise.all([
+        tx.get(pRef),
+        Promise.all(activeBatchIds.map((bId) => tx.get(shopDoc(uid, 'inventoryBatches', bId)))),
+      ]);
       if (!pSnap.exists()) throw new Error('Product not found.');
       const product = { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) };
 
-      const delta = input.adjustmentType === 'add' ? input.quantity : -input.quantity;
-      const previousStock = product.currentStock;
-      const newStock = previousStock + delta;
+      const batchDocs: InventoryBatch[] = [];
+      for (const bSnap of batchSnaps) {
+        if (bSnap.exists()) {
+          batchDocs.push({ id: bSnap.id, ...(bSnap.data() as Omit<InventoryBatch, 'id'>) });
+        }
+      }
+
+      const baseUnit = getEffectiveBaseUnit(product);
+      const unitLabel = clip(input.unitName || baseUnit, 40) || baseUnit;
+      const delta = input.adjustmentType === 'add' ? baseQuantity : -baseQuantity;
+      const previousStock = roundStockQty(product.currentStock);
+      const newStock = roundStockQty(previousStock + delta);
 
       if (newStock < 0) {
         throw new Error(
-          `Cannot deduct ${input.quantity} ${product.unit} from "${product.name}" (current stock: ${previousStock}).`
+          `Cannot deduct ${unitQty} ${unitLabel} (${baseQuantity} ${baseUnit}) from "${product.name}" (current stock: ${previousStock} ${baseUnit}).`
         );
       }
 
-      tx.update(pRef, {
+      const productPatch: Record<string, unknown> = {
         currentStock: newStock,
         updatedAt: serverTimestamp(),
-      });
+      };
+      if (typeof input.emptyContainerDelta === 'number' && input.emptyContainerDelta !== 0) {
+        const prevEmpty = roundStockQty(Math.max(0, Number(product.emptyContainersOnHand) || 0));
+        productPatch.emptyContainersOnHand = roundStockQty(
+          Math.max(0, prevEmpty + input.emptyContainerDelta)
+        );
+      }
+
+      tx.update(pRef, productPatch);
+
+      if (input.adjustmentType === 'add') {
+        const batchRef = doc(shopCol(uid, 'inventoryBatches'));
+        tx.set(batchRef, {
+          ownerUid: uid,
+          productId: product.id,
+          productName: clip(product.name, 180),
+          purchaseId: 'adj_add',
+          purchaseNumber: 'ADJ-ADD',
+          purchaseDate: input.adjustmentDate,
+          supplierId: clip(product.supplierId, 128),
+          supplierName: clip(product.supplierName || 'Stock Adjustment', 150),
+          initialBaseQty: baseQuantity,
+          remainingBaseQty: baseQuantity,
+          unitCostInBase: Math.max(0, roundMoney(product.purchasePrice)),
+          expiryDate: clip(product.expiryDate, 20),
+          status: 'active',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        const fifo = allocateFifoFromBatches(batchDocs, baseQuantity, product.purchasePrice);
+        for (const mut of fifo.updatedBatches) {
+          tx.update(shopDoc(uid, 'inventoryBatches', mut.batchId), {
+            remainingBaseQty: mut.nextRemainingBaseQty,
+            status: mut.nextStatus,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
 
       tx.set(adjRef, {
         ownerUid: uid,
@@ -1722,7 +3944,11 @@ export async function createStockAdjustment(
         productName: clip(product.name, 180),
         adjustmentDate: input.adjustmentDate,
         adjustmentType: input.adjustmentType,
-        quantity: input.quantity,
+        quantity: unitQty,
+        unitName: unitLabel,
+        unitQuantity: unitQty,
+        conversionFactor: conv,
+        baseQuantity,
         reason: clip(input.reason, 200),
         notes: clip(input.notes, 500),
         previousStock,
@@ -1740,8 +3966,12 @@ export async function createStockAdjustment(
         quantityChange: delta,
         previousStock,
         newStock,
+        unitName: unitLabel,
+        unitQuantity: unitQty,
+        conversionFactor: conv,
+        baseQuantity,
         referenceId: adjRef.id,
-        notes: clip(`${input.adjustmentType.toUpperCase()}: ${input.reason}`, 500),
+        notes: clip(`${input.adjustmentType.toUpperCase()} (${unitQty} ${unitLabel}): ${input.reason}`, 500),
         createdAt: serverTimestamp(),
       });
 
@@ -1752,11 +3982,27 @@ export async function createStockAdjustment(
         entityType: 'stockAdjustment',
         entityId: adjRef.id,
         summary: clip(
-          `${input.adjustmentType.toUpperCase()} ${input.quantity} ${product.unit} on ${product.name} (${previousStock} -> ${newStock})`,
+          `${input.adjustmentType.toUpperCase()} ${unitQty} ${unitLabel} (${baseQuantity} ${baseUnit}) on ${product.name} (${previousStock} -> ${newStock})`,
           400
         ),
         createdAt: serverTimestamp(),
       });
+    });
+
+    enqueueSheetsBackgroundTask({
+      dedupeId: adjRef.id,
+      shopId: uid,
+      entityType: 'stock_adjustment',
+      entityId: adjRef.id,
+      action: 'STOCK_ADJUSTMENT',
+      summary: clip(`Stock adjustment (${input.adjustmentType})`, 180),
+      targetSheets: [
+        'Stock Adjustments',
+        'Stock Movements',
+        'Products',
+        'Inventory',
+        'Daily Summary',
+      ],
     });
 
     return adjRef.id;

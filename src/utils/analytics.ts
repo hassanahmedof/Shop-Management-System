@@ -16,6 +16,7 @@ import {
   getProductStockStatus,
   roundMoney,
 } from '../utils/formatters';
+import { getEffectiveBaseUnit, roundStockQty } from './packaging';
 
 export interface DashboardSummary {
   todaySales: number;
@@ -586,6 +587,11 @@ export function computeProductPerformance(
   const prevToDate = addDaysToIso(fromDate, -1);
   const prevFromDate = addDaysToIso(prevToDate, -(spanDays - 1));
 
+  const productMap = new Map<string, Product>();
+  for (const p of products) {
+    productMap.set(p.id, p);
+  }
+
   const filteredProducts = products.filter((p) => {
     if (filters.productId && p.id !== filters.productId) return false;
     if (filters.categoryId && p.categoryId !== filters.categoryId) return false;
@@ -611,7 +617,7 @@ export function computeProductPerformance(
       brandId: p.brandId,
       brandName: p.brandName,
       currentStock: p.currentStock,
-      unit: p.unit,
+      unit: getEffectiveBaseUnit(p),
       quantitySold: 0,
       revenue: 0,
       cost: 0,
@@ -624,9 +630,11 @@ export function computeProductPerformance(
   }
 
   for (const item of activeItems) {
+    const currentProduct = productMap.get(item.productId);
+    const effectiveCategoryId = currentProduct?.categoryId ?? item.categoryId;
     if (filters.productId && item.productId !== filters.productId) continue;
-    if (filters.categoryId && item.categoryId !== filters.categoryId) continue;
-    if (filters.brandId && item.brandId !== filters.brandId) continue;
+    if (filters.categoryId && effectiveCategoryId !== filters.categoryId) continue;
+    if (filters.brandId && (currentProduct?.brandId ?? item.brandId) !== filters.brandId) continue;
     if (supplierProductIds && !supplierProductIds.has(item.productId)) continue;
 
     let row = aggMap.get(item.productId);
@@ -652,14 +660,17 @@ export function computeProductPerformance(
       aggMap.set(item.productId, row);
     }
 
+    const baseQty = roundStockQty(
+      item.baseQuantity ?? item.quantity * (item.conversionFactor || 1)
+    );
     if (item.saleDate >= fromDate && item.saleDate <= toDate) {
-      row.quantitySold += item.quantity;
+      row.quantitySold = roundStockQty(row.quantitySold + baseQty);
       row.revenue = roundMoney(row.revenue + item.lineTotal);
       row.cost = roundMoney(row.cost + item.lineCost);
       row.grossProfit = roundMoney(row.revenue - row.cost);
       row.profitMarginPct = row.revenue > 0 ? Math.round((row.grossProfit / row.revenue) * 10000) / 100 : 0;
     } else if (item.saleDate >= prevFromDate && item.saleDate <= prevToDate) {
-      row.previousPeriodQty += item.quantity;
+      row.previousPeriodQty = roundStockQty(row.previousPeriodQty + baseQty);
     }
   }
 

@@ -13,6 +13,7 @@ import {
 } from 'firebase/firestore';
 import { auth, db, getStaffProvisionAuth, handleFirestoreError, OperationType } from '../lib/firebase';
 import type {
+  InventoryBatch,
   PaymentMethod,
   Product,
   StaffCatalogItem,
@@ -22,8 +23,17 @@ import type {
   StaffSale,
   StaffSaleLine,
 } from '../types/shop';
-import { formatDateTimeKarachi, roundMoney } from '../utils/formatters';
+import { formatDateTimeKarachi, normalizeCustomerWhatsapp, roundMoney } from '../utils/formatters';
+import {
+  allocateFifoFromBatches,
+  getAllowedSaleUnits,
+  getEffectiveBaseUnit,
+  roundStockQty,
+  toStaffPackagingUnits,
+} from '../utils/packaging';
+import { enqueueSheetsBackgroundTask } from './backgroundTaskQueue';
 import { notifyDiscordTransaction } from './discordNotificationService';
+import { recordPerfMetric, startPerfTimer } from '../utils/perfMonitor';
 
 function clip(val: string | undefined | null, maxLen: number): string {
   return (val || '').trim().slice(0, maxLen);
@@ -137,14 +147,35 @@ export async function syncStaffCatalogDocuments(
   for (const p of products) {
     const cur = existingMap.get(p.id);
     const curKey = cur ? [...(cur.allowedStaffUids || [])].sort().join(',') : '';
+    const baseUnit = clip(getEffectiveBaseUnit(p), 40);
+    const staffPkgs = toStaffPackagingUnits(p.packagingUnits, baseUnit);
+    const curPkgsJson = JSON.stringify(cur?.packagingUnits || []);
+    const nextPkgsJson = JSON.stringify(staffPkgs);
+    const wholesalePrice = Math.max(0, roundMoney(p.wholesalePrice || 0));
+    const originType = p.originType || '';
+    const bottleSize = clip(p.bottleSize, 40);
+    const storageLocation = clip(p.storageLocation, 80);
+    const isReturnable = Boolean(p.isReturnable);
+    const returnableUnitName = clip(p.returnableUnitName, 40);
+    const depositPerReturnable = Math.max(0, roundMoney(p.depositPerReturnable || 0));
+
     const needsUpdate =
       !cur ||
       cur.name !== clip(p.name, 180) ||
       cur.categoryName !== clip(p.categoryName, 100) ||
       cur.brandName !== clip(p.brandName, 100) ||
       cur.salePrice !== Math.max(0, roundMoney(p.salePrice)) ||
-      cur.currentStock !== Math.max(0, p.currentStock) ||
-      cur.unit !== clip(p.unit || 'Pack', 40) ||
+      (cur.wholesalePrice ?? 0) !== wholesalePrice ||
+      cur.currentStock !== Math.max(0, roundStockQty(p.currentStock)) ||
+      cur.unit !== baseUnit ||
+      (cur.baseUnit || cur.unit) !== baseUnit ||
+      curPkgsJson !== nextPkgsJson ||
+      (cur.originType || '') !== originType ||
+      (cur.bottleSize || '') !== bottleSize ||
+      (cur.storageLocation || '') !== storageLocation ||
+      Boolean(cur.isReturnable) !== isReturnable ||
+      (cur.returnableUnitName || '') !== returnableUnitName ||
+      (cur.depositPerReturnable ?? 0) !== depositPerReturnable ||
       cur.isActive !== Boolean(p.isActive) ||
       curKey !== allowedKey;
 
@@ -157,8 +188,17 @@ export async function syncStaffCatalogDocuments(
           categoryName: clip(p.categoryName, 100),
           brandName: clip(p.brandName, 100),
           salePrice: Math.max(0, roundMoney(p.salePrice)),
-          currentStock: Math.max(0, p.currentStock),
-          unit: clip(p.unit || 'Pack', 40),
+          wholesalePrice,
+          currentStock: Math.max(0, roundStockQty(p.currentStock)),
+          unit: baseUnit,
+          baseUnit,
+          packagingUnits: staffPkgs,
+          originType,
+          bottleSize,
+          storageLocation,
+          isReturnable,
+          returnableUnitName,
+          depositPerReturnable,
           isActive: Boolean(p.isActive),
           allowedStaffUids,
           updatedAt: serverTimestamp(),
@@ -619,8 +659,14 @@ export async function createStaffSale(
   input: {
     saleDate: string;
     paymentMethod: PaymentMethod;
+    customerWhatsapp?: string;
     notes: string;
-    items: Array<{ productId: string; quantity: number }>;
+    items: Array<{
+      productId: string;
+      quantity: number;
+      unitName?: string;
+      conversionFactor?: number;
+    }>;
     saleNumber?: string;
     saleDateTime?: string;
     clientRequestId?: string;
@@ -633,40 +679,110 @@ export async function createStaffSale(
     throw new Error('Add at least one product to record a sale.');
   }
 
-  await authorizeApiRequest('/api/staff/sales/authorize', 'POST');
+  const merged = new Map<
+    string,
+    {
+      productId: string;
+      unitName: string;
+      conversionFactor: number;
+      unitQuantity: number;
+    }
+  >();
 
-  const merged = new Map<string, number>();
   for (const row of input.items) {
     if (!row.productId) throw new Error('Select a product for every row.');
-    if (!Number.isFinite(row.quantity) || row.quantity <= 0) {
+    const qty = roundStockQty(Number(row.quantity) || 0);
+    if (!Number.isFinite(qty) || qty <= 0) {
       throw new Error('Quantity must be greater than zero.');
     }
-    merged.set(row.productId, (merged.get(row.productId) || 0) + Math.floor(row.quantity));
+    const unitKey = (row.unitName || '').trim();
+    const conv = roundStockQty(Number(row.conversionFactor) || 1) || 1;
+    const key = `${row.productId}::${unitKey}`;
+    const prev = merged.get(key);
+    if (prev) {
+      prev.unitQuantity = roundStockQty(prev.unitQuantity + qty);
+    } else {
+      merged.set(key, {
+        productId: row.productId,
+        unitName: unitKey,
+        conversionFactor: conv,
+        unitQuantity: qty,
+      });
+    }
   }
 
+  const distinctProductIds = Array.from(new Set(Array.from(merged.values()).map((m) => m.productId)));
   const saleRef = doc(collection(db, 'shops', shopId, 'staffSales'));
   const saleNumber = input.saleNumber?.trim() || generateStaffSaleNumber();
   const saleDateTime = input.saleDateTime?.trim() || formatDateTimeKarachi(new Date());
+
+  const stopTx = startPerfTimer();
 
   try {
     let discordPayload: Parameters<typeof notifyDiscordTransaction>[1] | null = null;
 
     await runTransaction(db, async (tx) => {
-      const catalogEntries: Array<{ item: StaffCatalogItem; qty: number }> = [];
-
-      for (const [productId, qty] of merged.entries()) {
-        const cRef = doc(db, 'shops', shopId, 'staffCatalog', productId);
-        const cSnap = await tx.get(cRef);
+      const catalogSnaps = await Promise.all(
+        distinctProductIds.map((productId) => tx.get(doc(db, 'shops', shopId, 'staffCatalog', productId)))
+      );
+      const catalogMap = new Map<string, StaffCatalogItem>();
+      for (let i = 0; i < distinctProductIds.length; i += 1) {
+        const productId = distinctProductIds[i];
+        const cSnap = catalogSnaps[i];
         if (!cSnap.exists()) {
           throw new Error('Selected product is not available in the catalog.');
         }
-        const catalogItem = { id: cSnap.id, ...(cSnap.data() as Omit<StaffCatalogItem, 'id'>) };
-        if (catalogItem.currentStock < qty) {
+        catalogMap.set(productId, { id: cSnap.id, ...(cSnap.data() as Omit<StaffCatalogItem, 'id'>) });
+      }
+
+      const resolvedEntries: Array<{
+        item: StaffCatalogItem;
+        unitName: string;
+        unitQuantity: number;
+        conversionFactor: number;
+        baseQuantity: number;
+        salePricePerUnit: number;
+      }> = [];
+
+      const totalBaseByProduct = new Map<string, number>();
+
+      for (const row of merged.values()) {
+        const catalogItem = catalogMap.get(row.productId)!;
+        const allowedUnits = getAllowedSaleUnits(catalogItem);
+        const matchedUnit =
+          (row.unitName
+            ? allowedUnits.find((u) => u.unitName.toLowerCase() === row.unitName.toLowerCase())
+            : undefined) || allowedUnits[0];
+
+        if (!matchedUnit) {
+          throw new Error(`Invalid unit selected for "${catalogItem.name}".`);
+        }
+
+        const conv = roundStockQty(matchedUnit.conversionQty || row.conversionFactor || 1);
+        const baseQty = roundStockQty(row.unitQuantity * conv);
+        totalBaseByProduct.set(
+          catalogItem.productId,
+          roundStockQty((totalBaseByProduct.get(catalogItem.productId) || 0) + baseQty)
+        );
+
+        resolvedEntries.push({
+          item: catalogItem,
+          unitName: matchedUnit.unitName,
+          unitQuantity: row.unitQuantity,
+          conversionFactor: conv,
+          baseQuantity: baseQty,
+          salePricePerUnit: roundMoney(matchedUnit.salePrice),
+        });
+      }
+
+      for (const [pid, neededBase] of totalBaseByProduct.entries()) {
+        const catalogItem = catalogMap.get(pid)!;
+        const baseUnit = getEffectiveBaseUnit(catalogItem);
+        if (catalogItem.currentStock < neededBase) {
           throw new Error(
-            `Insufficient stock for "${catalogItem.name}". Available: ${catalogItem.currentStock} ${catalogItem.unit}, Requested: ${qty}.`
+            `Insufficient stock for "${catalogItem.name}". Available: ${catalogItem.currentStock} ${baseUnit}, Requested: ${neededBase} ${baseUnit}.`
           );
         }
-        catalogEntries.push({ item: catalogItem, qty });
       }
 
       let totalAmount = 0;
@@ -680,30 +796,45 @@ export async function createStaffSale(
         unit: string;
       }> = [];
 
-      for (const entry of catalogEntries) {
-        const lineTotal = roundMoney(entry.qty * entry.item.salePrice);
+      for (const entry of resolvedEntries) {
+        const baseUnit = getEffectiveBaseUnit(entry.item);
+        const lineTotal = roundMoney(entry.unitQuantity * entry.salePricePerUnit);
         totalAmount = roundMoney(totalAmount + lineTotal);
-        totalQuantity += entry.qty;
+        totalQuantity = roundStockQty(totalQuantity + entry.baseQuantity);
+
         lines.push({
           productId: entry.item.productId,
           productName: clip(entry.item.name, 180),
-          quantity: entry.qty,
-          salePricePerUnit: entry.item.salePrice,
+          quantity: entry.unitQuantity,
+          unitName: clip(entry.unitName, 40),
+          unitQuantity: entry.unitQuantity,
+          conversionFactor: entry.conversionFactor,
+          baseQuantity: entry.baseQuantity,
+          salePricePerUnit: entry.salePricePerUnit,
           lineTotal,
-        });
-        discordItems.push({
-          productName: clip(entry.item.name, 180),
-          quantity: entry.qty,
-          unitPrice: entry.item.salePrice,
-          lineTotal,
-          unit: clip(entry.item.unit || '', 40),
         });
 
-        tx.update(doc(db, 'shops', shopId, 'staffCatalog', entry.item.productId), {
-          currentStock: entry.item.currentStock - entry.qty,
+        discordItems.push({
+          productName: clip(entry.item.name, 180),
+          quantity: entry.unitQuantity,
+          unitPrice: entry.salePricePerUnit,
+          lineTotal,
+          unit:
+            entry.conversionFactor > 1
+              ? clip(`${entry.unitName} (${entry.conversionFactor} ${baseUnit})`, 40)
+              : clip(entry.unitName, 40),
+        });
+      }
+
+      for (const [pid, consumedBase] of totalBaseByProduct.entries()) {
+        const catalogItem = catalogMap.get(pid)!;
+        tx.update(doc(db, 'shops', shopId, 'staffCatalog', pid), {
+          currentStock: roundStockQty(Math.max(0, catalogItem.currentStock - consumedBase)),
           updatedAt: serverTimestamp(),
         });
       }
+
+      const cleanWhatsapp = normalizeCustomerWhatsapp(input.customerWhatsapp);
 
       tx.set(saleRef, {
         ownerUid: shopId,
@@ -720,6 +851,7 @@ export async function createStaffSale(
         staffAuthUid: staff.authUid,
         staffName: clip(staff.name, 120),
         staffUsername: clip(staff.username, 40),
+        ...(cleanWhatsapp ? { customerWhatsapp: clip(cleanWhatsapp, 32) } : {}),
         notes: clip(input.notes, 500),
         status: 'completed',
         syncedToLedger: false,
@@ -729,7 +861,7 @@ export async function createStaffSale(
 
       discordPayload = {
         type: 'sale',
-        dedupeId: input.clientRequestId?.trim() || saleRef.id,
+        dedupeId: saleRef.id,
         saleId: saleNumber,
         saleDate: input.saleDate,
         saleDateTime,
@@ -745,12 +877,17 @@ export async function createStaffSale(
       void notifyDiscordTransaction(shopId, discordPayload);
     }
 
+    recordPerfMetric('firebase_tx', 'create_staff_sale', stopTx(), {
+      items: merged.size,
+    });
+
     return saleRef.id;
   } catch (err) {
     if (
       err instanceof Error &&
       (err.message.includes('Insufficient stock') ||
         err.message.includes('Selected product') ||
+        err.message.includes('Invalid unit') ||
         err.message.includes('permission'))
     ) {
       throw err;
@@ -765,30 +902,78 @@ export async function reconcileStaffSaleToOwnerLedger(
 ): Promise<void> {
   if (staffSale.syncedToLedger) return;
 
+  const involvedProductIds = new Set(staffSale.items.map((i) => i.productId));
+  let candidateBatchIds: string[] = [];
+  try {
+    const batchSnap = await getDocs(
+      query(collection(db, 'shops', ownerUid, 'inventoryBatches'), where('ownerUid', '==', ownerUid))
+    );
+    candidateBatchIds = batchSnap.docs
+      .filter((d) => {
+        const data = d.data() as InventoryBatch;
+        return (
+          involvedProductIds.has(data.productId) &&
+          data.status === 'active' &&
+          Number(data.remainingBaseQty) > 0
+        );
+      })
+      .map((d) => d.id);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, `shops/${ownerUid}/inventoryBatches`);
+  }
+
+  let reconciledDiscordPayload: Parameters<typeof notifyDiscordTransaction>[1] | null = null;
+
   try {
     await runTransaction(db, async (tx) => {
       const ssRef = doc(db, 'shops', ownerUid, 'staffSales', staffSale.id);
-      const ssSnap = await tx.get(ssRef);
+      const saleRef = doc(db, 'shops', ownerUid, 'sales', staffSale.id);
+      const uniqueProdIds = Array.from(involvedProductIds);
+
+      const [ssSnap, saleSnap, prodSnaps, batchSnaps] = await Promise.all([
+        tx.get(ssRef),
+        tx.get(saleRef),
+        Promise.all(uniqueProdIds.map((pid) => tx.get(doc(db, 'shops', ownerUid, 'products', pid)))),
+        Promise.all(candidateBatchIds.map((bId) => tx.get(doc(db, 'shops', ownerUid, 'inventoryBatches', bId)))),
+      ]);
+
       if (!ssSnap.exists()) return;
       const currentSS = ssSnap.data() as StaffSale;
       if (currentSS.syncedToLedger) return;
 
-      const saleRef = doc(db, 'shops', ownerUid, 'sales', staffSale.id);
-      const saleSnap = await tx.get(saleRef);
       if (saleSnap.exists()) {
         tx.update(ssRef, { syncedToLedger: true, updatedAt: serverTimestamp() });
         return;
       }
 
       const prodMap = new Map<string, Product>();
-      for (const line of currentSS.items) {
-        if (!prodMap.has(line.productId)) {
-          const pSnap = await tx.get(doc(db, 'shops', ownerUid, 'products', line.productId));
-          if (pSnap.exists()) {
-            prodMap.set(line.productId, { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) });
-          }
+      for (let i = 0; i < uniqueProdIds.length; i += 1) {
+        const pSnap = prodSnaps[i];
+        if (pSnap.exists()) {
+          prodMap.set(uniqueProdIds[i], { id: pSnap.id, ...(pSnap.data() as Omit<Product, 'id'>) });
         }
       }
+
+      const batchesByProduct = new Map<string, InventoryBatch[]>();
+      for (const bSnap of batchSnaps) {
+        if (!bSnap.exists()) continue;
+        const bData = { id: bSnap.id, ...(bSnap.data() as Omit<InventoryBatch, 'id'>) };
+        if (bData.status === 'active' && roundStockQty(bData.remainingBaseQty) > 0) {
+          const arr = batchesByProduct.get(bData.productId) || [];
+          arr.push(bData);
+          batchesByProduct.set(bData.productId, arr);
+        }
+      }
+
+      const runningStock = new Map<string, number>();
+      for (const [pid, prod] of prodMap.entries()) {
+        runningStock.set(pid, roundStockQty(prod.currentStock));
+      }
+
+      const batchMutations = new Map<
+        string,
+        { remainingBaseQty: number; status: 'active' | 'exhausted' }
+      >();
 
       let totalAmount = 0;
       let totalCost = 0;
@@ -796,24 +981,37 @@ export async function reconcileStaffSaleToOwnerLedger(
 
       for (const line of currentSS.items) {
         const prod = prodMap.get(line.productId);
-        const purchasePriceAtSale = roundMoney(prod?.purchasePrice ?? 0);
-        const lineTotal = roundMoney(line.quantity * line.salePricePerUnit);
-        const lineCost = roundMoney(line.quantity * purchasePriceAtSale);
+        const baseUnit = prod ? getEffectiveBaseUnit(prod) : line.unitName || 'Piece';
+        const unitName = clip(line.unitName || baseUnit, 40);
+        const unitQty = roundStockQty(line.unitQuantity ?? line.quantity);
+        const conv = roundStockQty(line.conversionFactor ?? 1) || 1;
+        const baseQty = roundStockQty(line.baseQuantity ?? unitQty * conv);
+
+        const productBatches = batchesByProduct.get(line.productId) || [];
+        const fifo = allocateFifoFromBatches(
+          productBatches,
+          baseQty,
+          prod?.purchasePrice ?? 0
+        );
+        for (const mut of fifo.updatedBatches) {
+          batchMutations.set(mut.batchId, {
+            remainingBaseQty: mut.nextRemainingBaseQty,
+            status: mut.nextStatus,
+          });
+        }
+
+        const lineTotal = roundMoney(unitQty * line.salePricePerUnit);
+        const lineCost = fifo.totalCost;
         const lineProfit = roundMoney(lineTotal - lineCost);
 
         totalAmount = roundMoney(totalAmount + lineTotal);
         totalCost = roundMoney(totalCost + lineCost);
-        totalQuantity += line.quantity;
+        totalQuantity = roundStockQty(totalQuantity + baseQty);
 
         if (prod) {
-          const prevStock = prod.currentStock;
-          const nextStock = Math.max(0, prevStock - line.quantity);
-          prod.currentStock = nextStock;
-
-          tx.update(doc(db, 'shops', ownerUid, 'products', line.productId), {
-            currentStock: nextStock,
-            updatedAt: serverTimestamp(),
-          });
+          const prevStock = runningStock.get(line.productId) ?? prod.currentStock;
+          const nextStock = roundStockQty(Math.max(0, prevStock - baseQty));
+          runningStock.set(line.productId, nextStock);
 
           tx.set(doc(collection(db, 'shops', ownerUid, 'stockMovements')), {
             ownerUid,
@@ -821,11 +1019,18 @@ export async function reconcileStaffSaleToOwnerLedger(
             productName: clip(line.productName, 180),
             movementDate: currentSS.saleDate,
             movementType: 'sale',
-            quantityChange: -line.quantity,
+            quantityChange: -baseQty,
             previousStock: prevStock,
             newStock: nextStock,
+            unitName,
+            unitQuantity: unitQty,
+            conversionFactor: conv,
+            baseQuantity: baseQty,
             referenceId: staffSale.id,
-            notes: clip(`Staff sale ${currentSS.saleNumber} by ${currentSS.staffName}`, 500),
+            notes: clip(
+              `Staff sale ${currentSS.saleNumber} (${unitQty} ${unitName}) by ${currentSS.staffName}`,
+              500
+            ),
             createdAt: serverTimestamp(),
           });
         }
@@ -840,12 +1045,17 @@ export async function reconcileStaffSaleToOwnerLedger(
           categoryName: clip(prod?.categoryName || 'Uncategorized', 100),
           brandId: clip(prod?.brandId || '', 128),
           brandName: clip(prod?.brandName || '', 100),
-          quantity: line.quantity,
+          quantity: unitQty,
+          unitName,
+          unitQuantity: unitQty,
+          conversionFactor: conv,
+          baseQuantity: baseQty,
           salePricePerUnit: line.salePricePerUnit,
-          purchasePriceAtSale,
+          purchasePriceAtSale: fifo.weightedBaseUnitCost,
           lineTotal,
           lineCost,
           lineProfit,
+          batchAllocations: fifo.allocations.slice(0, 50),
           staffId: currentSS.staffId,
           staffName: clip(currentSS.staffName, 120),
           status: currentSS.status,
@@ -854,7 +1064,23 @@ export async function reconcileStaffSaleToOwnerLedger(
         });
       }
 
+      for (const [pid, nextStock] of runningStock.entries()) {
+        tx.update(doc(db, 'shops', ownerUid, 'products', pid), {
+          currentStock: nextStock,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      for (const [batchId, mut] of batchMutations.entries()) {
+        tx.update(doc(db, 'shops', ownerUid, 'inventoryBatches', batchId), {
+          remainingBaseQty: mut.remainingBaseQty,
+          status: mut.status,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
       const totalProfit = roundMoney(totalAmount - totalCost);
+      const cleanWhatsapp = normalizeCustomerWhatsapp(currentSS.customerWhatsapp);
 
       tx.set(saleRef, {
         ownerUid,
@@ -870,6 +1096,7 @@ export async function reconcileStaffSaleToOwnerLedger(
         staffId: currentSS.staffId,
         staffName: clip(currentSS.staffName, 120),
         recordedByRole: 'staff',
+        ...(cleanWhatsapp ? { customerWhatsapp: clip(cleanWhatsapp, 32) } : {}),
         notes: clip(currentSS.notes, 500),
         status: currentSS.status,
         createdAt: serverTimestamp(),
@@ -887,11 +1114,72 @@ export async function reconcileStaffSaleToOwnerLedger(
         entityType: 'sale',
         entityId: staffSale.id,
         summary: clip(
-          `Synced staff sale ${currentSS.saleNumber} by ${currentSS.staffName} (PKR ${totalAmount})`,
+          `Synced staff sale ${currentSS.saleNumber} by ${currentSS.staffName} (PKR ${totalAmount} · Profit PKR ${totalProfit})`,
           400
         ),
         createdAt: serverTimestamp(),
       });
+
+      const createdAtTs = currentSS.createdAt as { toMillis?: () => number; seconds?: number } | undefined;
+      const createdAtMs =
+        typeof createdAtTs?.toMillis === 'function'
+          ? createdAtTs.toMillis()
+          : typeof createdAtTs?.seconds === 'number'
+          ? createdAtTs.seconds * 1000
+          : 0;
+      const isRecentSale = createdAtMs === 0 || Date.now() - createdAtMs <= 30 * 60 * 1000;
+
+      if (isRecentSale) {
+        reconciledDiscordPayload = {
+          type: 'sale',
+          dedupeId: staffSale.id,
+          saleId: currentSS.saleNumber,
+          saleDate: currentSS.saleDate,
+          saleDateTime: currentSS.saleDateTime,
+          staffName: clip(currentSS.staffName, 120),
+          paymentMethod: currentSS.paymentMethod,
+          items: currentSS.items.map((line) => {
+            const unitQty = roundStockQty(line.unitQuantity ?? line.quantity);
+            const conv = roundStockQty(line.conversionFactor ?? 1) || 1;
+            const unitLabel = clip(line.unitName || 'Piece', 40);
+            const prod = prodMap.get(line.productId);
+            const baseUnit = prod ? getEffectiveBaseUnit(prod) : unitLabel;
+            return {
+              productName: clip(line.productName, 180),
+              quantity: unitQty,
+              unitPrice: line.salePricePerUnit,
+              lineTotal: roundMoney(unitQty * line.salePricePerUnit),
+              unit: conv > 1 ? clip(`${unitLabel} (${conv} ${baseUnit})`, 40) : unitLabel,
+            };
+          }),
+          totalAmount,
+          totalProfit,
+          notes: clip(currentSS.notes, 500),
+        };
+      }
+    });
+
+    if (reconciledDiscordPayload) {
+      void notifyDiscordTransaction(ownerUid, reconciledDiscordPayload);
+    }
+
+    enqueueSheetsBackgroundTask({
+      dedupeId: staffSale.id,
+      shopId: ownerUid,
+      entityType: 'staff_sale',
+      entityId: staffSale.id,
+      action: 'SYNC_STAFF_SALE',
+      summary: `Staff sale ${staffSale.saleNumber} by ${staffSale.staffName}`,
+      targetSheets: [
+        'Sales',
+        'Sales Details',
+        'Products',
+        'Inventory',
+        'Stock Movements',
+        'Daily Summary',
+        'Monthly Summary',
+        'Staff Performance',
+      ],
     });
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, `shops/${ownerUid}/staffSales/${staffSale.id}`);

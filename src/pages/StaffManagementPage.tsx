@@ -49,6 +49,13 @@ import {
   getMonthKey,
   roundMoney,
 } from '../utils/formatters';
+import {
+  ALL_STAFF_FILTER_ID,
+  buildSellerFilterOptions,
+  formatSaleSellerLabel,
+  getSaleSellerKey,
+  matchesSellerFilter,
+} from '../utils/sellerAttribution';
 
 type PerformancePeriod = 'daily' | 'weekly' | 'monthly' | 'all';
 
@@ -56,10 +63,15 @@ type ResetPasswordTarget =
   | { kind: 'staff'; member: StaffMember }
   | { kind: 'admin'; member: AdminMember };
 
+function formatSaleItemLabel(i: SaleItem): string {
+  const unitQty = i.unitQuantity ?? i.quantity;
+  return i.unitName ? `${i.productName} (${unitQty} ${i.unitName})` : `${i.productName} ×${i.quantity}`;
+}
+
 export function StaffManagementPage() {
   const { user, shopId } = useAuth();
   const activeShopId = shopId || user?.uid || '';
-  const { staffMembers, adminMembers, products, staffCatalog, sales, saleItems } = useShopData();
+  const { staffMembers, adminMembers, products, staffCatalog, sales, saleItems, settings } = useShopData();
   const { showToast } = useToast();
 
   const todayIso = getKarachiDateIso();
@@ -109,7 +121,7 @@ export function StaffManagementPage() {
 
   // Performance Period & History Filters
   const [perfPeriod, setPerfPeriod] = useState<PerformancePeriod>('monthly');
-  const [historyStaffId, setHistoryStaffId] = useState<string>('all_staff');
+  const [historyStaffId, setHistoryStaffId] = useState<string>(ALL_STAFF_FILTER_ID);
   const [historyPayment, setHistoryPayment] = useState<'' | PaymentMethod>('');
   const [historyFrom, setHistoryFrom] = useState('');
   const [historyTo, setHistoryTo] = useState('');
@@ -118,23 +130,26 @@ export function StaffManagementPage() {
   const historyStaffOptions = useMemo<SearchableSelectOption[]>(
     () => [
       {
-        value: 'all_staff',
+        value: ALL_STAFF_FILTER_ID,
         label: 'All Sales Staff',
         subtitle: 'Only staff-recorded sales',
       },
       {
         value: 'all',
-        label: 'All (Staff + Owner)',
-        subtitle: 'Include owner-recorded sales',
+        label: 'All (Admins + Staff)',
+        subtitle: 'Include all Admin and Staff sales',
       },
-      ...staffMembers.map((m) => ({
-        value: m.id,
-        label: m.name,
-        subtitle: `@${m.username}${m.phone ? ` · ${m.phone}` : ''}`,
-        keywords: [m.name, m.username, m.phone].filter(Boolean),
-      })),
+      ...buildSellerFilterOptions({
+        sales,
+        staffMembers,
+        adminMembers,
+        settings,
+        user,
+        shopId: activeShopId,
+        includeAllOwnersOption: true,
+      }),
     ],
-    [staffMembers]
+    [sales, staffMembers, adminMembers, settings, user, activeShopId]
   );
 
   const historyPaymentOptions = useMemo<SearchableSelectOption[]>(
@@ -146,7 +161,7 @@ export function StaffManagementPage() {
   );
 
   const frequentHistoryStaffIds = useMemo(
-    () => computeTopActivityValues(sales, (s) => s.staffId, 5),
+    () => computeTopActivityValues(sales, (s) => getSaleSellerKey(s), 5),
     [sales]
   );
 
@@ -263,22 +278,18 @@ export function StaffManagementPage() {
     }));
   }, [sortedPerformance]);
 
-  // Employee sales history filter
+  // Employee & Admin sales history filter
   const filteredStaffSalesHistory = useMemo(() => {
     const q = historySearch.trim().toLowerCase();
     return sales.filter((s) => {
-      if (historyStaffId === 'all_staff') {
-        if (!s.staffId || s.staffId === 'owner') return false;
-      } else if (historyStaffId !== 'all') {
-        if (s.staffId !== historyStaffId) return false;
-      }
+      if (!matchesSellerFilter(s, historyStaffId)) return false;
       if (historyPayment && s.paymentMethod !== historyPayment) return false;
       if (historyFrom && s.saleDate < historyFrom) return false;
       if (historyTo && s.saleDate > historyTo) return false;
       if (q) {
         const items = saleItemsBySaleId.get(s.id) || [];
         const matchSale = s.saleNumber.toLowerCase().includes(q);
-        const matchStaff = (s.staffName || '').toLowerCase().includes(q);
+        const matchStaff = formatSaleSellerLabel(s).toLowerCase().includes(q);
         const matchProd = items.some((i) => i.productName.toLowerCase().includes(q));
         if (!matchSale && !matchStaff && !matchProd) return false;
       }
@@ -508,24 +519,32 @@ export function StaffManagementPage() {
           ? 'This Month'
           : 'All Time';
 
+  const tooltipContentStyle = {
+    backgroundColor: 'var(--cm-chart-tooltip-bg)',
+    borderColor: 'var(--cm-chart-tooltip-border)',
+    color: 'var(--cm-text-primary)',
+    borderRadius: '8px',
+    fontSize: '12px',
+  };
+
   return (
     <div className="space-y-4">
       {/* Shop Access Code Banner */}
-      <section className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
+      <section className="cm-surface border rounded-xl p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
         <div className="space-y-0.5">
-          <h2 className="text-sm sm:text-base font-semibold text-slate-900">Sales Staff Portal Access</h2>
-          <p className="text-[11px] sm:text-xs text-slate-500">
+          <h2 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">Sales Staff Portal Access</h2>
+          <p className="text-[11px] sm:text-xs text-[var(--cm-text-muted)]">
             Staff sign in using Username & Password. Shop Reference Code:
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <div className="px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg font-mono-num text-sm sm:text-base font-bold text-slate-900 tracking-wider">
+          <div className="px-3 py-1.5 bg-[var(--cm-bg-subtle)] border border-[var(--cm-border)] rounded-lg font-mono-num text-sm sm:text-base font-bold text-[var(--cm-text-primary)] tracking-wider">
             {shopCode}
           </div>
           <button
             type="button"
             onClick={handleCopyShopCode}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-semibold text-teal-700 bg-teal-50 hover:bg-teal-100 rounded-lg transition-colors cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-semibold text-[var(--cm-accent-text)] bg-[var(--cm-accent-soft)] border border-[var(--cm-accent-border)] rounded-lg transition-colors cursor-pointer"
           >
             {copiedCode ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
             {copiedCode ? 'Copied' : 'Copy'}
@@ -535,34 +554,34 @@ export function StaffManagementPage() {
 
       {/* Summary KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
-        <div className="bg-white border border-slate-200 rounded-xl p-3">
-          <div className="text-[11px] sm:text-xs font-medium text-slate-500">Registered Staff</div>
-          <div className="mt-1 text-base sm:text-xl font-bold font-mono-num text-slate-900">
-            {activeStaffCount} Active <span className="text-xs font-normal text-slate-500">/ {staffMembers.length}</span>
+        <div className="cm-surface border rounded-xl p-3">
+          <div className="text-[11px] sm:text-xs font-medium text-[var(--cm-text-muted)]">Registered Staff</div>
+          <div className="mt-1 text-base sm:text-xl font-bold font-mono-num text-[var(--cm-text-primary)]">
+            {activeStaffCount} Active <span className="text-xs font-normal text-[var(--cm-text-muted)]">/ {staffMembers.length}</span>
           </div>
         </div>
-        <div className="bg-white border border-slate-200 rounded-xl p-3">
-          <div className="text-[11px] sm:text-xs font-medium text-slate-500">Staff Sales ({periodLabel})</div>
-          <div className="mt-1 text-base sm:text-xl font-bold font-mono-num text-slate-900 truncate">
+        <div className="cm-surface border rounded-xl p-3">
+          <div className="text-[11px] sm:text-xs font-medium text-[var(--cm-text-muted)]">Staff Sales ({periodLabel})</div>
+          <div className="mt-1 text-base sm:text-xl font-bold font-mono-num text-[var(--cm-text-primary)] truncate">
             {formatPKR(totalStaffRevenue)}
           </div>
         </div>
-        <div className="bg-white border border-slate-200 rounded-xl p-3">
-          <div className="text-[11px] sm:text-xs font-medium text-slate-500">Staff Bills ({periodLabel})</div>
-          <div className="mt-1 text-base sm:text-xl font-bold font-mono-num text-slate-900">
+        <div className="cm-surface border rounded-xl p-3">
+          <div className="text-[11px] sm:text-xs font-medium text-[var(--cm-text-muted)]">Staff Bills ({periodLabel})</div>
+          <div className="mt-1 text-base sm:text-xl font-bold font-mono-num text-[var(--cm-text-primary)]">
             {totalStaffOrders}
           </div>
         </div>
-        <div className="bg-white border border-slate-200 rounded-xl p-3">
+        <div className="cm-surface border rounded-xl p-3">
           <div className="flex items-center justify-between gap-1">
-            <span className="text-[11px] sm:text-xs font-medium text-slate-500 truncate">Top ({periodLabel})</span>
-            <Award className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+            <span className="text-[11px] sm:text-xs font-medium text-[var(--cm-text-muted)] truncate">Top ({periodLabel})</span>
+            <Award className="w-3.5 h-3.5 text-[var(--cm-accent)] shrink-0" />
           </div>
-          <div className="mt-1 text-sm sm:text-base font-bold text-slate-900 truncate">
+          <div className="mt-1 text-sm sm:text-base font-bold text-[var(--cm-text-primary)] truncate">
             {bestPerformer ? bestPerformer.member.name : 'No sales yet'}
           </div>
           {bestPerformer && (
-            <div className="text-[11px] font-mono-num text-teal-700 font-semibold truncate">
+            <div className="text-[11px] font-mono-num text-[var(--cm-accent-text)] font-semibold truncate">
               {formatPKR(bestPerformer.periodRevenue)} ({bestPerformer.periodOrders})
             </div>
           )}
@@ -573,7 +592,7 @@ export function StaffManagementPage() {
       <CompactSection
         title={accountRole === 'admin' ? 'Add New Admin' : 'Add New Sales Staff'}
         subtitle="Create a Sales Staff or Admin login account"
-        icon={<UserPlus className="w-4 h-4 text-teal-600" />}
+        icon={<UserPlus className="w-4 h-4 text-[var(--cm-accent)]" />}
         collapsible
         open={showAddAccount}
         onToggle={() => setShowAddAccount((v) => !v)}
@@ -581,14 +600,14 @@ export function StaffManagementPage() {
           <button
             type="button"
             onClick={() => setShowAddAccount((v) => !v)}
-            className="px-2.5 py-1 text-xs font-semibold text-teal-700 bg-teal-50 hover:bg-teal-100 rounded-lg cursor-pointer"
+            className="px-2.5 py-1 text-xs font-semibold text-[var(--cm-accent-text)] bg-[var(--cm-accent-soft)] border border-[var(--cm-accent-border)] rounded-lg cursor-pointer"
           >
             {showAddAccount ? 'Hide Form' : '+ New Account'}
           </button>
         }
         bodyClassName="p-3.5 sm:p-4 space-y-3.5"
       >
-        <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5 text-xs">
+        <div className="inline-flex rounded-lg border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] p-0.5 text-xs">
           <button
             type="button"
             onClick={() => {
@@ -597,8 +616,8 @@ export function StaffManagementPage() {
             }}
             className={`px-3 py-1.5 rounded-md font-semibold transition-colors cursor-pointer ${
               accountRole === 'sales_staff'
-                ? 'bg-white text-teal-700 border border-slate-200 shadow-xs'
-                : 'text-slate-600 hover:text-slate-900'
+                ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-accent-text)] border border-[var(--cm-border)] shadow-xs'
+                : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
             }`}
           >
             Sales Staff
@@ -611,8 +630,8 @@ export function StaffManagementPage() {
             }}
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-semibold transition-colors cursor-pointer ${
               accountRole === 'admin'
-                ? 'bg-white text-teal-700 border border-slate-200 shadow-xs'
-                : 'text-slate-600 hover:text-slate-900'
+                ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-accent-text)] border border-[var(--cm-border)] shadow-xs'
+                : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
             }`}
           >
             <ShieldCheck className="w-3.5 h-3.5" />
@@ -621,12 +640,12 @@ export function StaffManagementPage() {
         </div>
 
         {formError && (
-          <div className="p-2.5 bg-red-50 border border-red-200 rounded-lg text-xs sm:text-sm text-red-700">
+          <div className="p-2.5 bg-[var(--cm-danger-soft)] border border-[var(--cm-danger-border)] rounded-lg text-xs sm:text-sm text-[var(--cm-danger)]">
             {formError}
           </div>
         )}
         {formSuccess && (
-          <div className="p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg text-xs sm:text-sm text-emerald-700">
+          <div className="p-2.5 bg-[var(--cm-success-soft)] border border-[var(--cm-success-border)] rounded-lg text-xs sm:text-sm text-[var(--cm-success)]">
             {formSuccess}
           </div>
         )}
@@ -634,7 +653,7 @@ export function StaffManagementPage() {
         <form onSubmit={handleCreateAccount} className="space-y-3">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
             <div>
-              <label htmlFor="new-staff-name" className="block text-[11px] font-medium text-slate-700 mb-1">
+              <label htmlFor="new-staff-name" className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">
                 Full Name *
               </label>
               <input
@@ -645,12 +664,12 @@ export function StaffManagementPage() {
                 placeholder="e.g. Muhammad Ali"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                className="w-full px-3 py-2 min-h-[40px] sm:min-h-0 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-600"
+                className="w-full px-3 py-2 min-h-[40px] sm:min-h-0 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
 
             <div>
-              <label htmlFor="new-staff-phone" className="block text-[11px] font-medium text-slate-700 mb-1">
+              <label htmlFor="new-staff-phone" className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">
                 Phone Number
               </label>
               <input
@@ -660,12 +679,12 @@ export function StaffManagementPage() {
                 placeholder="03XX-XXXXXXX"
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
-                className="w-full px-3 py-2 min-h-[40px] sm:min-h-0 text-sm border border-slate-200 rounded-lg font-mono-num focus:outline-none focus:border-teal-600"
+                className="w-full px-3 py-2 min-h-[40px] sm:min-h-0 text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
 
             <div>
-              <label htmlFor="new-staff-username" className="block text-[11px] font-medium text-slate-700 mb-1">
+              <label htmlFor="new-staff-username" className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">
                 Username *
               </label>
               <input
@@ -676,12 +695,12 @@ export function StaffManagementPage() {
                 placeholder={accountRole === 'admin' ? 'e.g. hassan_admin' : 'e.g. ali_sales'}
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                className="w-full px-3 py-2 min-h-[40px] sm:min-h-0 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-600"
+                className="w-full px-3 py-2 min-h-[40px] sm:min-h-0 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
 
             <div>
-              <label htmlFor="new-staff-password" className="block text-[11px] font-medium text-slate-700 mb-1">
+              <label htmlFor="new-staff-password" className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">
                 Password * (min 6 chars)
               </label>
               <input
@@ -692,21 +711,21 @@ export function StaffManagementPage() {
                 placeholder="Set login password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="w-full px-3 py-2 min-h-[40px] sm:min-h-0 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-600"
+                className="w-full px-3 py-2 min-h-[40px] sm:min-h-0 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
           </div>
 
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pt-2 border-t border-slate-100">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pt-2 border-t border-[var(--cm-border)]">
             {accountRole === 'sales_staff' ? (
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-700">
-                <span className="font-semibold text-slate-500">Permissions:</span>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-[var(--cm-text-secondary)]">
+                <span className="font-semibold text-[var(--cm-text-muted)]">Permissions:</span>
                 <label className="inline-flex items-center gap-1.5 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={canAddSales}
                     onChange={(e) => setCanAddSales(e.target.checked)}
-                    className="rounded border-slate-300 text-teal-600 focus:ring-teal-600"
+                    className="rounded border-[var(--cm-border-strong)] accent-[var(--cm-accent)]"
                   />
                   <span>Add Sales</span>
                 </label>
@@ -715,7 +734,7 @@ export function StaffManagementPage() {
                     type="checkbox"
                     checked={canViewOwnSales}
                     onChange={(e) => setCanViewOwnSales(e.target.checked)}
-                    className="rounded border-slate-300 text-teal-600 focus:ring-teal-600"
+                    className="rounded border-[var(--cm-border-strong)] accent-[var(--cm-accent)]"
                   />
                   <span>View Own Sales</span>
                 </label>
@@ -724,14 +743,14 @@ export function StaffManagementPage() {
                     type="checkbox"
                     checked={canViewStock}
                     onChange={(e) => setCanViewStock(e.target.checked)}
-                    className="rounded border-slate-300 text-teal-600 focus:ring-teal-600"
+                    className="rounded border-[var(--cm-border-strong)] accent-[var(--cm-accent)]"
                   />
                   <span>Prices & Stock</span>
                 </label>
               </div>
             ) : (
-              <div className="flex items-center gap-2 text-xs text-slate-600">
-                <ShieldCheck className="w-4 h-4 text-teal-600 shrink-0" />
+              <div className="flex items-center gap-2 text-xs text-[var(--cm-text-secondary)]">
+                <ShieldCheck className="w-4 h-4 text-[var(--cm-accent)] shrink-0" />
                 <span>
                   Admins receive full shop management access on the <strong>Owner / Admin</strong> tab.
                 </span>
@@ -741,7 +760,7 @@ export function StaffManagementPage() {
             <button
               type="submit"
               disabled={creating}
-              className="w-full sm:w-auto px-4 py-2 min-h-[42px] sm:min-h-[38px] text-xs sm:text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+              className="w-full sm:w-auto px-4 py-2 min-h-[42px] sm:min-h-[38px] text-xs sm:text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
             >
               {creating
                 ? accountRole === 'admin'
@@ -764,7 +783,7 @@ export function StaffManagementPage() {
         defaultOpen
       >
         {adminMembers.length === 0 ? (
-          <div className="p-4 text-center text-xs sm:text-sm text-slate-500">
+          <div className="p-4 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">
             No additional admins registered yet. Open <strong>+ New Account</strong> above and switch to <strong>Admin</strong>.
           </div>
         ) : (
@@ -772,7 +791,7 @@ export function StaffManagementPage() {
             <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                  <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                     <th className="py-2 px-3">Name</th>
                     <th className="py-2 px-3">Username</th>
                     <th className="py-2 px-3">Phone</th>
@@ -781,28 +800,28 @@ export function StaffManagementPage() {
                     <th className="py-2 px-3 text-right">Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                   {adminMembers.map((admin) => {
                     const isCurrentSelf = Boolean(user?.uid && admin.authUid === user.uid);
                     return (
-                      <tr key={admin.id} className="hover:bg-slate-50">
-                        <td className="py-2 px-3 font-semibold text-slate-900">
+                      <tr key={admin.id} className="hover:bg-[var(--cm-bg-hover)]">
+                        <td className="py-2 px-3 font-semibold text-[var(--cm-text-primary)]">
                           {admin.name}
                           {isCurrentSelf && (
-                            <span className="ml-2 text-xs font-medium text-teal-700">(You)</span>
+                            <span className="ml-2 text-xs font-medium text-[var(--cm-accent-text)]">(You)</span>
                           )}
                         </td>
-                        <td className="py-2 px-3 font-mono-num text-xs text-slate-700">
+                        <td className="py-2 px-3 font-mono-num text-xs text-[var(--cm-text-secondary)]">
                           @{admin.username}
                         </td>
-                        <td className="py-2 px-3 font-mono-num text-xs text-slate-600">
+                        <td className="py-2 px-3 font-mono-num text-xs text-[var(--cm-text-secondary)]">
                           {admin.phone || '—'}
                         </td>
-                        <td className="py-2 px-3 text-xs text-slate-700 font-medium">
+                        <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)] font-medium">
                           Full Admin
                         </td>
                         <td className="py-2 px-3 text-xs font-semibold">
-                          <span className={admin.isActive ? 'text-emerald-700' : 'text-red-600'}>
+                          <span className={admin.isActive ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
                             {admin.isActive ? 'Active' : 'Inactive'}
                           </span>
                         </td>
@@ -811,7 +830,7 @@ export function StaffManagementPage() {
                             <button
                               type="button"
                               onClick={() => openResetModal({ kind: 'admin', member: admin })}
-                              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 hover:text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
+                              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-[var(--cm-text-secondary)] hover:text-[var(--cm-warning)] hover:bg-[var(--cm-warning-soft)] rounded-lg cursor-pointer"
                             >
                               <KeyRound className="w-3.5 h-3.5" />
                               <span>Reset Password</span>
@@ -822,8 +841,8 @@ export function StaffManagementPage() {
                               onClick={() => void handleToggleAdminActive(admin)}
                               className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                                 admin.isActive
-                                  ? 'text-red-700 hover:bg-red-50'
-                                  : 'text-emerald-700 hover:bg-emerald-50'
+                                  ? 'text-[var(--cm-danger)] hover:bg-[var(--cm-danger-soft)]'
+                                  : 'text-[var(--cm-success)] hover:bg-[var(--cm-success-soft)]'
                               }`}
                             >
                               {admin.isActive ? (
@@ -847,7 +866,7 @@ export function StaffManagementPage() {
               </table>
             </div>
 
-            <div className="md:hidden divide-y divide-slate-100">
+            <div className="md:hidden divide-y divide-[var(--cm-border)]">
               {adminMembers.map((admin) => {
                 const isCurrentSelf = Boolean(user?.uid && admin.authUid === user.uid);
                 return (
@@ -856,12 +875,12 @@ export function StaffManagementPage() {
                     title={
                       <span>
                         {admin.name}
-                        {isCurrentSelf && <span className="ml-1.5 text-[11px] font-medium text-teal-700">(You)</span>}
+                        {isCurrentSelf && <span className="ml-1.5 text-[11px] font-medium text-[var(--cm-accent-text)]">(You)</span>}
                       </span>
                     }
                     subtitle={`@${admin.username}${admin.phone ? ` · ${admin.phone}` : ''}`}
                     rightPrimary={
-                      <span className={admin.isActive ? 'text-emerald-700' : 'text-red-600'}>
+                      <span className={admin.isActive ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
                         {admin.isActive ? 'Active' : 'Inactive'}
                       </span>
                     }
@@ -873,7 +892,7 @@ export function StaffManagementPage() {
                         <button
                           type="button"
                           onClick={() => openResetModal({ kind: 'admin', member: admin })}
-                          className="inline-flex items-center gap-1 px-3 py-1.5 min-h-[36px] text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:text-amber-700 rounded-lg cursor-pointer"
+                          className="inline-flex items-center gap-1 px-3 py-1.5 min-h-[36px] text-xs font-medium text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:text-[var(--cm-warning)] rounded-lg cursor-pointer"
                         >
                           <KeyRound className="w-3.5 h-3.5" />
                           Reset Password
@@ -884,8 +903,8 @@ export function StaffManagementPage() {
                           onClick={() => void handleToggleAdminActive(admin)}
                           className={`inline-flex items-center gap-1 px-3 py-1.5 min-h-[36px] text-xs font-medium rounded-lg border cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                             admin.isActive
-                              ? 'text-red-700 bg-white border-red-200'
-                              : 'text-emerald-700 bg-white border-emerald-200'
+                              ? 'text-[var(--cm-danger)] bg-[var(--cm-danger-soft)] border-[var(--cm-danger-border)]'
+                              : 'text-[var(--cm-success)] bg-[var(--cm-success-soft)] border-[var(--cm-success-border)]'
                           }`}
                         >
                           {admin.isActive ? <UserX className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
@@ -910,7 +929,7 @@ export function StaffManagementPage() {
         defaultOpen
       >
         {staffMembers.length === 0 ? (
-          <div className="p-5 text-center text-xs sm:text-sm text-slate-500">
+          <div className="p-5 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">
             No sales staff registered yet. Open <strong>+ New Account</strong> above to add staff.
           </div>
         ) : (
@@ -918,7 +937,7 @@ export function StaffManagementPage() {
             <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                  <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                     <th className="py-2 px-3">Name</th>
                     <th className="py-2 px-3">Username</th>
                     <th className="py-2 px-3">Phone</th>
@@ -927,7 +946,7 @@ export function StaffManagementPage() {
                     <th className="py-2 px-3 text-right">Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                   {staffMembers.map((member) => {
                     const permsText = [
                       member.permissions.canAddSales ? 'Add Sales' : null,
@@ -938,17 +957,17 @@ export function StaffManagementPage() {
                       .join(' · ') || 'Restricted';
 
                     return (
-                      <tr key={member.id} className="hover:bg-slate-50">
-                        <td className="py-2 px-3 font-semibold text-slate-900">{member.name}</td>
-                        <td className="py-2 px-3 font-mono-num text-xs text-slate-700">
+                      <tr key={member.id} className="hover:bg-[var(--cm-bg-hover)]">
+                        <td className="py-2 px-3 font-semibold text-[var(--cm-text-primary)]">{member.name}</td>
+                        <td className="py-2 px-3 font-mono-num text-xs text-[var(--cm-text-secondary)]">
                           @{member.username}
                         </td>
-                        <td className="py-2 px-3 font-mono-num text-xs text-slate-600">
+                        <td className="py-2 px-3 font-mono-num text-xs text-[var(--cm-text-secondary)]">
                           {member.phone || '—'}
                         </td>
-                        <td className="py-2 px-3 text-xs text-slate-600">{permsText}</td>
+                        <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">{permsText}</td>
                         <td className="py-2 px-3 text-xs font-semibold">
-                          <span className={member.isActive ? 'text-emerald-700' : 'text-red-600'}>
+                          <span className={member.isActive ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
                             {member.isActive ? 'Active' : 'Inactive'}
                           </span>
                         </td>
@@ -957,7 +976,7 @@ export function StaffManagementPage() {
                             <button
                               type="button"
                               onClick={() => openEditModal(member)}
-                              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 hover:text-teal-700 hover:bg-slate-100 rounded-lg cursor-pointer"
+                              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-[var(--cm-text-secondary)] hover:text-[var(--cm-accent-text)] hover:bg-[var(--cm-bg-hover)] rounded-lg cursor-pointer"
                             >
                               <Settings2 className="w-3.5 h-3.5" />
                               <span>Permissions</span>
@@ -965,7 +984,7 @@ export function StaffManagementPage() {
                             <button
                               type="button"
                               onClick={() => openResetModal({ kind: 'staff', member })}
-                              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 hover:text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
+                              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-[var(--cm-text-secondary)] hover:text-[var(--cm-warning)] hover:bg-[var(--cm-warning-soft)] rounded-lg cursor-pointer"
                             >
                               <KeyRound className="w-3.5 h-3.5" />
                               <span>Reset</span>
@@ -975,8 +994,8 @@ export function StaffManagementPage() {
                               onClick={() => void handleToggleActive(member)}
                               className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg cursor-pointer ${
                                 member.isActive
-                                  ? 'text-red-700 hover:bg-red-50'
-                                  : 'text-emerald-700 hover:bg-emerald-50'
+                                  ? 'text-[var(--cm-danger)] hover:bg-[var(--cm-danger-soft)]'
+                                  : 'text-[var(--cm-success)] hover:bg-[var(--cm-success-soft)]'
                               }`}
                             >
                               {member.isActive ? (
@@ -1000,7 +1019,7 @@ export function StaffManagementPage() {
               </table>
             </div>
 
-            <div className="md:hidden divide-y divide-slate-100">
+            <div className="md:hidden divide-y divide-[var(--cm-border)]">
               {staffMembers.map((member) => {
                 const permsText = [
                   member.permissions.canAddSales ? 'Add Sales' : null,
@@ -1016,7 +1035,7 @@ export function StaffManagementPage() {
                     title={member.name}
                     subtitle={`@${member.username}${member.phone ? ` · ${member.phone}` : ''}`}
                     rightPrimary={
-                      <span className={member.isActive ? 'text-emerald-700' : 'text-red-600'}>
+                      <span className={member.isActive ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
                         {member.isActive ? 'Active' : 'Inactive'}
                       </span>
                     }
@@ -1024,14 +1043,14 @@ export function StaffManagementPage() {
                     onToggle={() => setExpandedStaffId((prev) => (prev === member.id ? null : member.id))}
                     expandedContent={
                       <div className="space-y-2">
-                        <div className="text-slate-600">
-                          Permissions: <span className="font-medium text-slate-900">{permsText}</span>
+                        <div className="text-[var(--cm-text-secondary)]">
+                          Permissions: <span className="font-medium text-[var(--cm-text-primary)]">{permsText}</span>
                         </div>
                         <div className="flex flex-wrap items-center gap-2 pt-1">
                           <button
                             type="button"
                             onClick={() => openEditModal(member)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg cursor-pointer"
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] text-xs font-medium text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-lg cursor-pointer"
                           >
                             <Settings2 className="w-3.5 h-3.5" />
                             Permissions
@@ -1039,7 +1058,7 @@ export function StaffManagementPage() {
                           <button
                             type="button"
                             onClick={() => openResetModal({ kind: 'staff', member })}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg cursor-pointer"
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] text-xs font-medium text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-lg cursor-pointer"
                           >
                             <KeyRound className="w-3.5 h-3.5" />
                             Reset Password
@@ -1049,8 +1068,8 @@ export function StaffManagementPage() {
                             onClick={() => void handleToggleActive(member)}
                             className={`inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] text-xs font-medium rounded-lg border cursor-pointer ${
                               member.isActive
-                                ? 'text-red-700 bg-white border-red-200'
-                                : 'text-emerald-700 bg-white border-emerald-200'
+                                ? 'text-[var(--cm-danger)] bg-[var(--cm-danger-soft)] border-[var(--cm-danger-border)]'
+                                : 'text-[var(--cm-success)] bg-[var(--cm-success-soft)] border-[var(--cm-success-border)]'
                             }`}
                           >
                             {member.isActive ? <UserX className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
@@ -1069,20 +1088,22 @@ export function StaffManagementPage() {
 
       {/* Staff Sales Performance & Employee Comparison */}
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-        <div className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 space-y-3">
+        <div className="lg:col-span-5 cm-surface border rounded-xl p-3.5 sm:p-4 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <h2 className="text-sm sm:text-base font-semibold text-slate-900">Employee Comparison</h2>
-              <p className="text-[11px] sm:text-xs text-slate-500">Revenue ({periodLabel})</p>
+              <h2 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">Employee Comparison</h2>
+              <p className="text-[11px] sm:text-xs text-[var(--cm-text-muted)]">Revenue ({periodLabel})</p>
             </div>
-            <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5 text-xs">
+            <div className="inline-flex rounded-lg border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] p-0.5 text-xs">
               {(['daily', 'weekly', 'monthly', 'all'] as PerformancePeriod[]).map((p) => (
                 <button
                   key={p}
                   type="button"
                   onClick={() => setPerfPeriod(p)}
                   className={`px-2 py-1 rounded-md font-medium capitalize cursor-pointer ${
-                    perfPeriod === p ? 'bg-white text-teal-700 border border-slate-200' : 'text-slate-600'
+                    perfPeriod === p
+                      ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-accent-text)] border border-[var(--cm-border)]'
+                      : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
                   }`}
                 >
                   {p === 'all' ? 'All' : p}
@@ -1092,23 +1113,24 @@ export function StaffManagementPage() {
           </div>
 
           {comparisonChartData.length === 0 ? (
-            <div className="h-52 flex items-center justify-center text-xs sm:text-sm text-slate-500">
+            <div className="h-52 flex items-center justify-center text-xs sm:text-sm text-[var(--cm-text-muted)]">
               Add staff members to compare employee sales performance.
             </div>
           ) : (
             <div className="h-52 sm:h-60">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={comparisonChartData} margin={{ top: 8, right: 12, left: 0, bottom: 8 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" vertical={false} />
-                  <XAxis dataKey="name" tick={{ fontSize: 11, fill: '#64748B' }} />
-                  <YAxis tick={{ fontSize: 11, fill: '#64748B' }} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--cm-chart-grid)" vertical={false} />
+                  <XAxis dataKey="name" tick={{ fontSize: 11, fill: 'var(--cm-chart-tick)' }} />
+                  <YAxis tick={{ fontSize: 11, fill: 'var(--cm-chart-tick)' }} />
                   <Tooltip
                     formatter={(value) => [formatPKR(Number(value ?? 0)), 'Sales Revenue']}
                     labelFormatter={(_, payload) =>
                       payload?.[0]?.payload?.fullName ? String(payload[0].payload.fullName) : ''
                     }
+                    contentStyle={tooltipContentStyle}
                   />
-                  <Bar dataKey="revenue" fill="#0D9488" radius={[6, 6, 0, 0]} maxBarSize={48} />
+                  <Bar dataKey="revenue" fill="#65a30d" radius={[6, 6, 0, 0]} maxBarSize={48} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
@@ -1124,13 +1146,13 @@ export function StaffManagementPage() {
             defaultOpen
           >
             {sortedPerformance.length === 0 ? (
-              <div className="p-6 text-center text-xs sm:text-sm text-slate-500">No staff performance data yet.</div>
+              <div className="p-6 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">No staff performance data yet.</div>
             ) : (
               <>
                 <div className="hidden md:block overflow-x-auto">
                   <table className="w-full text-left border-collapse">
                     <thead>
-                      <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                      <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                         <th className="py-2 px-3">Staff Member</th>
                         <th className="py-2 px-3 text-right">Today</th>
                         <th className="py-2 px-3 text-right">7 Days</th>
@@ -1140,55 +1162,55 @@ export function StaffManagementPage() {
                         <th className="py-2 px-3 text-right">Bills</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                    <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                       {sortedPerformance.map((row) => (
-                        <tr key={row.member.id} className="hover:bg-slate-50">
+                        <tr key={row.member.id} className="hover:bg-[var(--cm-bg-hover)]">
                           <td className="py-2 px-3">
-                            <div className="font-semibold text-slate-900">{row.member.name}</div>
-                            <div className="text-[11px] text-slate-500 font-mono-num">
+                            <div className="font-semibold text-[var(--cm-text-primary)]">{row.member.name}</div>
+                            <div className="text-[11px] text-[var(--cm-text-muted)] font-mono-num">
                               Cash: {formatPKR(row.cashTotal)} · Online: {formatPKR(row.onlineTotal)}
                             </div>
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num whitespace-nowrap">
+                          <td className="py-2 px-3 text-right font-mono-num whitespace-nowrap text-[var(--cm-text-primary)]">
                             {formatPKR(row.dailyRevenue)}
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num whitespace-nowrap">
+                          <td className="py-2 px-3 text-right font-mono-num whitespace-nowrap text-[var(--cm-text-primary)]">
                             {formatPKR(row.weeklyRevenue)}
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num font-semibold text-slate-900 whitespace-nowrap">
+                          <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-text-primary)] whitespace-nowrap">
                             {formatPKR(row.monthlyRevenue)}
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num whitespace-nowrap">
+                          <td className="py-2 px-3 text-right font-mono-num whitespace-nowrap text-[var(--cm-text-primary)]">
                             {formatPKR(row.allTimeRevenue)}
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num font-semibold text-emerald-700 whitespace-nowrap">
+                          <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-success)] whitespace-nowrap">
                             {formatPKR(row.allTimeProfit)}
                           </td>
-                          <td className="py-2 px-3 text-right font-mono-num">{row.totalOrders}</td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">{row.totalOrders}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
 
-                <div className="md:hidden divide-y divide-slate-100">
+                <div className="md:hidden divide-y divide-[var(--cm-border)]">
                   {sortedPerformance.map((row) => (
                     <CompactExpandableRow
                       key={row.member.id}
                       title={row.member.name}
                       subtitle={`Month: ${formatPKR(row.monthlyRevenue)} · ${row.totalOrders} bills`}
                       rightPrimary={formatPKR(row.allTimeRevenue)}
-                      rightSecondary={<span className="text-emerald-700">+{formatPKR(row.allTimeProfit)}</span>}
+                      rightSecondary={<span className="text-[var(--cm-success)]">+{formatPKR(row.allTimeProfit)}</span>}
                       isExpanded={expandedPerfId === row.member.id}
                       onToggle={() =>
                         setExpandedPerfId((prev) => (prev === row.member.id ? null : row.member.id))
                       }
                       expandedContent={
-                        <div className="grid grid-cols-2 gap-2 text-slate-600 font-mono-num">
-                          <div>Today: <span className="text-slate-900 font-semibold">{formatPKR(row.dailyRevenue)}</span></div>
-                          <div>7 Days: <span className="text-slate-900 font-semibold">{formatPKR(row.weeklyRevenue)}</span></div>
-                          <div>Cash: <span className="text-slate-900">{formatPKR(row.cashTotal)}</span></div>
-                          <div>Online: <span className="text-slate-900">{formatPKR(row.onlineTotal)}</span></div>
+                        <div className="grid grid-cols-2 gap-2 text-[var(--cm-text-secondary)] font-mono-num">
+                          <div>Today: <span className="text-[var(--cm-text-primary)] font-semibold">{formatPKR(row.dailyRevenue)}</span></div>
+                          <div>7 Days: <span className="text-[var(--cm-text-primary)] font-semibold">{formatPKR(row.weeklyRevenue)}</span></div>
+                          <div>Cash: <span className="text-[var(--cm-text-primary)]">{formatPKR(row.cashTotal)}</span></div>
+                          <div>Online: <span className="text-[var(--cm-text-primary)]">{formatPKR(row.onlineTotal)}</span></div>
                         </div>
                       }
                     />
@@ -1208,24 +1230,24 @@ export function StaffManagementPage() {
         collapsible
         defaultOpen={false}
       >
-        <div className="p-3 sm:p-3.5 border-b border-slate-200 space-y-2">
+        <div className="p-3 sm:p-3.5 border-b border-[var(--cm-border)] space-y-2">
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
-              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <Search className="w-3.5 h-3.5 text-[var(--cm-text-muted)] absolute left-3 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 placeholder="Search staff, sale # or product..."
                 value={historySearch}
                 onChange={(e) => setHistorySearch(e.target.value)}
-                className="w-full pl-8 pr-3 py-1.5 min-h-[38px] sm:min-h-0 text-xs sm:text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-600"
+                className="w-full pl-8 pr-3 py-1.5 min-h-[38px] sm:min-h-0 text-xs sm:text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
             <button
               type="button"
               onClick={() => setShowHistoryFilters((v) => !v)}
-              className="md:hidden inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[38px] text-xs font-semibold text-slate-700 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer shrink-0"
+              className="md:hidden inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[38px] text-xs font-semibold text-[var(--cm-text-secondary)] bg-[var(--cm-bg-subtle)] border border-[var(--cm-border)] rounded-lg cursor-pointer shrink-0"
             >
-              <Filter className="w-3.5 h-3.5 text-teal-600" />
+              <Filter className="w-3.5 h-3.5 text-[var(--cm-accent)]" />
               Filters
               <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showHistoryFilters ? 'rotate-180' : ''}`} />
             </button>
@@ -1239,10 +1261,10 @@ export function StaffManagementPage() {
             <SearchableSelect
               options={historyStaffOptions}
               value={historyStaffId}
-              onChange={(val) => setHistoryStaffId(val || 'all_staff')}
+              onChange={(val) => setHistoryStaffId(val || ALL_STAFF_FILTER_ID)}
               placeholder="All Sales Staff"
-              searchPlaceholder="Search staff member..."
-              ariaLabel="Filter by staff member"
+              searchPlaceholder="Search admin or staff..."
+              ariaLabel="Filter by admin or staff member"
               suggestionScope="staff"
               suggestedValues={frequentHistoryStaffIds}
               size="sm"
@@ -1252,14 +1274,14 @@ export function StaffManagementPage() {
               aria-label="From date"
               value={historyFrom}
               onChange={(e) => setHistoryFrom(e.target.value)}
-              className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded-lg font-mono-num"
+              className="w-full px-2.5 py-1.5 text-xs cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
             />
             <input
               type="date"
               aria-label="To date"
               value={historyTo}
               onChange={(e) => setHistoryTo(e.target.value)}
-              className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded-lg font-mono-num"
+              className="w-full px-2.5 py-1.5 text-xs cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
             />
             <SearchableSelect
               options={historyPaymentOptions}
@@ -1276,7 +1298,7 @@ export function StaffManagementPage() {
         </div>
 
         {filteredStaffSalesHistory.length === 0 ? (
-          <div className="p-6 text-center text-xs sm:text-sm text-slate-500">
+          <div className="p-6 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">
             No employee sales match the selected filters.
           </div>
         ) : (
@@ -1284,7 +1306,7 @@ export function StaffManagementPage() {
             <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                  <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                     <th className="py-2 px-3">Date & Time</th>
                     <th className="py-2 px-3">Sale #</th>
                     <th className="py-2 px-3">Staff</th>
@@ -1296,40 +1318,40 @@ export function StaffManagementPage() {
                     <th className="py-2 px-3">Status</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                   {filteredStaffSalesHistory.map((sale) => {
                     const items = saleItemsBySaleId.get(sale.id) || [];
-                    const summaryText = items.map((i) => `${i.productName} ×${i.quantity}`).join(', ');
+                    const summaryText = items.map(formatSaleItemLabel).join(', ');
                     const isCancelled = sale.status === 'cancelled';
 
                     return (
-                      <tr key={sale.id} className={`hover:bg-slate-50 ${isCancelled ? 'opacity-60' : ''}`}>
-                        <td className="py-2 px-3 font-mono-num text-xs whitespace-nowrap text-slate-700">
+                      <tr key={sale.id} className={`hover:bg-[var(--cm-bg-hover)] ${isCancelled ? 'opacity-60' : ''}`}>
+                        <td className="py-2 px-3 font-mono-num text-xs whitespace-nowrap text-[var(--cm-text-secondary)]">
                           {sale.saleDateTime || formatDateDDMMYYYY(sale.saleDate)}
                         </td>
-                        <td className="py-2 px-3 font-mono-num text-xs font-medium text-slate-900 whitespace-nowrap">
+                        <td className="py-2 px-3 font-mono-num text-xs font-medium text-[var(--cm-text-primary)] whitespace-nowrap">
                           {sale.saleNumber}
                         </td>
-                        <td className="py-2 px-3 font-medium text-slate-900 whitespace-nowrap">
-                          {sale.staffName || 'Owner'}
+                        <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)] whitespace-nowrap">
+                          {formatSaleSellerLabel(sale)}
                         </td>
-                        <td className="py-2 px-3 text-slate-700 max-w-xs truncate" title={summaryText}>
+                        <td className="py-2 px-3 text-[var(--cm-text-secondary)] max-w-xs truncate" title={summaryText}>
                           {summaryText || `${sale.itemCount} items`}
                         </td>
-                        <td className="py-2 px-3 text-xs text-slate-600">{sale.paymentMethod}</td>
-                        <td className="py-2 px-3 text-right font-mono-num">{sale.totalQuantity}</td>
-                        <td className="py-2 px-3 text-right font-mono-num font-semibold text-slate-900 whitespace-nowrap">
+                        <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">{sale.paymentMethod}</td>
+                        <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{sale.totalQuantity}</td>
+                        <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-text-primary)] whitespace-nowrap">
                           {formatPKR(sale.totalAmount)}
                         </td>
                         <td
                           className={`py-2 px-3 text-right font-mono-num font-semibold whitespace-nowrap ${
-                            sale.totalProfit >= 0 ? 'text-emerald-700' : 'text-red-600'
+                            sale.totalProfit >= 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'
                           }`}
                         >
                           {formatPKR(sale.totalProfit)}
                         </td>
                         <td className="py-2 px-3 text-xs font-semibold">
-                          <span className={isCancelled ? 'text-red-600' : 'text-emerald-700'}>
+                          <span className={isCancelled ? 'text-[var(--cm-danger)]' : 'text-[var(--cm-success)]'}>
                             {isCancelled ? 'Cancelled' : 'Completed'}
                           </span>
                         </td>
@@ -1340,31 +1362,31 @@ export function StaffManagementPage() {
               </table>
             </div>
 
-            <div className="md:hidden divide-y divide-slate-100">
+            <div className="md:hidden divide-y divide-[var(--cm-border)]">
               {filteredStaffSalesHistory.map((sale) => {
                 const items = saleItemsBySaleId.get(sale.id) || [];
-                const summaryText = items.map((i) => `${i.productName} ×${i.quantity}`).join(', ');
+                const summaryText = items.map(formatSaleItemLabel).join(', ');
                 const isCancelled = sale.status === 'cancelled';
 
                 return (
                   <CompactExpandableRow
                     key={sale.id}
                     dimmed={isCancelled}
-                    title={`${sale.saleNumber} · ${sale.staffName || 'Owner'}`}
+                    title={`${sale.saleNumber} · ${formatSaleSellerLabel(sale)}`}
                     subtitle={`${sale.saleDateTime || formatDateDDMMYYYY(sale.saleDate)} · ${sale.paymentMethod}`}
                     rightPrimary={formatPKR(sale.totalAmount)}
                     rightSecondary={
-                      <span className={isCancelled ? 'text-red-600' : 'text-emerald-700'}>
+                      <span className={isCancelled ? 'text-[var(--cm-danger)]' : 'text-[var(--cm-success)]'}>
                         {isCancelled ? 'Cancelled' : `+${formatPKR(sale.totalProfit)}`}
                       </span>
                     }
                     isExpanded={expandedSaleId === sale.id}
                     onToggle={() => setExpandedSaleId((prev) => (prev === sale.id ? null : sale.id))}
                     expandedContent={
-                      <div className="space-y-1.5 text-slate-600">
-                        <div className="text-slate-900">{summaryText || `${sale.itemCount} items`}</div>
+                      <div className="space-y-1.5 text-[var(--cm-text-secondary)]">
+                        <div className="text-[var(--cm-text-primary)]">{summaryText || `${sale.itemCount} items`}</div>
                         <div className="flex justify-between font-mono-num text-[11px]">
-                          <span>Qty: {sale.totalQuantity}</span>
+                          <span>Base Qty: {sale.totalQuantity}</span>
                           <span>Status: {isCancelled ? 'Cancelled' : 'Completed'}</span>
                         </div>
                       </div>
@@ -1379,105 +1401,105 @@ export function StaffManagementPage() {
 
       {/* Edit Staff Details & Permissions Modal */}
       {editingStaff && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-          <div className="bg-white border border-slate-200 rounded-t-2xl sm:rounded-xl w-full max-w-md max-h-[92vh] overflow-y-auto p-4 sm:p-5 space-y-3.5">
-            <div className="flex items-center justify-between border-b border-slate-200 pb-2.5">
-              <h3 className="text-sm sm:text-base font-semibold text-slate-900">
+        <div className="fixed inset-0 z-50 bg-[var(--cm-bg-overlay)] flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="cm-surface border rounded-t-2xl sm:rounded-xl w-full max-w-md max-h-[92vh] overflow-y-auto p-4 sm:p-5 space-y-3.5">
+            <div className="flex items-center justify-between border-b border-[var(--cm-border)] pb-2.5">
+              <h3 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">
                 Edit Staff · @{editingStaff.username}
               </h3>
               <button
                 type="button"
                 onClick={() => setEditingStaff(null)}
-                className="p-1.5 text-slate-400 hover:text-slate-700 cursor-pointer"
+                className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             {editError && (
-              <div className="p-2.5 bg-red-50 border border-red-200 rounded-lg text-xs sm:text-sm text-red-700">
+              <div className="p-2.5 bg-[var(--cm-danger-soft)] border border-[var(--cm-danger-border)] rounded-lg text-xs sm:text-sm text-[var(--cm-danger)]">
                 {editError}
               </div>
             )}
 
             <form onSubmit={handleSaveEdit} className="space-y-3">
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Full Name</label>
+                <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">Full Name</label>
                 <input
                   type="text"
                   required
                   value={editName}
                   onChange={(e) => setEditName(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                  className="w-full px-3 py-2 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Phone</label>
+                <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">Phone</label>
                 <input
                   type="text"
                   value={editPhone}
                   onChange={(e) => setEditPhone(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg font-mono-num"
+                  className="w-full px-3 py-2 text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
                 />
               </div>
-              <div className="space-y-2 pt-2 border-t border-slate-100">
-                <div className="text-xs font-semibold text-slate-700">Account & Permissions</div>
-                <label className="flex items-center gap-2 text-xs sm:text-sm text-slate-700 cursor-pointer">
+              <div className="space-y-2 pt-2 border-t border-[var(--cm-border)]">
+                <div className="text-xs font-semibold text-[var(--cm-text-secondary)]">Account & Permissions</div>
+                <label className="flex items-center gap-2 text-xs sm:text-sm text-[var(--cm-text-secondary)] cursor-pointer">
                   <input
                     type="checkbox"
                     checked={editActive}
                     onChange={(e) => setEditActive(e.target.checked)}
-                    className="rounded border-slate-300 text-teal-600"
+                    className="rounded border-[var(--cm-border-strong)] accent-[var(--cm-accent)]"
                   />
                   <span>Account Active (can log in)</span>
                 </label>
-                <label className="flex items-center gap-2 text-xs sm:text-sm text-slate-700 cursor-pointer">
+                <label className="flex items-center gap-2 text-xs sm:text-sm text-[var(--cm-text-secondary)] cursor-pointer">
                   <input
                     type="checkbox"
                     checked={editPerms.canAddSales}
                     onChange={(e) =>
                       setEditPerms((p) => ({ ...p, canAddSales: e.target.checked }))
                     }
-                    className="rounded border-slate-300 text-teal-600"
+                    className="rounded border-[var(--cm-border-strong)] accent-[var(--cm-accent)]"
                   />
                   <span>Can Add New Sales</span>
                 </label>
-                <label className="flex items-center gap-2 text-xs sm:text-sm text-slate-700 cursor-pointer">
+                <label className="flex items-center gap-2 text-xs sm:text-sm text-[var(--cm-text-secondary)] cursor-pointer">
                   <input
                     type="checkbox"
                     checked={editPerms.canViewOwnSales}
                     onChange={(e) =>
                       setEditPerms((p) => ({ ...p, canViewOwnSales: e.target.checked }))
                     }
-                    className="rounded border-slate-300 text-teal-600"
+                    className="rounded border-[var(--cm-border-strong)] accent-[var(--cm-accent)]"
                   />
                   <span>Can View Own Sales History & Totals</span>
                 </label>
-                <label className="flex items-center gap-2 text-xs sm:text-sm text-slate-700 cursor-pointer">
+                <label className="flex items-center gap-2 text-xs sm:text-sm text-[var(--cm-text-secondary)] cursor-pointer">
                   <input
                     type="checkbox"
                     checked={editPerms.canViewStock}
                     onChange={(e) =>
                       setEditPerms((p) => ({ ...p, canViewStock: e.target.checked }))
                     }
-                    className="rounded border-slate-300 text-teal-600"
+                    className="rounded border-[var(--cm-border-strong)] accent-[var(--cm-accent)]"
                   />
                   <span>Can View Product Selling Prices & Stock</span>
                 </label>
               </div>
 
-              <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
+              <div className="flex justify-end gap-2 pt-3 border-t border-[var(--cm-border)]">
                 <button
                   type="button"
                   onClick={() => setEditingStaff(null)}
-                  className="px-4 py-2 min-h-[40px] text-xs sm:text-sm font-medium text-slate-700 border border-slate-200 rounded-lg cursor-pointer"
+                  className="px-4 py-2 min-h-[40px] text-xs sm:text-sm font-medium text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={savingEdit}
-                  className="px-4 py-2 min-h-[40px] text-xs sm:text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg disabled:opacity-50 cursor-pointer"
+                  className="px-4 py-2 min-h-[40px] text-xs sm:text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg disabled:opacity-50 cursor-pointer"
                 >
                   {savingEdit ? 'Saving...' : 'Save Changes'}
                 </button>
@@ -1489,34 +1511,34 @@ export function StaffManagementPage() {
 
       {/* Reset Staff / Admin Password Modal */}
       {resetTarget && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-          <div className="bg-white border border-slate-200 rounded-t-2xl sm:rounded-xl w-full max-w-md max-h-[92vh] overflow-y-auto p-4 sm:p-5 space-y-3.5">
-            <div className="flex items-center justify-between border-b border-slate-200 pb-2.5">
-              <h3 className="text-sm sm:text-base font-semibold text-slate-900">
+        <div className="fixed inset-0 z-50 bg-[var(--cm-bg-overlay)] flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="cm-surface border rounded-t-2xl sm:rounded-xl w-full max-w-md max-h-[92vh] overflow-y-auto p-4 sm:p-5 space-y-3.5">
+            <div className="flex items-center justify-between border-b border-[var(--cm-border)] pb-2.5">
+              <h3 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">
                 Reset Password · {resetTarget.member.name}
               </h3>
               <button
                 type="button"
                 onClick={() => setResetTarget(null)}
-                className="p-1.5 text-slate-400 hover:text-slate-700 cursor-pointer"
+                className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             {resetError && (
-              <div className="p-2.5 bg-red-50 border border-red-200 rounded-lg text-xs sm:text-sm text-red-700">
+              <div className="p-2.5 bg-[var(--cm-danger-soft)] border border-[var(--cm-danger-border)] rounded-lg text-xs sm:text-sm text-[var(--cm-danger)]">
                 {resetError}
               </div>
             )}
 
-            <p className="text-xs text-slate-600">
+            <p className="text-xs text-[var(--cm-text-secondary)]">
               Setting a new password immediately revokes any active login session for @{resetTarget.member.username}.
             </p>
 
             <form onSubmit={handleResetPassword} className="space-y-3">
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">
+                <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">
                   New Password (minimum 6 characters)
                 </label>
                 <input
@@ -1526,22 +1548,22 @@ export function StaffManagementPage() {
                   placeholder="Enter new password"
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-600"
+                  className="w-full px-3 py-2 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
                 />
               </div>
 
-              <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
+              <div className="flex justify-end gap-2 pt-3 border-t border-[var(--cm-border)]">
                 <button
                   type="button"
                   onClick={() => setResetTarget(null)}
-                  className="px-4 py-2 min-h-[40px] text-xs sm:text-sm font-medium text-slate-700 border border-slate-200 rounded-lg cursor-pointer"
+                  className="px-4 py-2 min-h-[40px] text-xs sm:text-sm font-medium text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={resettingPwd}
-                  className="px-4 py-2 min-h-[40px] text-xs sm:text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg disabled:opacity-50 cursor-pointer"
+                  className="px-4 py-2 min-h-[40px] text-xs sm:text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg disabled:opacity-50 cursor-pointer"
                 >
                   {resettingPwd ? 'Resetting...' : 'Reset Password'}
                 </button>

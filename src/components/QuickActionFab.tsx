@@ -76,9 +76,9 @@ export function QuickActionFab({ activeSection, onNavigate }: QuickActionFabProp
         <div
           role="menu"
           aria-label="Quick Actions"
-          className="w-60 bg-white border border-slate-200 rounded-xl shadow-xl p-1.5 space-y-1"
+          className="w-60 bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-xl shadow-xl p-1.5 space-y-1"
         >
-          <div className="px-2.5 py-1.5 border-b border-slate-100 text-[11px] font-semibold text-slate-500">
+          <div className="px-2.5 py-1.5 border-b border-[var(--cm-border)] text-[11px] font-semibold text-[var(--cm-text-muted)]">
             Quick Actions
           </div>
           {QUICK_ACTIONS.map((action) => {
@@ -92,20 +92,22 @@ export function QuickActionFab({ activeSection, onNavigate }: QuickActionFabProp
                 onClick={() => handleSelectAction(action.id)}
                 className={`w-full text-left px-3 py-2.5 min-h-[44px] rounded-lg flex items-center gap-3 transition-colors cursor-pointer ${
                   isCurrent
-                    ? 'bg-teal-50 text-teal-800'
-                    : 'text-slate-800 hover:bg-slate-50'
+                    ? 'bg-[var(--cm-accent-soft)] text-[var(--cm-accent-text)]'
+                    : 'text-[var(--cm-text-primary)] hover:bg-[var(--cm-bg-hover)]'
                 }`}
               >
                 <span
                   className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
-                    isCurrent ? 'bg-teal-600 text-white' : 'bg-slate-100 text-teal-700'
+                    isCurrent
+                      ? 'bg-[var(--cm-accent)] text-white'
+                      : 'bg-[var(--cm-bg-subtle)] text-[var(--cm-accent-text)]'
                   }`}
                 >
                   <Icon className="w-4 h-4" />
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm font-semibold leading-tight">{action.label}</span>
-                  <span className="block text-[11px] text-slate-500 truncate">{action.subtitle}</span>
+                  <span className="block text-[11px] text-[var(--cm-text-muted)] truncate">{action.subtitle}</span>
                 </span>
               </button>
             );
@@ -119,7 +121,7 @@ export function QuickActionFab({ activeSection, onNavigate }: QuickActionFabProp
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label={open ? 'Close quick actions menu' : 'Open quick actions menu'}
-        className="h-11 px-3.5 sm:h-12 sm:px-4 rounded-xl bg-teal-600 hover:bg-teal-700 active:scale-[0.98] text-white shadow-lg shadow-slate-900/15 flex items-center gap-2 text-sm font-semibold transition-all whitespace-nowrap cursor-pointer"
+        className="h-11 px-3.5 sm:h-12 sm:px-4 rounded-2xl bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] active:scale-[0.98] text-white shadow-lg flex items-center gap-2 text-sm font-semibold transition-all whitespace-nowrap cursor-pointer"
       >
         {open ? <X className="w-4 h-4 shrink-0" /> : <Plus className="w-4 h-4 shrink-0" />}
         <span className="hidden sm:inline">Quick Action</span>

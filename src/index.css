@@ -1,16 +1,146 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 @layer base {
   :root {
     --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
     --font-sans: 'DM Sans', system-ui, -apple-system, sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+    color-scheme: light;
+
+    /* Surface & Background Tokens — Light Mint & Crisp White */
+    --cm-bg-app: #f3f8f2;
+    --cm-bg-surface: #ffffff;
+    --cm-bg-subtle: #eaf4e8;
+    --cm-bg-hover: #e1efe0;
+    --cm-bg-input: #ffffff;
+    --cm-bg-sidebar: #ecf5ea;
+    --cm-bg-overlay: rgba(15, 29, 18, 0.45);
+
+    /* Text Tokens — Deep Charcoal */
+    --cm-text-primary: #142217;
+    --cm-text-secondary: #334837;
+    --cm-text-muted: #5d7261;
+    --cm-text-inverse: #ffffff;
+
+    /* Border & Shadow Tokens */
+    --cm-border: #d9e7d8;
+    --cm-border-strong: #bfd4bd;
+    --cm-card-shadow: 0 1px 2px rgba(20, 34, 23, 0.04), 0 8px 22px -16px rgba(34, 72, 39, 0.10);
+
+    /* Brand & Accent Tokens — Fresh Lime Green & Soft Mint */
+    --cm-accent: #4d8b0e;
+    --cm-accent-hover: #3f730a;
+    --cm-accent-soft: #e9f7d4;
+    --cm-accent-text: #3a6b09;
+    --cm-accent-border: #bfe38b;
+    --cm-lime: #84cc16;
+    --cm-lime-soft: #ecfccb;
+    --cm-mint-grad-start: #e3f5e4;
+    --cm-mint-grad-end: #f6fbe8;
+
+    /* Pastel Yellow Highlight Tokens */
+    --cm-yellow-soft: #fef9c3;
+    --cm-yellow-border: #fde047;
+    --cm-yellow-text: #854d0e;
+
+    /* Status Semantic Tokens */
+    --cm-success: #15803d;
+    --cm-success-soft: #dcfce7;
+    --cm-success-border: #bbf7d0;
+    --cm-warning: #a16207;
+    --cm-warning-soft: #fef9c3;
+    --cm-warning-border: #fde047;
+    --cm-danger: #dc2626;
+    --cm-danger-soft: #fee2e2;
+    --cm-danger-border: #fecaca;
+    --cm-info: #0369a1;
+    --cm-info-soft: #e0f2fe;
+    --cm-info-border: #bae6fd;
+
+    /* Chart Tokens */
+    --cm-chart-primary: #65a30d;
+    --cm-chart-lime: #84cc16;
+    --cm-chart-mint: #16a34a;
+    --cm-chart-yellow: #eab308;
+    --cm-chart-muted: #94a3b8;
+    --cm-chart-grid: #dce8db;
+    --cm-chart-tick: #5d7261;
+    --cm-chart-tooltip-bg: #ffffff;
+    --cm-chart-tooltip-border: #d9e7d8;
+  }
+
+  :root.dark {
+    color-scheme: dark;
+
+    /* Deep Charcoal & Forest-Dark Surfaces */
+    --cm-bg-app: #0b120d;
+    --cm-bg-surface: #131f17;
+    --cm-bg-subtle: #1a291f;
+    --cm-bg-hover: #213427;
+    --cm-bg-input: #0d1610;
+    --cm-bg-sidebar: #0f1812;
+    --cm-bg-overlay: rgba(4, 9, 6, 0.78);
+
+    /* High-Contrast Legible Text Tokens */
+    --cm-text-primary: #f0f6f1;
+    --cm-text-secondary: #c4d5c8;
+    --cm-text-muted: #8aa08f;
+    --cm-text-inverse: #ffffff;
+
+    /* Subtle Dark Separation & Shadows */
+    --cm-border: #243629;
+    --cm-border-strong: #324a39;
+    --cm-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 24px -16px rgba(0, 0, 0, 0.45);
+
+    /* Fresh Lime & Muted Mint Accents in Dark Mode */
+    --cm-accent: #4d8a11;
+    --cm-accent-hover: #3e720b;
+    --cm-accent-soft: rgba(132, 204, 22, 0.16);
+    --cm-accent-text: #a3e635;
+    --cm-accent-border: rgba(163, 230, 53, 0.34);
+    --cm-lime: #84cc16;
+    --cm-lime-soft: rgba(132, 204, 22, 0.16);
+    --cm-mint-grad-start: rgba(132, 204, 22, 0.11);
+    --cm-mint-grad-end: rgba(22, 101, 52, 0.10);
+
+    /* Muted Pastel Yellow Highlights */
+    --cm-yellow-soft: rgba(250, 204, 21, 0.14);
+    --cm-yellow-border: rgba(250, 204, 21, 0.32);
+    --cm-yellow-text: #fde047;
+
+    /* Status Semantic Tokens */
+    --cm-success: #4ade80;
+    --cm-success-soft: rgba(34, 197, 94, 0.16);
+    --cm-success-border: rgba(34, 197, 94, 0.35);
+    --cm-warning: #facc15;
+    --cm-warning-soft: rgba(250, 204, 21, 0.15);
+    --cm-warning-border: rgba(250, 204, 21, 0.34);
+    --cm-danger: #f87171;
+    --cm-danger-soft: rgba(239, 68, 68, 0.16);
+    --cm-danger-border: rgba(239, 68, 68, 0.35);
+    --cm-info: #38bdf8;
+    --cm-info-soft: rgba(14, 165, 233, 0.16);
+    --cm-info-border: rgba(14, 165, 233, 0.35);
+
+    /* Chart Tokens */
+    --cm-chart-primary: #84cc16;
+    --cm-chart-lime: #a3e635;
+    --cm-chart-mint: #4ade80;
+    --cm-chart-yellow: #facc15;
+    --cm-chart-muted: #64748b;
+    --cm-chart-grid: #243629;
+    --cm-chart-tick: #8aa08f;
+    --cm-chart-tooltip-bg: #18261d;
+    --cm-chart-tooltip-border: #324a39;
   }
 
   body {
     font-family: var(--font-sans);
-    background-color: #f8fafc;
-    color: #0f172a;
+    background-color: var(--cm-bg-app);
+    color: var(--cm-text-primary);
+    transition: background-color 0.15s ease, color 0.15s ease;
   }
 
   h1, h2, h3, h4, .font-display {
@@ -24,5 +154,42 @@
 
   .tabular-nums {
     font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  .cm-surface {
+    background-color: var(--cm-bg-surface);
+    border-color: var(--cm-border);
+    color: var(--cm-text-primary);
+    box-shadow: var(--cm-card-shadow);
+  }
+
+  .cm-subtle {
+    background-color: var(--cm-bg-subtle);
+    border-color: var(--cm-border);
+    color: var(--cm-text-secondary);
+  }
+
+  .cm-hero-gradient {
+    background: linear-gradient(135deg, var(--cm-mint-grad-start) 0%, var(--cm-bg-surface) 58%, var(--cm-mint-grad-end) 100%);
+    border-color: var(--cm-border);
+    box-shadow: var(--cm-card-shadow);
+  }
+
+  .cm-yellow-highlight {
+    background-color: var(--cm-yellow-soft);
+    border-color: var(--cm-yellow-border);
+    color: var(--cm-yellow-text);
+  }
+
+  .cm-input {
+    background-color: var(--cm-bg-input);
+    border-color: var(--cm-border-strong);
+    color: var(--cm-text-primary);
+  }
+
+  .cm-input::placeholder {
+    color: var(--cm-text-muted);
   }
 }

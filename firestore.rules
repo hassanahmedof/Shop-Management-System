@@ -315,7 +315,9 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'ownerUid', 'productId', 'name', 'categoryName', 'brandName',
-          'salePrice', 'currentStock', 'unit', 'isActive', 'allowedStaffUids', 'updatedAt'
+          'salePrice', 'wholesalePrice', 'currentStock', 'unit', 'baseUnit', 'packagingUnits',
+          'originType', 'bottleSize', 'storageLocation', 'isReturnable', 'returnableUnitName', 'depositPerReturnable',
+          'isActive', 'allowedStaffUids', 'updatedAt'
         ])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
         && data.productId is string && isValidId(data.productId)
@@ -323,8 +325,17 @@ service cloud.firestore {
         && data.categoryName is string && data.categoryName.size() <= 100
         && data.brandName is string && data.brandName.size() <= 100
         && data.salePrice is number && data.salePrice >= 0
+        && (!('wholesalePrice' in data) || (data.wholesalePrice is number && data.wholesalePrice >= 0))
         && data.currentStock is number && data.currentStock >= 0
         && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 40
+        && (!('baseUnit' in data) || (data.baseUnit is string && data.baseUnit.size() >= 1 && data.baseUnit.size() <= 40))
+        && (!('packagingUnits' in data) || (data.packagingUnits is list && data.packagingUnits.size() <= 25 && (data.packagingUnits.size() == 0 || data.packagingUnits[0] is map)))
+        && (!('originType' in data) || (data.originType is string && data.originType in ['', 'local', 'imported']))
+        && (!('bottleSize' in data) || (data.bottleSize is string && data.bottleSize.size() <= 40))
+        && (!('storageLocation' in data) || (data.storageLocation is string && data.storageLocation.size() <= 80))
+        && (!('isReturnable' in data) || data.isReturnable is bool)
+        && (!('returnableUnitName' in data) || (data.returnableUnitName is string && data.returnableUnitName.size() <= 40))
+        && (!('depositPerReturnable' in data) || (data.depositPerReturnable is number && data.depositPerReturnable >= 0))
         && data.isActive is bool
         && data.allowedStaffUids is list && data.allowedStaffUids.size() <= 50
         && (data.allowedStaffUids.size() == 0 || data.allowedStaffUids[0] is string)
@@ -340,7 +351,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerUid', 'shopId', 'saleNumber', 'saleDate', 'saleDateTime', 'paymentMethod',
           'totalAmount', 'totalQuantity', 'itemCount', 'items', 'staffId', 'staffAuthUid',
-          'staffName', 'staffUsername', 'notes', 'status', 'syncedToLedger', 'createdAt', 'updatedAt'
+          'staffName', 'staffUsername', 'customerWhatsapp', 'notes', 'status', 'syncedToLedger', 'createdAt', 'updatedAt'
         ])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
         && data.shopId is string && data.shopId == shopId && data.shopId.size() <= 128
@@ -350,12 +361,13 @@ service cloud.firestore {
         && isValidPaymentMethod(data.paymentMethod)
         && data.totalAmount is number && data.totalAmount >= 0
         && data.totalQuantity is number && data.totalQuantity > 0
-        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 50
-        && data.items is list && data.items.size() >= 1 && data.items.size() <= 50 && data.items[0] is map
+        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 200
+        && data.items is list && data.items.size() >= 1 && data.items.size() <= 200 && data.items[0] is map
         && data.staffId is string && isValidId(data.staffId)
         && data.staffAuthUid is string && isValidId(data.staffAuthUid)
         && data.staffName is string && data.staffName.size() >= 1 && data.staffName.size() <= 120
         && data.staffUsername is string && data.staffUsername.size() >= 2 && data.staffUsername.size() <= 40
+        && (!('customerWhatsapp' in data) || data.customerWhatsapp == null || (data.customerWhatsapp is string && data.customerWhatsapp.size() <= 32))
         && data.notes is string && data.notes.size() <= 500
         && data.status is string && data.status in ['completed', 'cancelled']
         && data.syncedToLedger is bool
@@ -375,9 +387,11 @@ service cloud.firestore {
 
     function isValidBrand(data, shopId) {
       return data.keys().hasAll(['ownerUid', 'name', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['ownerUid', 'name', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'name', 'categoryIds', 'isActive', 'createdAt', 'updatedAt'])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && (!('categoryIds' in data) || (data.categoryIds is list && data.categoryIds.size() <= 25 && (data.categoryIds.size() == 0 || data.categoryIds[0] is string)))
+        && (!('isActive' in data) || data.isActive is bool)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -417,7 +431,9 @@ service cloud.firestore {
           'ownerUid', 'name', 'categoryId', 'categoryName', 'brandId', 'brandName',
           'purchasePrice', 'salePrice', 'wholesalePrice',
           'currentStock', 'minStockLevel', 'maxStockLevel',
-          'unit', 'supplierId', 'supplierName', 'expiryDate', 'profitMarginPct',
+          'unit', 'baseUnit', 'packagingUnits', 'originType', 'bottleSize', 'storageLocation',
+          'isReturnable', 'returnableUnitName', 'depositPerReturnable', 'emptyContainersOnHand',
+          'supplierId', 'supplierName', 'expiryDate', 'profitMarginPct',
           'isActive', 'createdAt', 'updatedAt'
         ])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
@@ -433,11 +449,64 @@ service cloud.firestore {
         && data.minStockLevel is number && data.minStockLevel >= 0
         && data.maxStockLevel is number && data.maxStockLevel >= 0
         && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 40
+        && (!('baseUnit' in data) || (data.baseUnit is string && data.baseUnit.size() >= 1 && data.baseUnit.size() <= 40))
+        && (!('packagingUnits' in data) || (data.packagingUnits is list && data.packagingUnits.size() <= 25 && (data.packagingUnits.size() == 0 || data.packagingUnits[0] is map)))
+        && (!('originType' in data) || (data.originType is string && data.originType in ['', 'local', 'imported']))
+        && (!('bottleSize' in data) || (data.bottleSize is string && data.bottleSize.size() <= 40))
+        && (!('storageLocation' in data) || (data.storageLocation is string && data.storageLocation.size() <= 80))
+        && (!('isReturnable' in data) || data.isReturnable is bool)
+        && (!('returnableUnitName' in data) || (data.returnableUnitName is string && data.returnableUnitName.size() <= 40))
+        && (!('depositPerReturnable' in data) || (data.depositPerReturnable is number && data.depositPerReturnable >= 0))
+        && (!('emptyContainersOnHand' in data) || (data.emptyContainersOnHand is number && data.emptyContainersOnHand >= 0))
         && data.supplierId is string && data.supplierId.size() <= 128
         && data.supplierName is string && data.supplierName.size() <= 150
         && isValidOptionalDateStr(data.expiryDate)
         && data.profitMarginPct is number && data.profitMarginPct >= -1000 && data.profitMarginPct <= 100
         && data.isActive is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidProductTemplate(data, shopId) {
+      return data.keys().hasAll([
+          'ownerUid', 'name', 'categoryId', 'categoryName', 'brandId', 'brandName',
+          'variant', 'baseUnit', 'isActive', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid', 'name', 'categoryId', 'categoryName', 'brandId', 'brandName',
+          'variant', 'originType', 'baseUnit', 'defaultPurchaseUnit', 'defaultSaleUnit',
+          'packagingUnits', 'hasUnconfirmedPackaging',
+          'suggestedPurchasePrice', 'suggestedSalePrice', 'suggestedWholesalePrice',
+          'priceSource', 'priceUpdatedAt', 'trackExpiry', 'bottleSize', 'storageLocation',
+          'isReturnable', 'returnableUnitName', 'searchKeywords',
+          'isActive', 'isCustom', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 180
+        && data.categoryId is string && data.categoryId.size() <= 128
+        && data.categoryName is string && data.categoryName.size() <= 100
+        && data.brandId is string && data.brandId.size() <= 128
+        && data.brandName is string && data.brandName.size() <= 100
+        && data.variant is string && data.variant.size() <= 120
+        && (!('originType' in data) || (data.originType is string && data.originType in ['', 'local', 'imported']))
+        && data.baseUnit is string && data.baseUnit.size() >= 1 && data.baseUnit.size() <= 40
+        && (!('defaultPurchaseUnit' in data) || (data.defaultPurchaseUnit is string && data.defaultPurchaseUnit.size() <= 40))
+        && (!('defaultSaleUnit' in data) || (data.defaultSaleUnit is string && data.defaultSaleUnit.size() <= 40))
+        && (!('packagingUnits' in data) || (data.packagingUnits is list && data.packagingUnits.size() <= 15 && (data.packagingUnits.size() == 0 || data.packagingUnits[0] is map)))
+        && (!('hasUnconfirmedPackaging' in data) || data.hasUnconfirmedPackaging is bool)
+        && (!('suggestedPurchasePrice' in data) || (data.suggestedPurchasePrice is number && data.suggestedPurchasePrice >= 0))
+        && (!('suggestedSalePrice' in data) || (data.suggestedSalePrice is number && data.suggestedSalePrice >= 0))
+        && (!('suggestedWholesalePrice' in data) || (data.suggestedWholesalePrice is number && data.suggestedWholesalePrice >= 0))
+        && (!('priceSource' in data) || (data.priceSource is string && data.priceSource.size() <= 150))
+        && (!('priceUpdatedAt' in data) || (data.priceUpdatedAt is string && data.priceUpdatedAt.size() <= 40))
+        && (!('trackExpiry' in data) || data.trackExpiry is bool)
+        && (!('bottleSize' in data) || (data.bottleSize is string && data.bottleSize.size() <= 40))
+        && (!('storageLocation' in data) || (data.storageLocation is string && data.storageLocation.size() <= 80))
+        && (!('isReturnable' in data) || data.isReturnable is bool)
+        && (!('returnableUnitName' in data) || (data.returnableUnitName is string && data.returnableUnitName.size() <= 40))
+        && (!('searchKeywords' in data) || (data.searchKeywords is list && data.searchKeywords.size() <= 15 && (data.searchKeywords.size() == 0 || data.searchKeywords[0] is string)))
+        && data.isActive is bool
+        && (!('isCustom' in data) || data.isCustom is bool)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -451,7 +520,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerUid', 'saleNumber', 'saleDate', 'saleDateTime', 'paymentMethod',
           'totalAmount', 'totalCost', 'totalProfit', 'totalQuantity', 'itemCount',
-          'staffId', 'staffName', 'recordedByRole', 'notes', 'status', 'createdAt', 'updatedAt'
+          'staffId', 'staffName', 'recordedByRole', 'customerWhatsapp', 'notes', 'status', 'createdAt', 'updatedAt'
         ])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
         && data.saleNumber is string && data.saleNumber.size() >= 1 && data.saleNumber.size() <= 40
@@ -466,6 +535,7 @@ service cloud.firestore {
         && (!('staffId' in data) || (data.staffId is string && data.staffId.size() <= 128))
         && (!('staffName' in data) || (data.staffName is string && data.staffName.size() <= 120))
         && (!('recordedByRole' in data) || (data.recordedByRole is string && data.recordedByRole in ['owner', 'staff']))
+        && (!('customerWhatsapp' in data) || data.customerWhatsapp == null || (data.customerWhatsapp is string && data.customerWhatsapp.size() <= 32))
         && data.notes is string && data.notes.size() <= 500
         && data.status is string && data.status in ['completed', 'cancelled']
         && data.createdAt is timestamp
@@ -482,8 +552,9 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerUid', 'saleId', 'saleDate', 'productId', 'productName',
           'categoryId', 'categoryName', 'brandId', 'brandName',
-          'quantity', 'salePricePerUnit', 'purchasePriceAtSale',
-          'lineTotal', 'lineCost', 'lineProfit', 'staffId', 'staffName', 'status', 'createdAt', 'updatedAt'
+          'quantity', 'unitName', 'unitQuantity', 'conversionFactor', 'baseQuantity',
+          'salePricePerUnit', 'purchasePriceAtSale',
+          'lineTotal', 'lineCost', 'lineProfit', 'batchAllocations', 'staffId', 'staffName', 'status', 'createdAt', 'updatedAt'
         ])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
         && data.saleId is string && isValidId(data.saleId)
@@ -495,11 +566,16 @@ service cloud.firestore {
         && data.brandId is string && data.brandId.size() <= 128
         && data.brandName is string && data.brandName.size() <= 100
         && data.quantity is number && data.quantity > 0
+        && (!('unitName' in data) || (data.unitName is string && data.unitName.size() <= 40))
+        && (!('unitQuantity' in data) || (data.unitQuantity is number && data.unitQuantity > 0))
+        && (!('conversionFactor' in data) || (data.conversionFactor is number && data.conversionFactor > 0))
+        && (!('baseQuantity' in data) || (data.baseQuantity is number && data.baseQuantity > 0))
         && data.salePricePerUnit is number && data.salePricePerUnit >= 0
         && data.purchasePriceAtSale is number && data.purchasePriceAtSale >= 0
         && data.lineTotal is number && data.lineTotal >= 0
         && data.lineCost is number && data.lineCost >= 0
         && data.lineProfit is number
+        && (!('batchAllocations' in data) || (data.batchAllocations is list && data.batchAllocations.size() <= 50 && (data.batchAllocations.size() == 0 || data.batchAllocations[0] is map)))
         && (!('staffId' in data) || (data.staffId is string && data.staffId.size() <= 128))
         && (!('staffName' in data) || (data.staffName is string && data.staffName.size() <= 120))
         && data.status is string && data.status in ['completed', 'cancelled']
@@ -543,8 +619,9 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'ownerUid', 'purchaseId', 'purchaseDate', 'supplierId',
-          'productId', 'productName', 'quantity', 'purchasePricePerUnit',
-          'lineTotal', 'status', 'createdAt', 'updatedAt'
+          'productId', 'productName', 'quantity',
+          'unitName', 'unitQuantity', 'conversionFactor', 'baseQuantity', 'expiryDate',
+          'purchasePricePerUnit', 'lineTotal', 'status', 'createdAt', 'updatedAt'
         ])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
         && data.purchaseId is string && isValidId(data.purchaseId)
@@ -553,6 +630,11 @@ service cloud.firestore {
         && data.productId is string && isValidId(data.productId)
         && data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 180
         && data.quantity is number && data.quantity > 0
+        && (!('unitName' in data) || (data.unitName is string && data.unitName.size() <= 40))
+        && (!('unitQuantity' in data) || (data.unitQuantity is number && data.unitQuantity > 0))
+        && (!('conversionFactor' in data) || (data.conversionFactor is number && data.conversionFactor > 0))
+        && (!('baseQuantity' in data) || (data.baseQuantity is number && data.baseQuantity > 0))
+        && (!('expiryDate' in data) || isValidOptionalDateStr(data.expiryDate))
         && data.purchasePricePerUnit is number && data.purchasePricePerUnit >= 0
         && data.lineTotal is number && data.lineTotal >= 0
         && data.status is string && data.status in ['completed', 'cancelled']
@@ -598,7 +680,9 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'ownerUid', 'productId', 'productName', 'movementDate', 'movementType',
-          'quantityChange', 'previousStock', 'newStock', 'referenceId', 'notes', 'createdAt'
+          'quantityChange', 'previousStock', 'newStock',
+          'unitName', 'unitQuantity', 'conversionFactor', 'baseQuantity',
+          'referenceId', 'notes', 'createdAt'
         ])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
         && data.productId is string && isValidId(data.productId)
@@ -612,6 +696,10 @@ service cloud.firestore {
         && data.quantityChange is number
         && data.previousStock is number && data.previousStock >= 0
         && data.newStock is number && data.newStock >= 0
+        && (!('unitName' in data) || (data.unitName is string && data.unitName.size() <= 40))
+        && (!('unitQuantity' in data) || (data.unitQuantity is number && data.unitQuantity > 0))
+        && (!('conversionFactor' in data) || (data.conversionFactor is number && data.conversionFactor > 0))
+        && (!('baseQuantity' in data) || (data.baseQuantity is number && data.baseQuantity > 0))
         && data.referenceId is string && data.referenceId.size() <= 128
         && data.notes is string && data.notes.size() <= 500
         && data.createdAt is timestamp;
@@ -624,7 +712,8 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'ownerUid', 'productId', 'productName', 'adjustmentDate', 'adjustmentType',
-          'quantity', 'reason', 'notes', 'previousStock', 'newStock', 'createdAt'
+          'quantity', 'unitName', 'unitQuantity', 'conversionFactor', 'baseQuantity',
+          'reason', 'notes', 'previousStock', 'newStock', 'createdAt'
         ])
         && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
         && data.productId is string && isValidId(data.productId)
@@ -632,11 +721,43 @@ service cloud.firestore {
         && isValidDateStr(data.adjustmentDate)
         && data.adjustmentType is string && data.adjustmentType in ['add', 'reduce', 'damaged', 'expired', 'missing']
         && data.quantity is number && data.quantity > 0
+        && (!('unitName' in data) || (data.unitName is string && data.unitName.size() <= 40))
+        && (!('unitQuantity' in data) || (data.unitQuantity is number && data.unitQuantity > 0))
+        && (!('conversionFactor' in data) || (data.conversionFactor is number && data.conversionFactor > 0))
+        && (!('baseQuantity' in data) || (data.baseQuantity is number && data.baseQuantity > 0))
         && data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 200
         && data.notes is string && data.notes.size() <= 500
         && data.previousStock is number && data.previousStock >= 0
         && data.newStock is number && data.newStock >= 0
         && data.createdAt is timestamp;
+    }
+
+    function isValidInventoryBatch(data, shopId) {
+      return data.keys().hasAll([
+          'ownerUid', 'productId', 'productName', 'purchaseId', 'purchaseNumber',
+          'purchaseDate', 'supplierId', 'supplierName', 'initialBaseQty', 'remainingBaseQty',
+          'unitCostInBase', 'expiryDate', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid', 'productId', 'productName', 'purchaseId', 'purchaseNumber',
+          'purchaseDate', 'supplierId', 'supplierName', 'initialBaseQty', 'remainingBaseQty',
+          'unitCostInBase', 'expiryDate', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
+        && data.productId is string && isValidId(data.productId)
+        && data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 180
+        && data.purchaseId is string && data.purchaseId.size() >= 1 && data.purchaseId.size() <= 128
+        && data.purchaseNumber is string && data.purchaseNumber.size() >= 1 && data.purchaseNumber.size() <= 40
+        && isValidDateStr(data.purchaseDate)
+        && data.supplierId is string && data.supplierId.size() <= 128
+        && data.supplierName is string && data.supplierName.size() <= 150
+        && data.initialBaseQty is number && data.initialBaseQty > 0
+        && data.remainingBaseQty is number && data.remainingBaseQty >= 0 && data.remainingBaseQty <= data.initialBaseQty
+        && data.unitCostInBase is number && data.unitCostInBase >= 0
+        && isValidOptionalDateStr(data.expiryDate)
+        && data.status is string && data.status in ['active', 'exhausted', 'cancelled']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
     }
 
     function isValidAuditLog(data, shopId) {
@@ -1006,7 +1127,7 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly([
             'syncedToLedger', 'status', 'notes', 'saleDate', 'paymentMethod',
-            'totalAmount', 'totalQuantity', 'itemCount', 'items', 'updatedAt'
+            'totalAmount', 'totalQuantity', 'itemCount', 'items', 'customerWhatsapp', 'updatedAt'
           ]);
         allow delete: if false;
       }
@@ -1073,7 +1194,7 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && shopExists(shopId)
-          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'updatedAt']);
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'categoryIds', 'isActive', 'updatedAt']);
         allow delete: if isOwner(shopId) && isValidId(brandId) && shopExists(shopId) && existing().ownerUid == shopId;
       }
 
@@ -1121,11 +1242,16 @@ service cloud.firestore {
               'name', 'categoryId', 'categoryName', 'brandId', 'brandName',
               'purchasePrice', 'salePrice', 'wholesalePrice',
               'minStockLevel', 'maxStockLevel', 'unit',
+              'baseUnit', 'packagingUnits', 'originType', 'bottleSize', 'storageLocation',
+              'isReturnable', 'returnableUnitName', 'depositPerReturnable', 'emptyContainersOnHand',
               'supplierId', 'supplierName', 'expiryDate', 'profitMarginPct',
               'isActive', 'updatedAt'
             ]) ||
             incoming().diff(existing()).affectedKeys().hasOnly([
               'currentStock', 'purchasePrice', 'profitMarginPct', 'updatedAt'
+            ]) ||
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'currentStock', 'emptyContainersOnHand', 'updatedAt'
             ]) ||
             incoming().diff(existing()).affectedKeys().hasOnly([
               'currentStock', 'updatedAt'
@@ -1156,7 +1282,7 @@ service cloud.firestore {
           && (
             (incoming().status == 'completed' && incoming().diff(existing()).affectedKeys().hasOnly([
               'saleDate', 'paymentMethod', 'totalAmount', 'totalCost', 'totalProfit',
-              'totalQuantity', 'itemCount', 'notes', 'updatedAt'
+              'totalQuantity', 'itemCount', 'customerWhatsapp', 'notes', 'updatedAt'
             ])) ||
             (incoming().status == 'cancelled' && incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'notes', 'updatedAt'
@@ -1186,7 +1312,9 @@ service cloud.firestore {
           && shopExists(shopId)
           && (
             (incoming().status == 'completed' && incoming().diff(existing()).affectedKeys().hasOnly([
-              'saleDate', 'quantity', 'salePricePerUnit', 'lineTotal', 'lineCost', 'lineProfit', 'updatedAt'
+              'saleDate', 'quantity', 'unitName', 'unitQuantity', 'conversionFactor', 'baseQuantity',
+              'salePricePerUnit', 'purchasePriceAtSale', 'lineTotal', 'lineCost', 'lineProfit',
+              'batchAllocations', 'updatedAt'
             ])) ||
             (incoming().status == 'cancelled' && incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'updatedAt'
@@ -1314,6 +1442,34 @@ service cloud.firestore {
         allow update, delete: if false;
       }
 
+      match /inventoryBatches/{batchId} {
+        allow get: if isOwner(shopId) && isValidId(batchId) && (resource == null || (shopExists(shopId) && existing().ownerUid == shopId));
+        allow list: if isOwner(shopId) && existing().ownerUid == shopId;
+        allow create: if isOwner(shopId)
+          && isValidId(batchId)
+          && isValidInventoryBatch(incoming(), shopId)
+          && incoming().status == 'active'
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && shopExists(shopId);
+        allow update: if isOwner(shopId)
+          && isValidId(batchId)
+          && isValidInventoryBatch(incoming(), shopId)
+          && existing().status != 'cancelled'
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().productId == existing().productId
+          && incoming().purchaseId == existing().purchaseId
+          && incoming().initialBaseQty == existing().initialBaseQty
+          && incoming().unitCostInBase == existing().unitCostInBase
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && shopExists(shopId)
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'remainingBaseQty', 'status', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+
       match /auditLogs/{logId} {
         allow get: if isOwner(shopId) && isValidId(logId) && (resource == null || (shopExists(shopId) && existing().ownerUid == shopId));
         allow list: if isOwner(shopId) && existing().ownerUid == shopId;
@@ -1393,6 +1549,34 @@ service cloud.firestore {
             'targetSheets', 'recordCount', 'status', 'retryCount', 'lastError', 'summary', 'updatedAt'
           ]);
         allow delete: if isOwner(shopId) && isValidId(jobId) && shopExists(shopId) && existing().ownerUid == shopId;
+      }
+
+      match /productTemplates/{templateId} {
+        allow get: if isOwner(shopId) && isValidId(templateId) && (resource == null || (shopExists(shopId) && existing().ownerUid == shopId));
+        allow list: if isOwner(shopId) && existing().ownerUid == shopId;
+        allow create: if isOwner(shopId)
+          && isValidId(templateId)
+          && isValidProductTemplate(incoming(), shopId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && shopExists(shopId);
+        allow update: if isOwner(shopId)
+          && isValidId(templateId)
+          && isValidProductTemplate(incoming(), shopId)
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && shopExists(shopId)
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'categoryId', 'categoryName', 'brandId', 'brandName',
+            'variant', 'originType', 'baseUnit', 'defaultPurchaseUnit', 'defaultSaleUnit',
+            'packagingUnits', 'hasUnconfirmedPackaging',
+            'suggestedPurchasePrice', 'suggestedSalePrice', 'suggestedWholesalePrice',
+            'priceSource', 'priceUpdatedAt', 'trackExpiry', 'bottleSize', 'storageLocation',
+            'isReturnable', 'returnableUnitName', 'searchKeywords',
+            'isActive', 'isCustom', 'updatedAt'
+          ]);
+        allow delete: if isOwner(shopId) && isValidId(templateId) && shopExists(shopId) && existing().ownerUid == shopId;
       }
     }
   }

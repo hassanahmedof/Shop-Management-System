@@ -25,6 +25,8 @@ export interface ScoredSelectOption {
  * Ranks and filters SearchableSelectOption items using tokenized, partial-word,
  * case-insensitive matching across label, subtitle, meta, and hidden keywords.
  */
+import { recordPerfMetric, startPerfTimer } from '../utils/perfMonitor';
+
 export function filterAndRankSelectOptions(
   options: SearchableSelectOption[],
   rawQuery: string
@@ -34,20 +36,23 @@ export function filterAndRankSelectOptions(
     return options;
   }
 
+  const stopTimer = startPerfTimer();
   const normalizedQuery = tokens.join(' ');
   const scored: ScoredSelectOption[] = [];
 
-  for (const opt of options) {
+  for (let i = 0; i < options.length; i += 1) {
+    const opt = options[i];
     const labelLower = opt.label.toLowerCase();
     const subtitleLower = (opt.subtitle || '').toLowerCase();
     const metaLower = (opt.meta || '').toLowerCase();
-    const keywordsLower = (opt.keywords || []).join(' ').toLowerCase();
+    const keywordsLower = opt.keywords?.length ? opt.keywords.join(' ').toLowerCase() : '';
     const combined = `${labelLower} ${subtitleLower} ${metaLower} ${keywordsLower}`;
 
     let allMatched = true;
     let score = 0;
 
-    for (const token of tokens) {
+    for (let t = 0; t < tokens.length; t += 1) {
+      const token = tokens[t];
       if (!combined.includes(token)) {
         allMatched = false;
         break;
@@ -57,10 +62,9 @@ export function filterAndRankSelectOptions(
         score += 90;
       } else if (labelLower.startsWith(token)) {
         score += 60;
-      } else if (labelLower.split(/[\s\-_/]+/).some((w) => w.startsWith(token))) {
-        score += 45;
       } else if (labelLower.includes(token)) {
-        score += 30;
+        const wordMatch = labelLower.split(/[\s\-_/]+/).some((w) => w.startsWith(token));
+        score += wordMatch ? 45 : 30;
       } else if (subtitleLower.startsWith(token)) {
         score += 22;
       } else if (subtitleLower.includes(token)) {
@@ -87,6 +91,13 @@ export function filterAndRankSelectOptions(
     if (b.score !== a.score) return b.score - a.score;
     return a.option.label.localeCompare(b.option.label);
   });
+
+  if (options.length >= 50) {
+    recordPerfMetric('catalog_search', 'search_select_options', stopTimer(), {
+      optionCount: options.length,
+      matchCount: scored.length,
+    });
+  }
 
   return scored.map((s) => s.option);
 }

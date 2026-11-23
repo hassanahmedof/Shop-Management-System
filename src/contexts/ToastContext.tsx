@@ -95,26 +95,30 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       case 'warning':
         return {
           icon: AlertTriangle,
-          iconWrap: 'bg-amber-50 text-amber-700 border border-amber-200',
-          titleColor: 'text-amber-900',
+          iconWrap:
+            'bg-[var(--cm-warning-soft)] text-[var(--cm-warning)] border border-[var(--cm-warning-border)]',
+          titleColor: 'text-[var(--cm-warning)]',
         };
       case 'error':
         return {
           icon: AlertCircle,
-          iconWrap: 'bg-red-50 text-red-700 border border-red-200',
-          titleColor: 'text-red-900',
+          iconWrap:
+            'bg-[var(--cm-danger-soft)] text-[var(--cm-danger)] border border-[var(--cm-danger-border)]',
+          titleColor: 'text-[var(--cm-danger)]',
         };
       case 'success':
         return {
           icon: CheckCircle2,
-          iconWrap: 'bg-emerald-50 text-emerald-700 border border-emerald-200',
-          titleColor: 'text-emerald-900',
+          iconWrap:
+            'bg-[var(--cm-success-soft)] text-[var(--cm-success)] border border-[var(--cm-success-border)]',
+          titleColor: 'text-[var(--cm-success)]',
         };
       default:
         return {
           icon: Info,
-          iconWrap: 'bg-teal-50 text-teal-700 border border-teal-200',
-          titleColor: 'text-slate-900',
+          iconWrap:
+            'bg-[var(--cm-accent-soft)] text-[var(--cm-accent-text)] border border-[var(--cm-accent-border)]',
+          titleColor: 'text-[var(--cm-text-primary)]',
         };
     }
   };
@@ -135,7 +139,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               <div
                 key={toast.id}
                 role={toast.tone === 'error' || toast.tone === 'warning' ? 'alert' : 'status'}
-                className="pointer-events-auto bg-white border border-slate-200 rounded-xl shadow-lg p-4 flex items-start gap-3"
+                className="pointer-events-auto bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-xl shadow-lg p-4 flex items-start gap-3"
               >
                 <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${visuals.iconWrap}`}>
                   <Icon className="w-4 h-4" />
@@ -148,13 +152,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                     <button
                       type="button"
                       onClick={() => dismissToast(toast.id)}
-                      className="p-1 -mr-1 -mt-1 text-slate-400 hover:text-slate-700 rounded-md cursor-pointer"
+                      className="p-1 -mr-1 -mt-1 text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] rounded-md cursor-pointer"
                       aria-label="Dismiss notification"
                     >
                       <X className="w-4 h-4" />
                     </button>
                   </div>
-                  <p className="text-xs text-slate-600 leading-relaxed">{toast.message}</p>
+                  <p className="text-xs text-[var(--cm-text-secondary)] leading-relaxed">{toast.message}</p>
                   {toast.actionLabel && toast.onAction && (
                     <div className="pt-1 flex items-center gap-3">
                       <button
@@ -163,14 +167,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                           toast.onAction?.();
                           dismissToast(toast.id);
                         }}
-                        className="inline-flex items-center px-3 py-1.5 text-xs font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg transition-colors cursor-pointer"
+                        className="inline-flex items-center px-3 py-1.5 text-xs font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg transition-colors cursor-pointer"
                       >
                         {toast.actionLabel}
                       </button>
                       <button
                         type="button"
                         onClick={() => dismissToast(toast.id)}
-                        className="text-xs font-medium text-slate-500 hover:text-slate-800 cursor-pointer"
+                        className="text-xs font-medium text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] cursor-pointer"
                       >
                         Dismiss
                       </button>

@@ -6,6 +6,7 @@ import {
   searchProductsCatalog,
 } from '../services/productSearchService';
 import { formatNumber, formatPKR } from '../utils/formatters';
+import { formatStockBreakdown, getDefaultSaleUnit } from '../utils/packaging';
 
 interface SpeechRecognitionAlternativeLike {
   transcript: string;
@@ -71,7 +72,7 @@ function HighlightedText({ text, query }: { text: string; query: string }) {
         seg.match ? (
           <mark
             key={idx}
-            className="bg-amber-100 text-slate-900 rounded-xs px-0.5 font-semibold"
+            className="bg-[var(--cm-warning-soft)] text-[var(--cm-text-primary)] rounded-xs px-0.5 font-semibold"
           >
             {seg.text}
           </mark>
@@ -164,15 +165,26 @@ export function SearchableProductSelector({
     }
   }, [isOpen, stopVoiceSearch]);
 
-  // Debounce search slightly (150ms) for smooth performance on 500-5,000+ products
+  // Fast search debounce (50ms) with instant clear for snappy POS typing
   useEffect(() => {
+    if (!queryText) {
+      setDebouncedQuery('');
+      setVisibleCount(RESULTS_PAGE_SIZE);
+      setActiveIndex(0);
+      return;
+    }
     const timer = window.setTimeout(() => {
       setDebouncedQuery(queryText);
       setVisibleCount(RESULTS_PAGE_SIZE);
       setActiveIndex(0);
-    }, 150);
+    }, 50);
     return () => window.clearTimeout(timer);
   }, [queryText]);
+
+  const activeCatalogCount = useMemo(
+    () => items.reduce((count, i) => (i.isActive ? count + 1 : count), 0),
+    [items]
+  );
 
   // Trigger optional direct database refresh once if catalog happens to be empty on open
   useEffect(() => {
@@ -400,14 +412,14 @@ export function SearchableProductSelector({
   const renderResultsBody = () => {
     if (!hasSearchQuery) {
       return (
-        <div className="p-4 text-xs text-slate-500 space-y-1">
-          <p className="font-medium text-slate-700">
+        <div className="p-4 text-xs text-[var(--cm-text-muted)] space-y-1">
+          <p className="font-medium text-[var(--cm-text-secondary)]">
             {enableVoiceSearch
               ? 'Type or tap the microphone to search products'
               : 'Type a product name, brand, or category to search'}
           </p>
           <p>
-            Searching across {formatNumber(items.filter((i) => i.isActive).length)} active catalog items. Results update instantly.
+            Searching across {formatNumber(activeCatalogCount)} active catalog items. Results update instantly.
           </p>
         </div>
       );
@@ -416,14 +428,14 @@ export function SearchableProductSelector({
     if (matchedResults.length === 0) {
       return (
         <div className="p-5 text-center space-y-2">
-          <p className="text-sm font-medium text-slate-700">No products found</p>
-          <p className="text-xs text-slate-500">
+          <p className="text-sm font-medium text-[var(--cm-text-secondary)]">No products found</p>
+          <p className="text-xs text-[var(--cm-text-muted)]">
             No active products match &ldquo;{trimmedQuery}&rdquo;. Try a shorter word, brand, or category.
           </p>
           <button
             type="button"
             onClick={handleClearSearch}
-            className="px-3 py-1.5 text-xs font-semibold text-teal-700 border border-teal-200 hover:bg-teal-50 rounded-lg cursor-pointer"
+            className="px-3 py-1.5 text-xs font-semibold text-[var(--cm-accent-text)] border border-[var(--cm-accent-border)] hover:bg-[var(--cm-accent-soft)] rounded-lg cursor-pointer"
           >
             Clear Search
           </button>
@@ -433,20 +445,22 @@ export function SearchableProductSelector({
 
     return (
       <>
-        <div className="px-3.5 py-2 bg-slate-50 border-b border-slate-100 flex items-center justify-between text-[11px] text-slate-500 font-mono-num tabular-nums">
+        <div className="px-3.5 py-2 bg-[var(--cm-bg-subtle)] border-b border-[var(--cm-border)] flex items-center justify-between text-[11px] text-[var(--cm-text-muted)] font-mono-num tabular-nums">
           <span>
             Showing {formatNumber(paginatedResults.length)} of {formatNumber(matchedResults.length)} matches
           </span>
           {!allowOutOfStock && <span>Out-of-stock items locked</span>}
         </div>
 
-        <ul role="listbox" className="divide-y divide-slate-100">
+        <ul role="listbox" className="divide-y divide-[var(--cm-border)]">
           {paginatedResults.map(({ item }, idx) => {
             const isOutOfStock = item.currentStock <= 0;
             const isLowStock = item.currentStock > 0 && item.currentStock <= 10;
             const isDisabled = isOutOfStock && !allowOutOfStock;
             const isHighlightedRow = idx === activeIndex;
             const isSelected = item.id === selectedProductId;
+            const breakdown = formatStockBreakdown(item.currentStock, item);
+            const defSale = getDefaultSaleUnit(item);
 
             return (
               <li key={item.id} role="option" aria-selected={isSelected}>
@@ -456,34 +470,39 @@ export function SearchableProductSelector({
                   onClick={() => handlePickItem(item)}
                   className={`w-full text-left px-3.5 py-2.5 min-h-[52px] transition-colors flex flex-col gap-0.5 cursor-pointer ${
                     isDisabled
-                      ? 'bg-slate-50/80 opacity-65 hover:bg-slate-100'
+                      ? 'bg-[var(--cm-bg-subtle)] opacity-60 hover:bg-[var(--cm-bg-hover)]'
                       : isHighlightedRow
-                      ? 'bg-teal-50/70'
+                      ? 'bg-[var(--cm-accent-soft)]'
                       : isSelected
-                      ? 'bg-teal-50/40'
-                      : 'hover:bg-slate-50'
+                      ? 'bg-[var(--cm-accent-soft)]'
+                      : 'hover:bg-[var(--cm-bg-hover)]'
                   }`}
                 >
                   <div className="flex items-start justify-between gap-2">
-                    <span className="text-sm font-medium text-slate-900 leading-snug">
+                    <span className="text-sm font-medium text-[var(--cm-text-primary)] leading-snug">
                       <HighlightedText text={item.name} query={trimmedQuery} />
+                      {item.bottleSize && (
+                        <span className="ml-1.5 text-[11px] font-mono-num text-[var(--cm-text-muted)]">
+                          ({item.bottleSize})
+                        </span>
+                      )}
                     </span>
                     <span
                       className={`text-xs font-semibold whitespace-nowrap shrink-0 ${
                         isOutOfStock
-                          ? 'text-red-600'
+                          ? 'text-[var(--cm-danger)]'
                           : isLowStock
-                          ? 'text-amber-700'
-                          : 'text-emerald-700'
+                          ? 'text-[var(--cm-warning)]'
+                          : 'text-[var(--cm-success)]'
                       }`}
                     >
                       {isOutOfStock ? 'Out of Stock' : isLowStock ? 'Low Stock' : 'In Stock'}
                     </span>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-600 font-mono-num tabular-nums">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[var(--cm-text-secondary)] font-mono-num tabular-nums">
                     <span className="font-sans">
-                      <span className="font-medium text-slate-700">
+                      <span className="font-medium text-[var(--cm-text-primary)]">
                         {item.brandName ? (
                           <HighlightedText text={item.brandName} query={trimmedQuery} />
                         ) : (
@@ -493,25 +512,35 @@ export function SearchableProductSelector({
                     </span>
                     {item.categoryName && (
                       <>
-                        <span aria-hidden="true" className="text-slate-300">
+                        <span aria-hidden="true" className="text-[var(--cm-border-strong)]">
                           ·
                         </span>
-                        <span className="font-sans text-slate-500">
+                        <span className="font-sans text-[var(--cm-text-muted)]">
                           <HighlightedText text={item.categoryName} query={trimmedQuery} />
                         </span>
                       </>
                     )}
-                    <span aria-hidden="true" className="text-slate-300">
+                    {item.storageLocation && (
+                      <>
+                        <span aria-hidden="true" className="text-[var(--cm-border-strong)]">
+                          ·
+                        </span>
+                        <span className="font-sans text-[var(--cm-info)]">
+                          {item.storageLocation}
+                        </span>
+                      </>
+                    )}
+                    <span aria-hidden="true" className="text-[var(--cm-border-strong)]">
                       |
                     </span>
-                    <span className={isOutOfStock ? 'text-red-600 font-semibold' : 'text-slate-700'}>
-                      Stock: {formatNumber(item.currentStock)} {item.unit}
+                    <span className={isOutOfStock ? 'text-[var(--cm-danger)] font-semibold' : 'text-[var(--cm-text-secondary)]'}>
+                      Stock: {breakdown.summaryText}
                     </span>
-                    <span aria-hidden="true" className="text-slate-300">
+                    <span aria-hidden="true" className="text-[var(--cm-border-strong)]">
                       |
                     </span>
-                    <span className="font-semibold text-slate-900">
-                      {formatPKR(item.salePrice)}
+                    <span className="font-semibold text-[var(--cm-text-primary)]">
+                      {formatPKR(defSale.salePrice)}/{defSale.unitName}
                     </span>
                   </div>
                 </button>
@@ -521,13 +550,13 @@ export function SearchableProductSelector({
         </ul>
 
         {visibleCount < matchedResults.length && (
-          <div className="p-2.5 border-t border-slate-100 bg-slate-50 text-center">
+          <div className="p-2.5 border-t border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-center">
             <button
               type="button"
               onClick={() =>
                 setVisibleCount((prev) => Math.min(prev + RESULTS_PAGE_SIZE, matchedResults.length))
               }
-              className="px-3.5 py-1.5 text-xs font-semibold text-teal-700 hover:text-teal-800 bg-white border border-slate-200 rounded-lg cursor-pointer"
+              className="px-3.5 py-1.5 text-xs font-semibold text-[var(--cm-accent-text)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg cursor-pointer"
             >
               Load {Math.min(RESULTS_PAGE_SIZE, matchedResults.length - visibleCount)} More Results
             </button>
@@ -546,19 +575,21 @@ export function SearchableProductSelector({
             id={inputId}
             type="button"
             onClick={handleOpenPicker}
-            className="flex-1 min-w-0 min-h-[44px] px-3 py-2 text-left text-sm bg-white border border-slate-200 hover:border-slate-300 focus:border-teal-600 rounded-lg flex items-center justify-between gap-2 transition-colors cursor-pointer"
+            className="flex-1 min-w-0 min-h-[44px] px-3 py-2 text-left text-sm cm-input border hover:border-[var(--cm-border-strong)] focus:border-[var(--cm-accent)] rounded-lg flex items-center justify-between gap-2 transition-colors cursor-pointer"
           >
             <span className="flex items-center gap-2 min-w-0 flex-1">
-              <Search className="w-4 h-4 text-slate-400 shrink-0" />
+              <Search className="w-4 h-4 text-[var(--cm-text-muted)] shrink-0" />
               <span
                 className={`truncate ${
-                  selectedItem && mode === 'inline' ? 'text-slate-900 font-medium' : 'text-slate-400'
+                  selectedItem && mode === 'inline'
+                    ? 'text-[var(--cm-text-primary)] font-medium'
+                    : 'text-[var(--cm-text-muted)]'
                 }`}
               >
                 {selectedItem && mode === 'inline' ? selectedItem.name : placeholder}
               </span>
             </span>
-            <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+            <ChevronDown className="w-4 h-4 text-[var(--cm-text-muted)] shrink-0" />
           </button>
 
           {enableVoiceSearch && (
@@ -569,8 +600,8 @@ export function SearchableProductSelector({
               title={isListening ? 'Stop voice search' : 'Voice search'}
               className={`min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg border transition-colors cursor-pointer shrink-0 ${
                 isListening
-                  ? 'bg-red-50 border-red-300 text-red-600'
-                  : 'bg-white border-slate-200 text-slate-600 hover:text-teal-700 hover:border-teal-300'
+                  ? 'bg-[var(--cm-danger-soft)] border-[var(--cm-danger-border)] text-[var(--cm-danger)]'
+                  : 'bg-[var(--cm-bg-surface)] border-[var(--cm-border)] text-[var(--cm-text-secondary)] hover:text-[var(--cm-accent-text)] hover:border-[var(--cm-accent-border)]'
               }`}
             >
               {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
@@ -579,7 +610,7 @@ export function SearchableProductSelector({
         </div>
       ) : (
         <div className="relative">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <Search className="w-4 h-4 text-[var(--cm-text-muted)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
           <input
             ref={desktopInputRef}
             id={inputId}
@@ -597,7 +628,7 @@ export function SearchableProductSelector({
             role="combobox"
             aria-expanded={isOpen}
             aria-autocomplete="list"
-            className={`w-full min-h-[42px] pl-9 py-2 text-sm border border-slate-200 rounded-lg bg-white text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-teal-600 ${
+            className={`w-full min-h-[42px] pl-9 py-2 text-sm border cm-input rounded-lg focus:outline-none focus:border-[var(--cm-accent)] ${
               enableVoiceSearch ? 'pr-16' : 'pr-9'
             }`}
           />
@@ -617,7 +648,7 @@ export function SearchableProductSelector({
                   }
                 }}
                 aria-label="Clear search"
-                className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md cursor-pointer"
+                className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] rounded-md cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -630,8 +661,8 @@ export function SearchableProductSelector({
                 title={isListening ? 'Stop voice search' : 'Voice search'}
                 className={`p-1.5 rounded-md transition-colors cursor-pointer ${
                   isListening
-                    ? 'text-red-600 bg-red-50'
-                    : 'text-slate-400 hover:text-teal-700 hover:bg-teal-50'
+                    ? 'text-[var(--cm-danger)] bg-[var(--cm-danger-soft)]'
+                    : 'text-[var(--cm-text-muted)] hover:text-[var(--cm-accent-text)] hover:bg-[var(--cm-accent-soft)]'
                 }`}
               >
                 {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
@@ -643,9 +674,9 @@ export function SearchableProductSelector({
 
       {/* Desktop Inline Popover Panel */}
       {isOpen && !isMobile && (
-        <div className="absolute left-0 right-0 mt-1.5 z-40 bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
+        <div className="absolute left-0 right-0 mt-1.5 z-40 bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-xl shadow-lg overflow-hidden">
           {enableVoiceSearch && isListening && (
-            <div className="px-3.5 py-2 bg-teal-50 border-b border-teal-200 flex items-center justify-between gap-2 text-xs text-teal-800">
+            <div className="px-3.5 py-2 bg-[var(--cm-accent-soft)] border-b border-[var(--cm-accent-border)] flex items-center justify-between gap-2 text-xs text-[var(--cm-accent-text)]">
               <span className="font-medium">Listening... Speak product name</span>
               <button
                 type="button"
@@ -657,12 +688,12 @@ export function SearchableProductSelector({
             </div>
           )}
           {enableVoiceSearch && voiceNotice && (
-            <div className="px-3.5 py-2 bg-amber-50 border-b border-amber-200 text-xs font-medium text-amber-800">
+            <div className="px-3.5 py-2 bg-[var(--cm-warning-soft)] border-b border-[var(--cm-warning-border)] text-xs font-medium text-[var(--cm-warning)]">
               {voiceNotice}
             </div>
           )}
           {stockNotice && (
-            <div className="px-3.5 py-2 bg-red-50 border-b border-red-200 text-xs font-medium text-red-700">
+            <div className="px-3.5 py-2 bg-[var(--cm-danger-soft)] border-b border-[var(--cm-danger-border)] text-xs font-medium text-[var(--cm-danger)]">
               {stockNotice}
             </div>
           )}
@@ -675,12 +706,12 @@ export function SearchableProductSelector({
       {/* Mobile Full-Screen Searchable Picker */}
       {isOpen && isMobile && (
         <div
-          className="fixed inset-0 z-50 bg-white flex flex-col"
+          className="fixed inset-0 z-50 bg-[var(--cm-bg-surface)] flex flex-col"
           role="dialog"
           aria-modal="true"
           aria-label="Search products"
         >
-          <div className="p-3 border-b border-slate-200 bg-white flex items-center gap-2 shrink-0">
+          <div className="p-3 border-b border-[var(--cm-border)] bg-[var(--cm-bg-surface)] flex items-center gap-2 shrink-0">
             <button
               type="button"
               onClick={() => {
@@ -690,13 +721,13 @@ export function SearchableProductSelector({
                 setVoiceNotice(null);
               }}
               aria-label="Close product search"
-              className="min-w-[44px] min-h-[44px] flex items-center justify-center text-slate-600 hover:text-slate-900 rounded-lg cursor-pointer"
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)] rounded-lg cursor-pointer"
             >
               <ArrowLeft className="w-5 h-5" />
             </button>
 
             <div className="relative flex-1 min-w-0">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <Search className="w-4 h-4 text-[var(--cm-text-muted)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 ref={mobileInputRef}
                 type="text"
@@ -708,7 +739,7 @@ export function SearchableProductSelector({
                 onKeyDown={handleKeyDown}
                 placeholder={placeholder}
                 autoComplete="off"
-                className={`w-full min-h-[44px] pl-9 py-2 text-sm border border-slate-200 rounded-lg bg-slate-50 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:border-teal-600 ${
+                className={`w-full min-h-[44px] pl-9 py-2 text-sm border cm-input rounded-lg focus:outline-none focus:border-[var(--cm-accent)] ${
                   enableVoiceSearch ? 'pr-20' : 'pr-10'
                 }`}
               />
@@ -718,7 +749,7 @@ export function SearchableProductSelector({
                     type="button"
                     onClick={handleClearSearch}
                     aria-label="Clear search"
-                    className="min-w-[36px] min-h-[36px] flex items-center justify-center text-slate-400 hover:text-slate-700 rounded-md cursor-pointer"
+                    className="min-w-[36px] min-h-[36px] flex items-center justify-center text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] rounded-md cursor-pointer"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -729,7 +760,7 @@ export function SearchableProductSelector({
                     onClick={handleToggleVoice}
                     aria-label={isListening ? 'Stop voice search' : 'Search product by voice'}
                     className={`min-w-[36px] min-h-[36px] flex items-center justify-center rounded-md cursor-pointer ${
-                      isListening ? 'text-red-600 bg-red-50' : 'text-slate-500 hover:text-teal-700'
+                      isListening ? 'text-[var(--cm-danger)] bg-[var(--cm-danger-soft)]' : 'text-[var(--cm-text-muted)] hover:text-[var(--cm-accent-text)]'
                     }`}
                   >
                     {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
@@ -740,7 +771,7 @@ export function SearchableProductSelector({
           </div>
 
           {enableVoiceSearch && isListening && (
-            <div className="px-4 py-2.5 bg-teal-50 border-b border-teal-200 flex items-center justify-between text-xs text-teal-800 shrink-0">
+            <div className="px-4 py-2.5 bg-[var(--cm-accent-soft)] border-b border-[var(--cm-accent-border)] flex items-center justify-between text-xs text-[var(--cm-accent-text)] shrink-0">
               <span className="font-medium">Listening... Speak product name</span>
               <button
                 type="button"
@@ -753,18 +784,18 @@ export function SearchableProductSelector({
           )}
 
           {enableVoiceSearch && voiceNotice && (
-            <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-200 text-xs font-medium text-amber-800 shrink-0">
+            <div className="px-4 py-2.5 bg-[var(--cm-warning-soft)] border-b border-[var(--cm-warning-border)] text-xs font-medium text-[var(--cm-warning)] shrink-0">
               {voiceNotice}
             </div>
           )}
 
           {stockNotice && (
-            <div className="px-4 py-2.5 bg-red-50 border-b border-red-200 text-xs font-medium text-red-700 shrink-0">
+            <div className="px-4 py-2.5 bg-[var(--cm-danger-soft)] border-b border-[var(--cm-danger-border)] text-xs font-medium text-[var(--cm-danger)] shrink-0">
               {stockNotice}
             </div>
           )}
 
-          <div onScroll={handleResultsScroll} className="flex-1 overflow-y-auto bg-white">
+          <div onScroll={handleResultsScroll} className="flex-1 overflow-y-auto bg-[var(--cm-bg-surface)]">
             {renderResultsBody()}
           </div>
         </div>

@@ -6,7 +6,14 @@ import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import type { DiscordTransactionNotificationPayload } from './shared/discordSchema.ts';
 import type { SheetSyncPayload } from './shared/googleSheetsSchema.ts';
-import { sendDiscordTransactionNotification } from './server/discordNotifier.ts';
+import {
+  getDiscordCapabilities,
+  removeDiscordWebhookForOwner,
+  saveDiscordWebhookForOwner,
+  sendDiscordTestNotification,
+  sendDiscordTransactionNotification,
+  verifyDiscordWebhookLive,
+} from './server/discordNotifier.ts';
 import {
   ensureBusinessSpreadsheet,
   getGoogleSheetsCapabilities,
@@ -362,6 +369,18 @@ function extractBearerToken(req: Request): string | null {
   return token || null;
 }
 
+let cachedPrimaryOwnerUid: string | null = null;
+
+async function getPrimaryOwnerUidCached(): Promise<string | null> {
+  if (cachedPrimaryOwnerUid) return cachedPrimaryOwnerUid;
+  const ownerSetup = await firestoreGetDoc('appState/ownerSetup');
+  if (ownerSetup && ownerSetup.ownerUid && ownerSetup.initialized === true) {
+    cachedPrimaryOwnerUid = String(ownerSetup.ownerUid);
+    return cachedPrimaryOwnerUid;
+  }
+  return ownerSetup && ownerSetup.ownerUid ? String(ownerSetup.ownerUid) : null;
+}
+
 async function authorizeOwnerUser(
   user: VerifiedFirebaseUser,
   token: string,
@@ -387,7 +406,7 @@ async function authorizeOwnerUser(
     };
   }
 
-  const staffMap = await firestoreGetDoc(`staffAuthMap/${user.uid}`, token).catch(() => null);
+  const staffMap = await firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
   if (staffMap) {
     return {
       ok: false,
@@ -396,9 +415,8 @@ async function authorizeOwnerUser(
     };
   }
 
-  const ownerSetup = await firestoreGetDoc('appState/ownerSetup').catch(() => null);
-  if (ownerSetup && ownerSetup.ownerUid) {
-    const primaryOwnerUid = String(ownerSetup.ownerUid);
+  const primaryOwnerUid = await getPrimaryOwnerUidCached();
+  if (primaryOwnerUid) {
     if (primaryOwnerUid === user.uid) {
       if (options?.mode === 'setup') {
         return {
@@ -411,7 +429,7 @@ async function authorizeOwnerUser(
     }
 
     // Check if this user is an active added Admin created by the shop Owner/Admin
-    const adminMap = await firestoreGetDoc(`adminAuthMap/${user.uid}`, token).catch(() => null);
+    const adminMap = await firestoreGetDoc(`adminAuthMap/${user.uid}`, token);
     if (
       adminMap &&
       adminMap.isActive === true &&
@@ -422,7 +440,7 @@ async function authorizeOwnerUser(
       const adminMember = await firestoreGetDoc(
         `shops/${primaryOwnerUid}/adminMembers/${adminMap.adminMemberId}`,
         token
-      ).catch(() => null);
+      );
       if (
         adminMember &&
         adminMember.isActive === true &&
@@ -454,7 +472,7 @@ async function authorizeOwnerUser(
   }
 
   if (options?.requireExistingAdminOrSetup) {
-    const existingAdmin = await firestoreGetDoc(`admins/${user.uid}`, token).catch(() => null);
+    const existingAdmin = await firestoreGetDoc(`admins/${user.uid}`, token);
     if (!existingAdmin || existingAdmin.role !== 'owner') {
       return {
         ok: false,
@@ -563,11 +581,26 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
-  // Health & config status (never exposes OWNER_EMAIL value)
-  app.get('/api/health', (_req, res) => {
+  // Health & config status (never exposes OWNER_EMAIL or DISCORD_WEBHOOK_URL values)
+  app.get('/api/health', async (req, res) => {
+    const discordCaps = getDiscordCapabilities();
+    if (req.query.probe === 'discord') {
+      const live = await verifyDiscordWebhookLive();
+      res.json({
+        ok: true,
+        ownerConfigured: Boolean(getConfiguredOwnerEmail()),
+        discordConfigured: live.configured,
+        discordStatus: live.status,
+        discordLiveOk: live.liveOk,
+        discordLiveStatusCode: live.liveStatusCode,
+      });
+      return;
+    }
     res.json({
       ok: true,
       ownerConfigured: Boolean(getConfiguredOwnerEmail()),
+      discordConfigured: discordCaps.configured,
+      discordStatus: discordCaps.status,
     });
   });
 
@@ -1106,6 +1139,78 @@ async function startServer() {
   );
 
   // ------------------------------------------------------------------
+  // Admin Discord Notification Diagnostics, Encrypted Webhook Vault & Test Routes
+  // ------------------------------------------------------------------
+  app.get('/api/admin/discord/capabilities', requireOwnerMiddleware, async (req: AuthenticatedRequest, res) => {
+    if (req.query.verify === '1') {
+      res.json(await verifyDiscordWebhookLive(req.shopId!));
+      return;
+    }
+    res.json(getDiscordCapabilities(req.shopId!));
+  });
+
+  app.post('/api/admin/discord/webhook', requireOwnerMiddleware, async (req: AuthenticatedRequest, res) => {
+    const rawWebhookUrl =
+      typeof req.body?.webhookUrl === 'string' ? req.body.webhookUrl.trim() : '';
+    if (!rawWebhookUrl) {
+      res.status(400).json({ error: 'Discord webhook URL is required.' });
+      return;
+    }
+    if (rawWebhookUrl.length > 512) {
+      res.status(400).json({ error: 'Discord webhook URL exceeds maximum length.' });
+      return;
+    }
+
+    try {
+      const caps = await saveDiscordWebhookForOwner(req.shopId!, rawWebhookUrl);
+      res.json({ ok: true, ...caps });
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Failed to verify and save Discord webhook URL.',
+      });
+    }
+  });
+
+  app.delete('/api/admin/discord/webhook', requireOwnerMiddleware, (req: AuthenticatedRequest, res) => {
+    try {
+      const caps = removeDiscordWebhookForOwner(req.shopId!);
+      res.json({ ok: true, ...caps });
+    } catch (err) {
+      res.status(500).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Failed to remove saved Discord webhook URL.',
+      });
+    }
+  });
+
+  app.post('/api/admin/discord/test', requireOwnerMiddleware, async (req: AuthenticatedRequest, res) => {
+    const actor = req.firebaseUser?.name || req.firebaseUser?.email || 'Admin';
+    const result = await sendDiscordTestNotification(req.shopId!, actor);
+    if (result.sent) {
+      res.json({ ok: true, ...result });
+      return;
+    }
+    if (result.skipped) {
+      res.status(503).json({ ok: false, ...result });
+      return;
+    }
+    if (result.statusCode === 429) {
+      if (result.retryAfterMs) {
+        res.setHeader('Retry-After', String(Math.ceil(result.retryAfterMs / 1000)));
+      }
+      res.status(429).json({ ok: false, ...result });
+      return;
+    }
+    const status = result.retryable === false ? 422 : 502;
+    res.status(status).json({ ok: false, ...result });
+  });
+
+  // ------------------------------------------------------------------
   // Independent Discord Webhook Notification Route (Owner/Admin or Active Sales Staff)
   // ------------------------------------------------------------------
   app.post('/api/notifications/discord', async (req, res) => {
@@ -1125,8 +1230,17 @@ async function startServer() {
       return;
     }
 
+    let user: VerifiedFirebaseUser;
     try {
-      const user = await verifyFirebaseIdToken(token);
+      user = await verifyFirebaseIdToken(token);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Invalid or expired authentication token.';
+      console.warn(`[Discord] Auth verification failed (${payload.type}:${payload.dedupeId || 'unknown'}): ${message}`);
+      res.status(401).json({ ok: false, sent: false, error: message });
+      return;
+    }
+
+    try {
       let resolvedShopId = '';
 
       const ownerCheck = await authorizeOwnerUser(user, token, {
@@ -1136,16 +1250,15 @@ async function startServer() {
       if (ownerCheck.ok) {
         resolvedShopId = ownerCheck.shopId;
       } else if (payload.type === 'sale' && user.provider === 'password') {
-        const authMap = await firestoreGetDoc(`staffAuthMap/${user.uid}`, token).catch(() => null);
+        const authMap = await firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
         const shopId = String(authMap?.shopId || '');
         const staffId = String(authMap?.staffId || '');
         if (!authMap || authMap.isActive !== true || !shopId || !staffId) {
+          console.warn(`[Discord] Staff unauthorized (${payload.type}:${payload.dedupeId || 'unknown'})`);
           res.status(403).json({ error: 'Staff account is inactive or unauthorized.' });
           return;
         }
-        const staff = await firestoreGetDoc(`shops/${shopId}/staff/${staffId}`, token).catch(
-          () => null
-        );
+        const staff = await firestoreGetDoc(`shops/${shopId}/staff/${staffId}`, token);
         const permissions = (staff?.permissions || {}) as { canAddSales?: boolean };
         if (
           !staff ||
@@ -1153,11 +1266,13 @@ async function startServer() {
           staff.authUid !== user.uid ||
           permissions.canAddSales !== true
         ) {
+          console.warn(`[Discord] Staff permission denied (${payload.type}:${payload.dedupeId || 'unknown'})`);
           res.status(403).json({ error: 'You do not have permission to send sale notifications.' });
           return;
         }
         resolvedShopId = shopId;
       } else {
+        console.warn(`[Discord] Authorization rejected (${ownerCheck.status}, ${payload.type}:${payload.dedupeId || 'unknown'}): ${ownerCheck.error}`);
         res.status(ownerCheck.status).json({ error: ownerCheck.error });
         return;
       }
@@ -1166,13 +1281,33 @@ async function startServer() {
         resolvedShopId,
         payload as DiscordTransactionNotificationPayload
       );
-      res.json({ ok: true, ...result });
+      if (result.sent || result.deduplicated) {
+        res.json({ ok: true, ...result });
+        return;
+      }
+      if (result.skipped) {
+        console.warn(`[Discord] Delivery skipped (${payload.type}:${payload.dedupeId || 'unknown'}): ${result.reason || result.error}`);
+        res.status(503).json({ ok: false, ...result });
+        return;
+      }
+      if (result.statusCode === 429) {
+        if (result.retryAfterMs) {
+          res.setHeader('Retry-After', String(Math.ceil(result.retryAfterMs / 1000)));
+        }
+        res.status(429).json({ ok: false, ...result });
+        return;
+      }
+      const httpStatus = result.retryable === false ? 422 : 502;
+      console.warn(`[Discord] Delivery failed (${httpStatus}, ${payload.type}:${payload.dedupeId || 'unknown'}): ${result.error || 'Unknown error'}`);
+      res.status(httpStatus).json({ ok: false, ...result });
     } catch (err) {
-      // Independent notification feature: never disrupt the caller with unhandled errors
-      res.json({
-        ok: true,
+      const message = err instanceof Error ? err.message : 'Unable to process Discord notification.';
+      console.warn(`[Discord] Transient server error (${payload.type}:${payload.dedupeId || 'unknown'}): ${message}`);
+      res.status(502).json({
+        ok: false,
         sent: false,
-        error: err instanceof Error ? err.message : 'Unable to process Discord notification.',
+        retryable: true,
+        error: message,
       });
     }
   });

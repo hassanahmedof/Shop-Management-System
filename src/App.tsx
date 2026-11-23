@@ -6,6 +6,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { GoogleSheetsSyncProvider } from './contexts/GoogleSheetsSyncContext';
 import { OfflineSyncProvider } from './contexts/OfflineSyncContext';
 import { ShopDataProvider, useShopData } from './contexts/ShopDataContext';
+import { ThemeProvider } from './contexts/ThemeContext';
 import { ToastProvider, useToast } from './contexts/ToastContext';
 import { ActivityLogsPage } from './pages/ActivityLogsPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
@@ -20,6 +21,7 @@ import { SettingsPage } from './pages/SettingsPage';
 import { StaffManagementPage } from './pages/StaffManagementPage';
 import { StaffPortalView } from './pages/StaffPortalView';
 import { StockAdjustmentsPage } from './pages/StockAdjustmentsPage';
+import { initializeDiscordQueueWorker } from './services/discordNotificationService';
 import type { NavSection, StaffPortalSection } from './types/shop';
 
 const RESTRICTED_STAFF_PREFIXES = [
@@ -114,10 +116,15 @@ function MainApp() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
+  useEffect(() => {
+    if (!user) return;
+    return initializeDiscordQueueWorker();
+  }, [user]);
+
   if (loading || initializingShop) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-        <div className="text-sm text-slate-600 font-medium">Loading shop workspace...</div>
+      <div className="min-h-screen bg-[var(--cm-bg-app)] flex items-center justify-center p-6">
+        <div className="text-sm text-[var(--cm-text-secondary)] font-medium">Loading shop workspace...</div>
       </div>
     );
   }
@@ -128,24 +135,24 @@ function MainApp() {
 
   if (!shopReady) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-        <div className="max-w-md w-full bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-          <h2 className="text-base font-semibold text-slate-900">Unable to open shop workspace</h2>
-          <p className="text-sm text-slate-600 break-words">
+      <div className="min-h-screen bg-[var(--cm-bg-app)] flex items-center justify-center p-6">
+        <div className="max-w-md w-full bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-xl p-6 space-y-4">
+          <h2 className="text-base font-semibold text-[var(--cm-text-primary)]">Unable to open shop workspace</h2>
+          <p className="text-sm text-[var(--cm-text-secondary)] break-words">
             {authError || 'Please retry initializing your shop database.'}
           </p>
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => void retryInitialization()}
-              className="px-4 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg cursor-pointer"
+              className="px-4 py-2 text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer"
             >
               Retry
             </button>
             <button
               type="button"
               onClick={() => void logout()}
-              className="px-4 py-2 text-sm font-medium text-slate-700 border border-slate-200 rounded-lg cursor-pointer"
+              className="px-4 py-2 text-sm font-medium text-[var(--cm-text-secondary)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-subtle)] rounded-lg cursor-pointer"
             >
               Sign Out
             </button>
@@ -159,10 +166,10 @@ function MainApp() {
   if (sessionRole === 'sales_staff') {
     if (isRestrictedPathForStaff(currentPath)) {
       return (
-        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-          <div className="max-w-md w-full bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-            <h2 className="text-base font-semibold text-red-700">Access Denied</h2>
-            <p className="text-sm text-slate-600">
+        <div className="min-h-screen bg-[var(--cm-bg-app)] flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-xl p-6 space-y-4">
+            <h2 className="text-base font-semibold text-[var(--cm-danger)]">Access Denied</h2>
+            <p className="text-sm text-[var(--cm-text-secondary)]">
               Sales Staff accounts are not authorized to access Owner/Admin pages, business analytics, or system settings.
             </p>
             <button
@@ -171,7 +178,7 @@ function MainApp() {
                 window.history.replaceState(null, '', '/');
                 setCurrentPath('/');
               }}
-              className="px-4 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg cursor-pointer"
+              className="px-4 py-2 text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer"
             >
               Return to Sales Staff Portal
             </button>
@@ -196,17 +203,17 @@ function MainApp() {
 
   if (sessionRole !== 'owner') {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-        <div className="max-w-md w-full bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-          <h2 className="text-base font-semibold text-red-700">Access Denied</h2>
-          <p className="text-sm text-slate-600 break-words">
+      <div className="min-h-screen bg-[var(--cm-bg-app)] flex items-center justify-center p-6">
+        <div className="max-w-md w-full bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-xl p-6 space-y-4">
+          <h2 className="text-base font-semibold text-[var(--cm-danger)]">Access Denied</h2>
+          <p className="text-sm text-[var(--cm-text-secondary)] break-words">
             {authError ||
               'Access Denied. This account is not authorized to access the Owner/Admin panel.'}
           </p>
           <button
             type="button"
             onClick={() => void logout()}
-            className="px-4 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg cursor-pointer"
+            className="px-4 py-2 text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer"
           >
             Sign Out
           </button>
@@ -224,7 +231,7 @@ function MainApp() {
       case 'staff':
         return <StaffManagementPage />;
       case 'products':
-        return <ProductsPage />;
+        return <ProductsPage onOpenCatalogSettings={() => setActiveSection('settings')} />;
       case 'inventory':
         return <InventoryPage />;
       case 'purchases':
@@ -264,11 +271,13 @@ function MainApp() {
 export default function App() {
   return (
     <ErrorBoundary>
-      <ToastProvider>
-        <AuthProvider>
-          <MainApp />
-        </AuthProvider>
-      </ToastProvider>
+      <ThemeProvider>
+        <ToastProvider>
+          <AuthProvider>
+            <MainApp />
+          </AuthProvider>
+        </ToastProvider>
+      </ThemeProvider>
     </ErrorBoundary>
   );
 }

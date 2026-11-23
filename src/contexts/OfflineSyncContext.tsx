@@ -38,8 +38,14 @@ interface OfflineSyncContextValue {
     input: {
       saleDate: string;
       paymentMethod: PaymentMethod;
+      customerWhatsapp?: string;
       notes: string;
-      items: Array<{ productId: string; quantity: number }>;
+      items: Array<{
+        productId: string;
+        quantity: number;
+        unitName?: string;
+        conversionFactor?: number;
+      }>;
     }
   ) => OfflineQueuedSale;
   syncNow: (includeFailed?: boolean) => Promise<void>;
@@ -199,8 +205,14 @@ export function OfflineSyncProvider({ children }: { children: ReactNode }) {
       input: {
         saleDate: string;
         paymentMethod: PaymentMethod;
+        customerWhatsapp?: string;
         notes: string;
-        items: Array<{ productId: string; quantity: number }>;
+        items: Array<{
+          productId: string;
+          quantity: number;
+          unitName?: string;
+          conversionFactor?: number;
+        }>;
       }
     ) => {
       if (!shopId || !staffProfile) {

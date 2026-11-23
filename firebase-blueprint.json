@@ -198,8 +198,17 @@
         "categoryName": { "type": "string", "maxLength": 100 },
         "brandName": { "type": "string", "maxLength": 100 },
         "salePrice": { "type": "number" },
+        "wholesalePrice": { "type": "number" },
         "currentStock": { "type": "number" },
         "unit": { "type": "string", "maxLength": 40 },
+        "baseUnit": { "type": "string", "maxLength": 40 },
+        "packagingUnits": { "type": "array" },
+        "originType": { "type": "string", "enum": ["", "local", "imported"] },
+        "bottleSize": { "type": "string", "maxLength": 40 },
+        "storageLocation": { "type": "string", "maxLength": 80 },
+        "isReturnable": { "type": "boolean" },
+        "returnableUnitName": { "type": "string", "maxLength": 40 },
+        "depositPerReturnable": { "type": "number" },
         "isActive": { "type": "boolean" },
         "allowedStaffUids": { "type": "array" },
         "updatedAt": { "type": "string", "format": "date-time" }
@@ -228,6 +237,7 @@
         "staffAuthUid": { "type": "string", "maxLength": 128 },
         "staffName": { "type": "string", "maxLength": 120 },
         "staffUsername": { "type": "string", "maxLength": 40 },
+        "customerWhatsapp": { "type": "string", "maxLength": 32 },
         "notes": { "type": "string", "maxLength": 500 },
         "status": { "type": "string", "enum": ["completed", "cancelled"] },
         "syncedToLedger": { "type": "boolean" },
@@ -255,11 +265,13 @@
     },
     "Brand": {
       "title": "Brand",
-      "description": "Product brand such as Pampers, Huggies, Molfix, Rose Petal.",
+      "description": "Product brand such as Pampers, Huggies, Molfix, Rose Petal with multi-category links and active status.",
       "type": "object",
       "properties": {
         "ownerUid": { "type": "string", "maxLength": 128 },
         "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "categoryIds": { "type": "array" },
+        "isActive": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -305,6 +317,15 @@
         "minStockLevel": { "type": "number" },
         "maxStockLevel": { "type": "number" },
         "unit": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "baseUnit": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "packagingUnits": { "type": "array" },
+        "originType": { "type": "string", "enum": ["", "local", "imported"] },
+        "bottleSize": { "type": "string", "maxLength": 40 },
+        "storageLocation": { "type": "string", "maxLength": 80 },
+        "isReturnable": { "type": "boolean" },
+        "returnableUnitName": { "type": "string", "maxLength": 40 },
+        "depositPerReturnable": { "type": "number" },
+        "emptyContainersOnHand": { "type": "number" },
         "supplierId": { "type": "string", "maxLength": 128 },
         "supplierName": { "type": "string", "maxLength": 150 },
         "expiryDate": { "type": "string", "maxLength": 20 },
@@ -319,6 +340,45 @@
         "currentStock", "minStockLevel", "maxStockLevel",
         "unit", "supplierId", "supplierName", "expiryDate", "profitMarginPct",
         "isActive", "createdAt", "updatedAt"
+      ]
+    },
+    "ProductTemplate": {
+      "title": "ProductTemplate",
+      "description": "Permanent searchable catalog template organized by Category -> Brand -> Product with packaging and PKR estimates.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "categoryId": { "type": "string", "maxLength": 128 },
+        "categoryName": { "type": "string", "maxLength": 100 },
+        "brandId": { "type": "string", "maxLength": 128 },
+        "brandName": { "type": "string", "maxLength": 100 },
+        "variant": { "type": "string", "maxLength": 120 },
+        "originType": { "type": "string", "enum": ["", "local", "imported"] },
+        "baseUnit": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "defaultPurchaseUnit": { "type": "string", "maxLength": 40 },
+        "defaultSaleUnit": { "type": "string", "maxLength": 40 },
+        "packagingUnits": { "type": "array" },
+        "hasUnconfirmedPackaging": { "type": "boolean" },
+        "suggestedPurchasePrice": { "type": "number" },
+        "suggestedSalePrice": { "type": "number" },
+        "suggestedWholesalePrice": { "type": "number" },
+        "priceSource": { "type": "string", "maxLength": 150 },
+        "priceUpdatedAt": { "type": "string", "maxLength": 40 },
+        "trackExpiry": { "type": "boolean" },
+        "bottleSize": { "type": "string", "maxLength": 40 },
+        "storageLocation": { "type": "string", "maxLength": 80 },
+        "isReturnable": { "type": "boolean" },
+        "returnableUnitName": { "type": "string", "maxLength": 40 },
+        "searchKeywords": { "type": "array" },
+        "isActive": { "type": "boolean" },
+        "isCustom": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "name", "categoryId", "categoryName", "brandId", "brandName",
+        "variant", "baseUnit", "isActive", "createdAt", "updatedAt"
       ]
     },
     "Sale": {
@@ -339,6 +399,7 @@
         "staffId": { "type": "string", "maxLength": 128 },
         "staffName": { "type": "string", "maxLength": 120 },
         "recordedByRole": { "type": "string", "enum": ["owner", "staff"] },
+        "customerWhatsapp": { "type": "string", "maxLength": 32 },
         "notes": { "type": "string", "maxLength": 500 },
         "status": { "type": "string", "enum": ["completed", "cancelled"] },
         "createdAt": { "type": "string", "format": "date-time" },
@@ -365,11 +426,16 @@
         "brandId": { "type": "string", "maxLength": 128 },
         "brandName": { "type": "string", "maxLength": 100 },
         "quantity": { "type": "number" },
+        "unitName": { "type": "string", "maxLength": 40 },
+        "unitQuantity": { "type": "number" },
+        "conversionFactor": { "type": "number" },
+        "baseQuantity": { "type": "number" },
         "salePricePerUnit": { "type": "number" },
         "purchasePriceAtSale": { "type": "number" },
         "lineTotal": { "type": "number" },
         "lineCost": { "type": "number" },
         "lineProfit": { "type": "number" },
+        "batchAllocations": { "type": "array" },
         "staffId": { "type": "string", "maxLength": 128 },
         "staffName": { "type": "string", "maxLength": 120 },
         "status": { "type": "string", "enum": ["completed", "cancelled"] },
@@ -422,6 +488,11 @@
         "productId": { "type": "string", "maxLength": 128 },
         "productName": { "type": "string", "maxLength": 180 },
         "quantity": { "type": "number" },
+        "unitName": { "type": "string", "maxLength": 40 },
+        "unitQuantity": { "type": "number" },
+        "conversionFactor": { "type": "number" },
+        "baseQuantity": { "type": "number" },
+        "expiryDate": { "type": "string", "maxLength": 20 },
         "purchasePricePerUnit": { "type": "number" },
         "lineTotal": { "type": "number" },
         "status": { "type": "string", "enum": ["completed", "cancelled"] },
@@ -481,6 +552,10 @@
         "quantityChange": { "type": "number" },
         "previousStock": { "type": "number" },
         "newStock": { "type": "number" },
+        "unitName": { "type": "string", "maxLength": 40 },
+        "unitQuantity": { "type": "number" },
+        "conversionFactor": { "type": "number" },
+        "baseQuantity": { "type": "number" },
         "referenceId": { "type": "string", "maxLength": 128 },
         "notes": { "type": "string", "maxLength": 500 },
         "createdAt": { "type": "string", "format": "date-time" }
@@ -501,6 +576,10 @@
         "adjustmentDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
         "adjustmentType": { "type": "string", "enum": ["add", "reduce", "damaged", "expired", "missing"] },
         "quantity": { "type": "number" },
+        "unitName": { "type": "string", "maxLength": 40 },
+        "unitQuantity": { "type": "number" },
+        "conversionFactor": { "type": "number" },
+        "baseQuantity": { "type": "number" },
         "reason": { "type": "string", "minLength": 1, "maxLength": 200 },
         "notes": { "type": "string", "maxLength": 500 },
         "previousStock": { "type": "number" },
@@ -510,6 +589,33 @@
       "required": [
         "ownerUid", "productId", "productName", "adjustmentDate", "adjustmentType",
         "quantity", "reason", "notes", "previousStock", "newStock", "createdAt"
+      ]
+    },
+    "InventoryBatch": {
+      "title": "InventoryBatch",
+      "description": "FIFO stock batch tracking distinct purchase prices, dates, expiry, and remaining base units.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "maxLength": 180 },
+        "purchaseId": { "type": "string", "maxLength": 128 },
+        "purchaseNumber": { "type": "string", "maxLength": 40 },
+        "purchaseDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "maxLength": 10 },
+        "supplierId": { "type": "string", "maxLength": 128 },
+        "supplierName": { "type": "string", "maxLength": 150 },
+        "initialBaseQty": { "type": "number" },
+        "remainingBaseQty": { "type": "number" },
+        "unitCostInBase": { "type": "number" },
+        "expiryDate": { "type": "string", "maxLength": 20 },
+        "status": { "type": "string", "enum": ["active", "exhausted", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "productId", "productName", "purchaseId", "purchaseNumber", "purchaseDate",
+        "supplierId", "supplierName", "initialBaseQty", "remainingBaseQty", "unitCostInBase",
+        "expiryDate", "status", "createdAt", "updatedAt"
       ]
     },
     "AuditLog": {
@@ -654,6 +760,10 @@
       "schema": { "$ref": "#/entities/Product" },
       "description": "Shop products and inventory levels."
     },
+    "/shops/{shopId}/productTemplates/{templateId}": {
+      "schema": { "$ref": "#/entities/ProductTemplate" },
+      "description": "Permanent category-and-brand-linked product suggestion catalog templates."
+    },
     "/shops/{shopId}/sales/{saleId}": {
       "schema": { "$ref": "#/entities/Sale" },
       "description": "Sales headers."
@@ -685,6 +795,10 @@
     "/shops/{shopId}/stockAdjustments/{adjustmentId}": {
       "schema": { "$ref": "#/entities/StockAdjustment" },
       "description": "Manual stock adjustments."
+    },
+    "/shops/{shopId}/inventoryBatches/{batchId}": {
+      "schema": { "$ref": "#/entities/InventoryBatch" },
+      "description": "FIFO stock batches per product preserving per-lot unit cost and expiry."
     },
     "/shops/{shopId}/auditLogs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },

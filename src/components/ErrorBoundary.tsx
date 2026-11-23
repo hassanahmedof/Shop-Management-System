@@ -41,17 +41,17 @@ export class ErrorBoundary extends Component<Props, State> {
       }
 
       return (
-        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-          <div className="max-w-lg w-full bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-            <div className="flex items-center gap-3 text-red-600">
+        <div className="min-h-screen bg-[var(--cm-bg-app)] flex items-center justify-center p-6">
+          <div className="max-w-lg w-full bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] rounded-xl p-6 space-y-4">
+            <div className="flex items-center gap-3 text-[var(--cm-danger)]">
               <AlertTriangle className="w-6 h-6 shrink-0" />
-              <h1 className="text-lg font-semibold text-slate-900">Unable to load shop data</h1>
+              <h1 className="text-lg font-semibold text-[var(--cm-text-primary)]">Unable to load shop data</h1>
             </div>
-            <p className="text-sm text-slate-600 leading-relaxed break-words">{friendly}</p>
+            <p className="text-sm text-[var(--cm-text-secondary)] leading-relaxed break-words">{friendly}</p>
             <button
               type="button"
               onClick={() => window.location.reload()}
-              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-teal-600 hover:bg-teal-700 rounded-lg transition-colors"
+              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg transition-colors cursor-pointer"
             >
               <RotateCcw className="w-4 h-4" />
               Reload Application

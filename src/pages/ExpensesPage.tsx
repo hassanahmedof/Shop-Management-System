@@ -216,25 +216,33 @@ export function ExpensesPage() {
     });
   }, [expenses, search, filterCatId]);
 
+  const tooltipContentStyle = {
+    backgroundColor: 'var(--cm-chart-tooltip-bg)',
+    borderColor: 'var(--cm-chart-tooltip-border)',
+    color: 'var(--cm-text-primary)',
+    borderRadius: '8px',
+    fontSize: '12px',
+  };
+
   return (
     <div className="space-y-4">
       {/* Daily, Monthly, Yearly Expense Totals */}
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 sm:gap-3">
-        <div className="bg-white border border-slate-200 rounded-xl p-3">
-          <div className="text-[11px] font-medium text-slate-500">Daily Expenses (Today)</div>
-          <div className="mt-0.5 text-base sm:text-lg font-bold font-mono-num tabular-nums text-slate-900 truncate">
+        <div className="cm-surface border rounded-xl p-3">
+          <div className="text-[11px] font-medium text-[var(--cm-text-muted)]">Daily Expenses (Today)</div>
+          <div className="mt-0.5 text-base sm:text-lg font-bold font-mono-num tabular-nums text-[var(--cm-text-primary)] truncate">
             {formatPKR(totals.daily)}
           </div>
         </div>
-        <div className="bg-white border border-slate-200 rounded-xl p-3">
-          <div className="text-[11px] font-medium text-slate-500">Monthly Expenses</div>
-          <div className="mt-0.5 text-base sm:text-lg font-bold font-mono-num tabular-nums text-slate-900 truncate">
+        <div className="cm-surface border rounded-xl p-3">
+          <div className="text-[11px] font-medium text-[var(--cm-text-muted)]">Monthly Expenses</div>
+          <div className="mt-0.5 text-base sm:text-lg font-bold font-mono-num tabular-nums text-[var(--cm-text-primary)] truncate">
             {formatPKR(totals.monthly)}
           </div>
         </div>
-        <div className="col-span-2 sm:col-span-1 bg-white border border-slate-200 rounded-xl p-3">
-          <div className="text-[11px] font-medium text-slate-500">Yearly Expenses</div>
-          <div className="mt-0.5 text-base sm:text-lg font-bold font-mono-num tabular-nums text-slate-900 truncate">
+        <div className="col-span-2 sm:col-span-1 cm-surface border rounded-xl p-3">
+          <div className="text-[11px] font-medium text-[var(--cm-text-muted)]">Yearly Expenses</div>
+          <div className="mt-0.5 text-base sm:text-lg font-bold font-mono-num tabular-nums text-[var(--cm-text-primary)] truncate">
             {formatPKR(totals.yearly)}
           </div>
         </div>
@@ -249,13 +257,15 @@ export function ExpensesPage() {
         bodyClassName="p-3.5 sm:p-4 space-y-3"
       >
         {error && (
-          <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs sm:text-sm text-red-700">{error}</div>
+          <div className="p-3 bg-[var(--cm-danger-soft)] border border-[var(--cm-danger-border)] rounded-lg text-xs sm:text-sm text-[var(--cm-danger)]">
+            {error}
+          </div>
         )}
 
         <form onSubmit={handleSaveExpense} className="space-y-3">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             <div>
-              <label className="block text-[11px] font-medium text-slate-600 mb-1">Expense Title *</label>
+              <label className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">Expense Title *</label>
               <input
                 type="text"
                 required
@@ -263,17 +273,17 @@ export function ExpensesPage() {
                 placeholder="e.g., November Shop Rent"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                className="w-full min-h-[38px] px-3 py-1.5 text-sm border border-slate-200 rounded-lg"
+                className="w-full min-h-[38px] px-3 py-1.5 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
 
             <div>
               <div className="flex items-center justify-between mb-1">
-                <label className="text-[11px] font-medium text-slate-600">Category *</label>
+                <label className="text-[11px] font-medium text-[var(--cm-text-secondary)]">Category *</label>
                 <button
                   type="button"
                   onClick={() => setShowCustomCat((v) => !v)}
-                  className="text-[11px] font-semibold text-teal-700 hover:underline cursor-pointer"
+                  className="text-[11px] font-semibold text-[var(--cm-accent-text)] hover:underline cursor-pointer"
                 >
                   + Custom
                 </button>
@@ -294,7 +304,7 @@ export function ExpensesPage() {
 
             <div className="grid grid-cols-2 gap-2">
               <div>
-                <label className="block text-[11px] font-medium text-slate-600 mb-1">Amount (PKR) *</label>
+                <label className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">Amount (PKR) *</label>
                 <input
                   type="number"
                   required
@@ -302,25 +312,25 @@ export function ExpensesPage() {
                   step="0.01"
                   value={amount}
                   onChange={(e) => setAmount(e.target.value)}
-                  className="w-full min-h-[38px] px-2.5 py-1.5 text-sm border border-slate-200 rounded-lg font-mono-num"
+                  className="w-full min-h-[38px] px-2.5 py-1.5 text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
                 />
               </div>
 
               <div>
-                <label className="block text-[11px] font-medium text-slate-600 mb-1">Date *</label>
+                <label className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">Date *</label>
                 <input
                   type="date"
                   required
                   value={expenseDate}
                   onChange={(e) => setExpenseDate(e.target.value)}
-                  className="w-full min-h-[38px] px-2 py-1.5 text-xs sm:text-sm border border-slate-200 rounded-lg font-mono-num"
+                  className="w-full min-h-[38px] px-2 py-1.5 text-xs sm:text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
                 />
               </div>
             </div>
 
             <div>
-              <span className="block text-[11px] font-medium text-slate-600 mb-1">Payment Method</span>
-              <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200 min-h-[38px]">
+              <span className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">Payment Method</span>
+              <div className="grid grid-cols-2 gap-1 p-1 bg-[var(--cm-bg-subtle)] rounded-lg border border-[var(--cm-border)] min-h-[38px]">
                 {(['Cash', 'Online'] as PaymentMethod[]).map((method) => (
                   <button
                     key={method}
@@ -328,8 +338,8 @@ export function ExpensesPage() {
                     onClick={() => setPaymentMethod(method)}
                     className={`text-xs font-semibold rounded-md transition-colors cursor-pointer ${
                       paymentMethod === method
-                        ? 'bg-white text-teal-700 border border-slate-200 shadow-2xs'
-                        : 'text-slate-600 hover:text-slate-900'
+                        ? 'bg-[var(--cm-bg-surface)] text-[var(--cm-accent-text)] border border-[var(--cm-border)] shadow-2xs'
+                        : 'text-[var(--cm-text-secondary)] hover:text-[var(--cm-text-primary)]'
                     }`}
                   >
                     {method}
@@ -339,38 +349,38 @@ export function ExpensesPage() {
             </div>
 
             <div className="sm:col-span-2">
-              <label className="block text-[11px] font-medium text-slate-600 mb-1">Notes (Optional)</label>
+              <label className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">Notes (Optional)</label>
               <input
                 type="text"
                 maxLength={500}
                 placeholder="Optional note"
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
-                className="w-full min-h-[38px] px-3 py-1.5 text-sm border border-slate-200 rounded-lg"
+                className="w-full min-h-[38px] px-3 py-1.5 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
               />
             </div>
           </div>
 
           {showCustomCat && (
-            <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex flex-wrap gap-2 items-center">
+            <div className="p-3 bg-[var(--cm-bg-subtle)] border border-[var(--cm-border)] rounded-lg flex flex-wrap gap-2 items-center">
               <input
                 type="text"
                 placeholder="New custom category name..."
                 value={customCatName}
                 onChange={(e) => setCustomCatName(e.target.value)}
-                className="min-h-[38px] px-3 py-1.5 text-sm border border-slate-200 rounded-lg bg-white flex-1 min-w-[180px]"
+                className="min-h-[38px] px-3 py-1.5 text-sm cm-input border rounded-lg flex-1 min-w-[180px]"
               />
               <button
                 type="button"
                 onClick={() => void handleAddCustomCategory()}
-                className="min-h-[38px] px-3 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-lg cursor-pointer"
+                className="min-h-[38px] px-3 py-1.5 text-xs font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer"
               >
                 Add Category
               </button>
               <button
                 type="button"
                 onClick={() => setShowCustomCat(false)}
-                className="min-h-[38px] px-3 py-1.5 text-xs font-medium text-slate-600 border border-slate-200 rounded-lg bg-white cursor-pointer"
+                className="min-h-[38px] px-3 py-1.5 text-xs font-medium text-[var(--cm-text-secondary)] border border-[var(--cm-border)] rounded-lg bg-[var(--cm-bg-surface)] hover:bg-[var(--cm-bg-hover)] cursor-pointer"
               >
                 Cancel
               </button>
@@ -381,7 +391,7 @@ export function ExpensesPage() {
             <button
               type="submit"
               disabled={submitting}
-              className="w-full sm:w-auto min-h-[42px] inline-flex items-center justify-center gap-1.5 px-5 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg disabled:opacity-50 cursor-pointer"
+              className="w-full sm:w-auto min-h-[42px] inline-flex items-center justify-center gap-1.5 px-5 py-2 text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg disabled:opacity-50 cursor-pointer"
             >
               <Plus className="w-4 h-4" />
               {submitting ? 'Saving...' : 'Save Expense'}
@@ -400,20 +410,20 @@ export function ExpensesPage() {
       >
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="space-y-2">
-            <h3 className="text-xs sm:text-sm font-semibold text-slate-800">Category-Wise Breakdown</h3>
+            <h3 className="text-xs sm:text-sm font-semibold text-[var(--cm-text-primary)]">Category-Wise Breakdown</h3>
             <div className="h-52 sm:h-60">
               {categoryBreakdown.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-xs text-slate-500">
+                <div className="h-full flex items-center justify-center text-xs text-[var(--cm-text-muted)]">
                   No expenses recorded yet.
                 </div>
               ) : (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={categoryBreakdown} margin={{ top: 6, right: 8, left: -12, bottom: 4 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
-                    <XAxis dataKey="name" tick={{ fontSize: 10, fill: '#64748b' }} />
-                    <YAxis tick={{ fontSize: 10, fill: '#64748b' }} />
-                    <Tooltip formatter={(v) => formatPKR(Number(v ?? 0))} />
-                    <Bar dataKey="total" name="Amount (PKR)" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--cm-chart-grid)" vertical={false} />
+                    <XAxis dataKey="name" tick={{ fontSize: 10, fill: 'var(--cm-chart-tick)' }} />
+                    <YAxis tick={{ fontSize: 10, fill: 'var(--cm-chart-tick)' }} />
+                    <Tooltip formatter={(v) => formatPKR(Number(v ?? 0))} contentStyle={tooltipContentStyle} />
+                    <Bar dataKey="total" name="Amount (PKR)" fill="#eab308" radius={[4, 4, 0, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
               )}
@@ -421,20 +431,20 @@ export function ExpensesPage() {
           </div>
 
           <div className="space-y-2">
-            <h3 className="text-xs sm:text-sm font-semibold text-slate-800">Monthly Expense Comparison</h3>
+            <h3 className="text-xs sm:text-sm font-semibold text-[var(--cm-text-primary)]">Monthly Expense Comparison</h3>
             <div className="h-52 sm:h-60">
               {monthlyComparisonSeries.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-xs text-slate-500">
+                <div className="h-full flex items-center justify-center text-xs text-[var(--cm-text-muted)]">
                   No monthly comparison data yet.
                 </div>
               ) : (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={monthlyComparisonSeries} margin={{ top: 6, right: 8, left: -12, bottom: 4 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
-                    <XAxis dataKey="month" tick={{ fontSize: 10, fill: '#64748b' }} />
-                    <YAxis tick={{ fontSize: 10, fill: '#64748b' }} />
-                    <Tooltip formatter={(v) => formatPKR(Number(v ?? 0))} />
-                    <Bar dataKey="total" name="Monthly Expense (PKR)" fill="#0f172a" radius={[4, 4, 0, 0]} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--cm-chart-grid)" vertical={false} />
+                    <XAxis dataKey="month" tick={{ fontSize: 10, fill: 'var(--cm-chart-tick)' }} />
+                    <YAxis tick={{ fontSize: 10, fill: 'var(--cm-chart-tick)' }} />
+                    <Tooltip formatter={(v) => formatPKR(Number(v ?? 0))} contentStyle={tooltipContentStyle} />
+                    <Bar dataKey="total" name="Monthly Expense (PKR)" fill="#65a30d" radius={[4, 4, 0, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
               )}
@@ -450,15 +460,15 @@ export function ExpensesPage() {
         collapsible={true}
         defaultOpen={true}
       >
-        <div className="p-3 sm:p-4 border-b border-slate-200 grid grid-cols-1 sm:grid-cols-12 gap-2">
+        <div className="p-3 sm:p-4 border-b border-[var(--cm-border)] grid grid-cols-1 sm:grid-cols-12 gap-2">
           <div className="relative sm:col-span-7">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <Search className="w-4 h-4 text-[var(--cm-text-muted)] absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
               placeholder="Search expenses..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="w-full min-h-[38px] pl-9 pr-3 py-1.5 text-sm border border-slate-200 rounded-lg"
+              className="w-full min-h-[38px] pl-9 pr-3 py-1.5 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
             />
           </div>
           <div className="sm:col-span-5">
@@ -478,11 +488,11 @@ export function ExpensesPage() {
         </div>
 
         {filteredExpenses.length === 0 ? (
-          <div className="p-6 text-center text-xs sm:text-sm text-slate-500">No expenses found.</div>
+          <div className="p-6 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">No expenses found.</div>
         ) : (
           <>
             {/* Mobile Compact Expandable List */}
-            <div className="md:hidden divide-y divide-slate-100">
+            <div className="md:hidden divide-y divide-[var(--cm-border)]">
               {filteredExpenses.map((exp) => (
                 <CompactExpandableRow
                   key={exp.id}
@@ -496,13 +506,13 @@ export function ExpensesPage() {
                   expandedContent={
                     <div className="space-y-2">
                       {exp.notes && (
-                        <p className="text-xs text-slate-600">Notes: {exp.notes}</p>
+                        <p className="text-xs text-[var(--cm-text-secondary)]">Notes: {exp.notes}</p>
                       )}
                       <div className="flex items-center justify-end gap-2">
                         <button
                           type="button"
                           onClick={() => openEdit(exp)}
-                          className="min-h-[36px] px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                          className="min-h-[36px] px-3 py-1.5 text-xs font-medium text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                         >
                           <Edit3 className="w-3.5 h-3.5" />
                           <span>Edit</span>
@@ -515,7 +525,7 @@ export function ExpensesPage() {
                               showToast({ title: 'Expense deleted', message: exp.title, tone: 'info' });
                             }
                           }}
-                          className="min-h-[36px] px-3 py-1.5 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                          className="min-h-[36px] px-3 py-1.5 text-xs font-medium text-[var(--cm-danger)] bg-[var(--cm-danger-soft)] border border-[var(--cm-danger-border)] rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                           <span>Delete</span>
@@ -531,7 +541,7 @@ export function ExpensesPage() {
             <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                  <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                     <th className="py-2.5 px-3">Date</th>
                     <th className="py-2.5 px-3">Title</th>
                     <th className="py-2.5 px-3">Category</th>
@@ -541,32 +551,32 @@ export function ExpensesPage() {
                     <th className="py-2.5 px-3 text-right">Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                   {filteredExpenses.map((exp) => (
-                    <tr key={exp.id} className="hover:bg-slate-50">
-                      <td className="py-2 px-3 font-mono-num whitespace-nowrap text-xs">
+                    <tr key={exp.id} className="hover:bg-[var(--cm-bg-hover)]">
+                      <td className="py-2 px-3 font-mono-num whitespace-nowrap text-xs text-[var(--cm-text-secondary)]">
                         {formatDateDDMMYYYY(exp.expenseDate)}
                       </td>
-                      <td className="py-2 px-3 font-medium text-slate-900">{exp.title}</td>
-                      <td className="py-2 px-3 text-xs text-slate-600">{exp.categoryName}</td>
-                      <td className="py-2 px-3 text-xs text-slate-600">{exp.paymentMethod}</td>
-                      <td className="py-2 px-3 text-right font-mono-num font-semibold text-slate-900">
+                      <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">{exp.title}</td>
+                      <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">{exp.categoryName}</td>
+                      <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">{exp.paymentMethod}</td>
+                      <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-text-primary)]">
                         {formatPKR(exp.amount)}
                       </td>
-                      <td className="py-2 px-3 text-xs text-slate-500">{exp.notes || '—'}</td>
+                      <td className="py-2 px-3 text-xs text-[var(--cm-text-muted)]">{exp.notes || '—'}</td>
                       <td className="py-2 px-3 text-right whitespace-nowrap">
                         <div className="inline-flex items-center gap-1">
                           <button
                             type="button"
                             onClick={() => openEdit(exp)}
-                            className="p-1.5 text-slate-500 hover:text-teal-700 rounded cursor-pointer"
+                            className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-accent-text)] rounded cursor-pointer"
                           >
                             <Edit3 className="w-4 h-4" />
                           </button>
                           <button
                             type="button"
                             onClick={() => activeShopId && void deleteExpense(activeShopId, exp)}
-                            className="p-1.5 text-slate-500 hover:text-red-600 rounded cursor-pointer"
+                            className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] rounded cursor-pointer"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -583,27 +593,31 @@ export function ExpensesPage() {
 
       {/* Edit Expense Modal */}
       {editing && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
-              <h3 className="text-base font-semibold text-slate-900">Edit Expense</h3>
-              <button type="button" onClick={() => setEditing(null)} className="p-1 text-slate-400">
+        <div className="fixed inset-0 z-50 bg-[var(--cm-bg-overlay)] flex items-center justify-center p-4">
+          <div className="cm-surface border rounded-xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-[var(--cm-border)] pb-3">
+              <h3 className="text-base font-semibold text-[var(--cm-text-primary)]">Edit Expense</h3>
+              <button
+                type="button"
+                onClick={() => setEditing(null)}
+                className="p-1 text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] cursor-pointer"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
             <form onSubmit={handleSaveEdit} className="space-y-4">
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Title</label>
+                <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">Title</label>
                 <input
                   type="text"
                   required
                   value={editTitle}
                   onChange={(e) => setEditTitle(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                  className="w-full px-3 py-2 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Category</label>
+                <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">Category</label>
                 <SearchableSelect
                   ariaLabel="Edit expense category"
                   suggestionScope="expense-category"
@@ -617,7 +631,7 @@ export function ExpensesPage() {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Amount (PKR)</label>
+                  <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">Amount (PKR)</label>
                   <input
                     type="number"
                     required
@@ -625,22 +639,22 @@ export function ExpensesPage() {
                     step="0.01"
                     value={editAmount}
                     onChange={(e) => setEditAmount(e.target.value)}
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg font-mono-num"
+                    className="w-full px-3 py-2 text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Date</label>
+                  <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">Date</label>
                   <input
                     type="date"
                     required
                     value={editDate}
                     onChange={(e) => setEditDate(e.target.value)}
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg font-mono-num"
+                    className="w-full px-3 py-2 text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
                   />
                 </div>
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Payment Method</label>
+                <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">Payment Method</label>
                 <SearchableSelect
                   ariaLabel="Edit expense payment method"
                   showFrequentSection={false}
@@ -651,25 +665,25 @@ export function ExpensesPage() {
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Notes</label>
+                <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">Notes</label>
                 <input
                   type="text"
                   value={editNotes}
                   onChange={(e) => setEditNotes(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                  className="w-full px-3 py-2 text-sm cm-input border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
                 />
               </div>
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
                   onClick={() => setEditing(null)}
-                  className="px-4 py-2 text-sm font-medium text-slate-700 border border-slate-200 rounded-lg"
+                  className="px-4 py-2 text-sm font-medium text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg"
+                  className="px-4 py-2 text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer"
                 >
                   Update Expense
                 </button>

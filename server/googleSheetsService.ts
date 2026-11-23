@@ -818,6 +818,44 @@ export async function ensureBusinessSpreadsheet(
         }
       }
 
+      // Expand grid columnCount on pre-existing tabs whenever new schema columns are added
+      const resizeRequests: Array<Record<string, unknown>> = [];
+      const expandedFormatRequests: Array<Record<string, unknown>> = [];
+      for (const tab of SHEET_TABS) {
+        const existingProps = existingMap.get(tab.name);
+        if (!existingProps) continue;
+        const currentColCount = existingProps.gridProperties?.columnCount ?? 0;
+        if (currentColCount < tab.headers.length) {
+          resizeRequests.push({
+            updateSheetProperties: {
+              properties: {
+                sheetId: existingProps.sheetId,
+                gridProperties: {
+                  columnCount: Math.max(tab.headers.length, 10),
+                },
+              },
+              fields: 'gridProperties.columnCount',
+            },
+          });
+          expandedFormatRequests.push(
+            ...buildTabFormattingRequests(existingProps.sheetId, tab, false)
+          );
+        }
+      }
+
+      if (resizeRequests.length > 0) {
+        await sheetsFetch(
+          `${SHEETS_API_BASE}/${encodeURIComponent(meta.spreadsheetId)}:batchUpdate`,
+          accessToken,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              requests: [...resizeRequests, ...expandedFormatRequests],
+            }),
+          }
+        );
+      }
+
       return {
         spreadsheetId: meta.spreadsheetId,
         spreadsheetUrl:
@@ -922,6 +960,23 @@ export interface SyncSpreadsheetResult {
   appendedRowCount: number;
 }
 
+const spreadsheetLocks = new Map<string, Promise<unknown>>();
+
+async function withSpreadsheetLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = spreadsheetLocks.get(key) || Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(fn);
+  spreadsheetLocks.set(key, next);
+  try {
+    return await next;
+  } finally {
+    if (spreadsheetLocks.get(key) === next) {
+      spreadsheetLocks.delete(key);
+    }
+  }
+}
+
 export async function syncSpreadsheetTabs(
   accessToken: string,
   requestedSpreadsheetId: string | undefined,
@@ -930,111 +985,113 @@ export async function syncSpreadsheetTabs(
   const ensured = await ensureBusinessSpreadsheet(accessToken, requestedSpreadsheetId);
   const spreadsheetId = ensured.spreadsheetId;
 
-  const targetTabs = (Object.keys(payload) as SheetTabName[]).filter(
-    (tabName) => Boolean(SHEET_TAB_MAP[tabName]) && Array.isArray(payload[tabName])
-  );
+  return withSpreadsheetLock(spreadsheetId, async () => {
+    const targetTabs = (Object.keys(payload) as SheetTabName[]).filter(
+      (tabName) => Boolean(SHEET_TAB_MAP[tabName]) && Array.isArray(payload[tabName])
+    );
 
-  if (targetTabs.length === 0) {
-    return {
-      spreadsheetId,
-      spreadsheetUrl: ensured.spreadsheetUrl,
-      syncedTabs: [],
-      updatedRowCount: 0,
-      appendedRowCount: 0,
-    };
-  }
+    if (targetTabs.length === 0) {
+      return {
+        spreadsheetId,
+        spreadsheetUrl: ensured.spreadsheetUrl,
+        syncedTabs: [],
+        updatedRowCount: 0,
+        appendedRowCount: 0,
+      };
+    }
 
-  // Ensure headers row 1 exist and inspect current ID column / row counts in one batchGet
-  const upsertTabs = targetTabs.filter((t) => SHEET_TAB_MAP[t].syncMode === 'upsert_by_id');
-  const summaryTabs = targetTabs.filter((t) => SHEET_TAB_MAP[t].syncMode === 'replace_sorted_summary');
+    // Ensure headers row 1 exist and inspect current ID column / row counts in one batchGet
+    const upsertTabs = targetTabs.filter((t) => SHEET_TAB_MAP[t].syncMode === 'upsert_by_id');
+    const summaryTabs = targetTabs.filter((t) => SHEET_TAB_MAP[t].syncMode === 'replace_sorted_summary');
 
-  const rangesToRead: string[] = [];
-  for (const tabName of upsertTabs) {
-    const tab = SHEET_TAB_MAP[tabName];
-    if (tab.deletedStatusColumnIndex !== undefined) {
-      const endCol = columnIndexToA1Letter(tab.headers.length - 1);
-      rangesToRead.push(`${escapeSheetTitleForA1(tabName)}!A1:${endCol}`);
-    } else {
+    const rangesToRead: string[] = [];
+    for (const tabName of upsertTabs) {
+      const tab = SHEET_TAB_MAP[tabName];
+      if (tab.deletedStatusColumnIndex !== undefined) {
+        const endCol = columnIndexToA1Letter(tab.headers.length - 1);
+        rangesToRead.push(`${escapeSheetTitleForA1(tabName)}!A1:${endCol}`);
+      } else {
+        rangesToRead.push(`${escapeSheetTitleForA1(tabName)}!A1:A`);
+      }
+    }
+    for (const tabName of summaryTabs) {
       rangesToRead.push(`${escapeSheetTitleForA1(tabName)}!A1:A`);
     }
-  }
-  for (const tabName of summaryTabs) {
-    rangesToRead.push(`${escapeSheetTitleForA1(tabName)}!A1:A`);
-  }
 
-  const batchGetQuery = rangesToRead
-    .map((r) => `ranges=${encodeURIComponent(r)}`)
-    .join('&');
+    const batchGetQuery = rangesToRead
+      .map((r) => `ranges=${encodeURIComponent(r)}`)
+      .join('&');
 
-  const batchGetRes = await sheetsFetch<{
-    valueRanges?: Array<{ range?: string; values?: SheetCellValue[][] }>;
-  }>(
-    `${SHEETS_API_BASE}/${encodeURIComponent(spreadsheetId)}/values:batchGet?${batchGetQuery}`,
-    accessToken
-  );
+    const batchGetRes = await sheetsFetch<{
+      valueRanges?: Array<{ range?: string; values?: SheetCellValue[][] }>;
+    }>(
+      `${SHEETS_API_BASE}/${encodeURIComponent(spreadsheetId)}/values:batchGet?${batchGetQuery}`,
+      accessToken
+    );
 
-  const valueRanges = batchGetRes.valueRanges || [];
-  let rangeCursor = 0;
+    const valueRanges = batchGetRes.valueRanges || [];
+    let rangeCursor = 0;
 
-  const batchDataUpdates: Array<{ range: string; values: SheetCellValue[][] }> = [];
-  const rangesToClear: string[] = [];
+    const batchDataUpdates: Array<{ range: string; values: SheetCellValue[][] }> = [];
+    const rangesToClear: string[] = [];
 
-  let updatedRowCount = 0;
-  let appendedRowCount = 0;
+    let updatedRowCount = 0;
+    let appendedRowCount = 0;
 
-  // 1. Handle upsert_by_id tabs (never duplicate existing document IDs)
-  for (const tabName of upsertTabs) {
-    const tab = SHEET_TAB_MAP[tabName];
-    const existingGrid = valueRanges[rangeCursor]?.values || [];
-    rangeCursor += 1;
+    // 1. Handle upsert_by_id tabs (never duplicate existing document IDs)
+    for (const tabName of upsertTabs) {
+      const tab = SHEET_TAB_MAP[tabName];
+      const existingGrid = valueRanges[rangeCursor]?.values || [];
+      rangeCursor += 1;
 
-    const endColLetter = columnIndexToA1Letter(tab.headers.length - 1);
+      const endColLetter = columnIndexToA1Letter(tab.headers.length - 1);
 
-    // Ensure header row is always up-to-date
-    const firstRow = existingGrid[0] || [];
-    const headerMatches =
-      firstRow.length >= tab.headers.length &&
-      tab.headers.every((h, idx) => String(firstRow[idx] ?? '').trim() === h);
+      // Ensure header row is always up-to-date
+      const firstRow = existingGrid[0] || [];
+      const headerMatches =
+        firstRow.length >= tab.headers.length &&
+        tab.headers.every((h, idx) => String(firstRow[idx] ?? '').trim() === h);
 
-    if (!headerMatches) {
-      batchDataUpdates.push({
-        range: `${escapeSheetTitleForA1(tabName)}!A1:${endColLetter}1`,
-        values: [[...tab.headers]],
-      });
-    }
-
-    // Build existing ID -> 1-based sheet row number map
-    const existingIdToRowNum = new Map<string, number>();
-    for (let r = 1; r < existingGrid.length; r += 1) {
-      const idVal = String(existingGrid[r]?.[tab.idColumnIndex] ?? '').trim();
-      if (idVal && !existingIdToRowNum.has(idVal)) {
-        existingIdToRowNum.set(idVal, r + 1); // 1-based Sheets row index
-      }
-    }
-
-    const incomingRows = payload[tabName] || [];
-    const seenIncomingIds = new Set<string>();
-    const rowsToAppend: SheetCellValue[][] = [];
-
-    for (const rawRow of incomingRows) {
-      const cleanRow = sanitizeRow(rawRow, tab.headers.length);
-      const recordId = String(cleanRow[tab.idColumnIndex] ?? '').trim();
-      if (!recordId) continue;
-
-      seenIncomingIds.add(recordId);
-      const existingRowNum = existingIdToRowNum.get(recordId);
-
-      if (existingRowNum) {
+      if (!headerMatches) {
         batchDataUpdates.push({
-          range: `${escapeSheetTitleForA1(tabName)}!A${existingRowNum}:${endColLetter}${existingRowNum}`,
-          values: [cleanRow],
+          range: `${escapeSheetTitleForA1(tabName)}!A1:${endColLetter}1`,
+          values: [[...tab.headers]],
         });
-        updatedRowCount += 1;
-      } else {
-        rowsToAppend.push(cleanRow);
-        appendedRowCount += 1;
       }
-    }
+
+      // Build existing ID -> 1-based sheet row number map
+      const existingIdToRowNum = new Map<string, number>();
+      for (let r = 1; r < existingGrid.length; r += 1) {
+        const idVal = String(existingGrid[r]?.[tab.idColumnIndex] ?? '').trim();
+        if (idVal && !existingIdToRowNum.has(idVal)) {
+          existingIdToRowNum.set(idVal, r + 1); // 1-based Sheets row index
+        }
+      }
+
+      const incomingRows = payload[tabName] || [];
+      const seenIncomingIds = new Set<string>();
+      const rowsToAppend: SheetCellValue[][] = [];
+
+      for (const rawRow of incomingRows) {
+        const cleanRow = sanitizeRow(rawRow, tab.headers.length);
+        const recordId = String(cleanRow[tab.idColumnIndex] ?? '').trim();
+        if (!recordId) continue;
+        if (seenIncomingIds.has(recordId)) continue;
+
+        seenIncomingIds.add(recordId);
+        const existingRowNum = existingIdToRowNum.get(recordId);
+
+        if (existingRowNum) {
+          batchDataUpdates.push({
+            range: `${escapeSheetTitleForA1(tabName)}!A${existingRowNum}:${endColLetter}${existingRowNum}`,
+            values: [cleanRow],
+          });
+          updatedRowCount += 1;
+        } else {
+          rowsToAppend.push(cleanRow);
+          appendedRowCount += 1;
+        }
+      }
 
     // Preserve deleted entries in Categories & Brands by marking Status = 'Deleted'
     if (tab.deletedStatusColumnIndex !== undefined) {
@@ -1124,11 +1181,12 @@ export async function syncSpreadsheetTabs(
     );
   }
 
-  return {
-    spreadsheetId,
-    spreadsheetUrl: ensured.spreadsheetUrl,
-    syncedTabs: targetTabs,
-    updatedRowCount,
-    appendedRowCount,
-  };
+    return {
+      spreadsheetId,
+      spreadsheetUrl: ensured.spreadsheetUrl,
+      syncedTabs: targetTabs,
+      updatedRowCount,
+      appendedRowCount,
+    };
+  });
 }

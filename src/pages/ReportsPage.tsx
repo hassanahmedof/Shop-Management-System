@@ -2,19 +2,27 @@ import { ChevronDown, Download, FileSpreadsheet, FileText, Filter, X } from 'luc
 import { useMemo, useState } from 'react';
 import { CompactExpandableRow, CompactSection } from '../components/CompactSection';
 import { SearchableSelect, type SearchableSelectOption } from '../components/SearchableSelect';
+import { useAuth } from '../contexts/AuthContext';
 import { useShopData } from '../contexts/ShopDataContext';
 import { computeTopActivityValues } from '../services/recordSearchService';
 import type { PaymentMethod } from '../types/shop';
 import { addDaysToIso, getKarachiDateIso } from '../utils/formatters';
+import { formatStockBreakdown } from '../utils/packaging';
 import {
   buildReportData,
   exportReportExcel,
   exportReportPDF,
   type ReportType,
 } from '../utils/reports';
+import {
+  buildSellerFilterOptions,
+  getSaleSellerKey,
+  matchesSellerFilter,
+} from '../utils/sellerAttribution';
 
 const REPORT_TYPES: Array<{ id: ReportType; label: string; description: string }> = [
-  { id: 'sales', label: 'Sales Report', description: 'All completed and cancelled sales with COGS and profit' },
+  { id: 'sales', label: 'Sales Report', description: 'All completed and cancelled sales with seller, COGS, and profit' },
+  { id: 'seller_performance', label: 'Admin & Staff Sales Report', description: 'Compare sales revenue, bills, and profit by each Admin and Staff member' },
   { id: 'purchases', label: 'Purchase Report', description: 'Supplier purchases, paid amounts, and balances due' },
   { id: 'expenses', label: 'Expense Report', description: 'Operating expenses by category and payment method' },
   { id: 'inventory', label: 'Inventory Report', description: 'Current stock quantities, valuation, margins, and expiry' },
@@ -26,12 +34,15 @@ const REPORT_TYPES: Array<{ id: ReportType; label: string; description: string }
 ];
 
 export function ReportsPage() {
+  const { user, shopId } = useAuth();
+  const activeShopId = shopId || user?.uid || '';
   const {
     products,
     categories,
     brands,
     suppliers,
     staffMembers,
+    adminMembers,
     sales,
     saleItems,
     purchases,
@@ -71,7 +82,7 @@ export function ReportsPage() {
         value: p.id,
         label: p.name,
         subtitle: `${p.brandName || 'Unbranded'} · ${p.categoryName || 'Uncategorized'}`,
-        meta: `Stock: ${p.currentStock} ${p.unit}`,
+        meta: `Stock: ${formatStockBreakdown(p.currentStock, p).summaryText}`,
         keywords: [p.name, p.brandName, p.categoryName, p.supplierName],
       })),
     [products]
@@ -109,21 +120,17 @@ export function ReportsPage() {
   );
 
   const staffOptions = useMemo<SearchableSelectOption[]>(
-    () => [
-      {
-        value: 'owner',
-        label: 'Owner (Admin)',
-        subtitle: 'Direct owner-recorded sales',
-        keywords: ['owner', 'admin'],
-      },
-      ...staffMembers.map((m) => ({
-        value: m.id,
-        label: m.name,
-        subtitle: `@${m.username}${m.phone ? ` · ${m.phone}` : ''}`,
-        keywords: [m.name, m.username, m.phone].filter(Boolean),
-      })),
-    ],
-    [staffMembers]
+    () =>
+      buildSellerFilterOptions({
+        sales,
+        staffMembers,
+        adminMembers,
+        settings,
+        user,
+        shopId: activeShopId,
+        includeAllOwnersOption: true,
+      }),
+    [sales, staffMembers, adminMembers, settings, user, activeShopId]
   );
 
   const paymentOptions = useMemo<SearchableSelectOption[]>(
@@ -151,7 +158,7 @@ export function ReportsPage() {
     [purchases]
   );
   const frequentStaffIds = useMemo(
-    () => computeTopActivityValues(sales, (s) => s.staffId || 'owner', 5),
+    () => computeTopActivityValues(sales, (s) => getSaleSellerKey(s), 5),
     [sales]
   );
 
@@ -193,11 +200,7 @@ export function ReportsPage() {
         ? new Set(
             sales
               .filter((s) => {
-                if (filterStaffId === 'owner') {
-                  if (s.staffId && s.staffId !== 'owner') return false;
-                } else if (filterStaffId && s.staffId !== filterStaffId) {
-                  return false;
-                }
+                if (!matchesSellerFilter(s, filterStaffId)) return false;
                 if (filterPaymentMethod && s.paymentMethod !== filterPaymentMethod) return false;
                 return true;
               })
@@ -231,11 +234,7 @@ export function ReportsPage() {
       : null;
 
     return sales.filter((s) => {
-      if (filterStaffId === 'owner') {
-        if (s.staffId && s.staffId !== 'owner') return false;
-      } else if (filterStaffId && s.staffId !== filterStaffId) {
-        return false;
-      }
+      if (!matchesSellerFilter(s, filterStaffId)) return false;
       if (filterPaymentMethod && s.paymentMethod !== filterPaymentMethod) return false;
       if (saleIdsWithMatchingItems && !saleIdsWithMatchingItems.has(s.id)) return false;
       return true;
@@ -281,6 +280,10 @@ export function ReportsPage() {
         purchases: filteredPurchases,
         expenses: filteredExpenses,
         stockMovements: filteredStockMovements,
+        staffMembers,
+        adminMembers,
+        user,
+        shopId: activeShopId,
       }),
     [
       reportType,
@@ -293,6 +296,10 @@ export function ReportsPage() {
       filteredPurchases,
       filteredExpenses,
       filteredStockMovements,
+      staffMembers,
+      adminMembers,
+      user,
+      activeShopId,
     ]
   );
 
@@ -319,11 +326,11 @@ export function ReportsPage() {
   return (
     <div className="space-y-4">
       {/* Report Selection & Export Controls */}
-      <section className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 space-y-3">
+      <section className="cm-surface border rounded-xl p-3.5 sm:p-4 space-y-3">
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-2.5">
           <div>
-            <h2 className="text-sm sm:text-base font-semibold text-slate-900">Business Reports</h2>
-            <p className="text-[11px] sm:text-xs text-slate-500">
+            <h2 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)]">Business Reports</h2>
+            <p className="text-[11px] sm:text-xs text-[var(--cm-text-muted)]">
               Preview and export in PDF or Excel format.
             </p>
           </div>
@@ -333,7 +340,7 @@ export function ReportsPage() {
               <button
                 type="button"
                 onClick={clearReportFilters}
-                className="inline-flex items-center gap-1 px-2.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs font-medium text-teal-700 border border-teal-200 bg-teal-50/60 hover:bg-teal-50 rounded-lg cursor-pointer"
+                className="inline-flex items-center gap-1 px-2.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs font-medium text-[var(--cm-accent-text)] border border-[var(--cm-accent-border)] bg-[var(--cm-accent-soft)] rounded-lg cursor-pointer"
               >
                 <X className="w-3.5 h-3.5" />
                 Reset
@@ -342,7 +349,7 @@ export function ReportsPage() {
             <button
               type="button"
               onClick={() => exportReportPDF(report, shopName)}
-              className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs sm:text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 rounded-lg transition-colors cursor-pointer"
+              className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs sm:text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg transition-colors cursor-pointer"
             >
               <FileText className="w-4 h-4" />
               PDF
@@ -350,17 +357,17 @@ export function ReportsPage() {
             <button
               type="button"
               onClick={() => exportReportExcel(report, shopName)}
-              className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs sm:text-sm font-semibold text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer"
+              className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs sm:text-sm font-semibold text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg transition-colors cursor-pointer"
             >
-              <FileSpreadsheet className="w-4 h-4 text-emerald-700" />
+              <FileSpreadsheet className="w-4 h-4 text-[var(--cm-success)]" />
               Excel
             </button>
           </div>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5 pt-2 border-t border-slate-100">
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5 pt-2 border-t border-[var(--cm-border)]">
           <div className="col-span-2 md:col-span-1">
-            <label className="block text-[11px] font-medium text-slate-700 mb-1">Report Type</label>
+            <label className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">Report Type</label>
             <SearchableSelect
               options={reportTypeOptions}
               value={reportType}
@@ -377,22 +384,22 @@ export function ReportsPage() {
           </div>
 
           <div>
-            <label className="block text-[11px] font-medium text-slate-700 mb-1">From Date</label>
+            <label className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">From Date</label>
             <input
               type="date"
               value={fromDate}
               onChange={(e) => setFromDate(e.target.value)}
-              className="w-full px-2.5 py-1.5 min-h-[40px] sm:min-h-0 text-xs sm:text-sm border border-slate-200 rounded-lg font-mono-num"
+              className="w-full px-2.5 py-1.5 min-h-[40px] sm:min-h-0 text-xs sm:text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
             />
           </div>
 
           <div>
-            <label className="block text-[11px] font-medium text-slate-700 mb-1">To Date</label>
+            <label className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">To Date</label>
             <input
               type="date"
               value={toDate}
               onChange={(e) => setToDate(e.target.value)}
-              className="w-full px-2.5 py-1.5 min-h-[40px] sm:min-h-0 text-xs sm:text-sm border border-slate-200 rounded-lg font-mono-num"
+              className="w-full px-2.5 py-1.5 min-h-[40px] sm:min-h-0 text-xs sm:text-sm cm-input border rounded-lg font-mono-num focus:outline-none focus:border-[var(--cm-accent)]"
             />
           </div>
         </div>
@@ -401,18 +408,18 @@ export function ReportsPage() {
           <button
             type="button"
             onClick={() => setShowFilters((v) => !v)}
-            className="md:hidden inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-semibold text-slate-700 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer"
+            className="md:hidden inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-semibold text-[var(--cm-text-secondary)] bg-[var(--cm-bg-subtle)] border border-[var(--cm-border)] rounded-lg cursor-pointer"
           >
-            <Filter className="w-3.5 h-3.5 text-teal-600" />
+            <Filter className="w-3.5 h-3.5 text-[var(--cm-accent)]" />
             Filters {activeFilterCount > 0 ? `(${activeFilterCount})` : ''}
             <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showFilters ? 'rotate-180' : ''}`} />
           </button>
           <button
             type="button"
             onClick={() => setShowQuickCards((v) => !v)}
-            className="inline-flex items-center gap-1 text-xs font-medium text-teal-700 hover:text-teal-800 cursor-pointer"
+            className="inline-flex items-center gap-1 text-xs font-medium text-[var(--cm-accent-text)] hover:underline cursor-pointer"
           >
-            <span>{showQuickCards ? 'Hide Report Directory' : 'All 9 Report Types'}</span>
+            <span>{showQuickCards ? 'Hide Report Directory' : 'All 10 Report Types'}</span>
             <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showQuickCards ? 'rotate-180' : ''}`} />
           </button>
         </div>
@@ -420,7 +427,7 @@ export function ReportsPage() {
         <div
           className={`${
             showFilters ? 'grid' : 'hidden md:grid'
-          } grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-2 pt-2 border-t border-slate-100`}
+          } grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-2 pt-2 border-t border-[var(--cm-border)]`}
         >
           <SearchableSelect
             options={productOptions}
@@ -474,10 +481,10 @@ export function ReportsPage() {
             options={staffOptions}
             value={filterStaffId}
             onChange={setFilterStaffId}
-            emptyOptionLabel="All Staff / Owner"
-            placeholder="All Staff / Owner"
-            searchPlaceholder="Search staff..."
-            ariaLabel="Filter report by staff member"
+            emptyOptionLabel="All Sellers (Admins & Staff)"
+            placeholder="All Sellers (Admins & Staff)"
+            searchPlaceholder="Search admin or staff..."
+            ariaLabel="Filter report by admin or staff member"
             suggestionScope="staff"
             suggestedValues={frequentStaffIds}
             size="sm"
@@ -496,7 +503,7 @@ export function ReportsPage() {
         </div>
 
         {showQuickCards && (
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-slate-100">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-[var(--cm-border)]">
             {REPORT_TYPES.map((rt) => (
               <button
                 key={rt.id}
@@ -507,15 +514,15 @@ export function ReportsPage() {
                 }}
                 className={`text-left p-2.5 border rounded-lg transition-colors cursor-pointer ${
                   reportType === rt.id
-                    ? 'border-teal-600 bg-teal-50/50'
-                    : 'border-slate-200 hover:bg-slate-50'
+                    ? 'border-[var(--cm-accent-border)] bg-[var(--cm-accent-soft)]'
+                    : 'border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)]'
                 }`}
               >
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-900">{rt.label}</span>
-                  <Download className="w-3.5 h-3.5 text-slate-400" />
+                  <span className="text-xs font-semibold text-[var(--cm-text-primary)]">{rt.label}</span>
+                  <Download className="w-3.5 h-3.5 text-[var(--cm-text-muted)]" />
                 </div>
-                <p className="mt-0.5 text-[11px] text-slate-500">{rt.description}</p>
+                <p className="mt-0.5 text-[11px] text-[var(--cm-text-muted)]">{rt.description}</p>
               </button>
             ))}
           </div>
@@ -529,18 +536,18 @@ export function ReportsPage() {
         summary={`${report.rows.length} rows`}
       >
         {report.summaryLines.length > 0 && (
-          <div className="px-3.5 py-2.5 border-b border-slate-100 bg-slate-50/60 grid grid-cols-2 sm:flex sm:flex-wrap gap-x-5 gap-y-1.5 text-xs">
+          <div className="px-3.5 py-2.5 border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] grid grid-cols-2 sm:flex sm:flex-wrap gap-x-5 gap-y-1.5 text-xs">
             {report.summaryLines.map((s) => (
               <div key={s.label}>
-                <span className="text-slate-500">{s.label}: </span>
-                <span className="font-semibold font-mono-num tabular-nums text-slate-900">{s.value}</span>
+                <span className="text-[var(--cm-text-muted)]">{s.label}: </span>
+                <span className="font-semibold font-mono-num tabular-nums text-[var(--cm-text-primary)]">{s.value}</span>
               </div>
             ))}
           </div>
         )}
 
         {report.rows.length === 0 ? (
-          <div className="p-6 text-center text-xs sm:text-sm text-slate-500">
+          <div className="p-6 text-center text-xs sm:text-sm text-[var(--cm-text-muted)]">
             No records found for this report in the selected date range.
           </div>
         ) : (
@@ -548,7 +555,7 @@ export function ReportsPage() {
             <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
+                  <tr className="border-b border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] text-xs font-semibold text-[var(--cm-text-secondary)]">
                     {report.columns.map((col) => (
                       <th key={col} className="py-2 px-3 whitespace-nowrap">
                         {col}
@@ -556,11 +563,11 @@ export function ReportsPage() {
                     ))}
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                <tbody className="divide-y divide-[var(--cm-border)] text-xs sm:text-sm">
                   {report.rows.map((row, idx) => (
-                    <tr key={idx} className="hover:bg-slate-50">
+                    <tr key={idx} className="hover:bg-[var(--cm-bg-hover)]">
                       {row.map((cell, cIdx) => (
-                        <td key={cIdx} className="py-2 px-3 font-mono-num text-slate-700 whitespace-nowrap">
+                        <td key={cIdx} className="py-2 px-3 font-mono-num text-[var(--cm-text-secondary)] whitespace-nowrap">
                           {cell}
                         </td>
                       ))}
@@ -570,7 +577,7 @@ export function ReportsPage() {
               </table>
             </div>
 
-            <div className="md:hidden divide-y divide-slate-100">
+            <div className="md:hidden divide-y divide-[var(--cm-border)]">
               {report.rows.map((row, idx) => {
                 const primaryLabel = row[0] ?? `Row ${idx + 1}`;
                 const secondaryLabel = row.length > 2 ? `${report.columns[1]}: ${row[1]}` : undefined;
@@ -587,11 +594,11 @@ export function ReportsPage() {
                     isExpanded={expandedRowIdx === idx}
                     onToggle={() => setExpandedRowIdx((prev) => (prev === idx ? null : idx))}
                     expandedContent={
-                      <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-slate-600">
+                      <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[var(--cm-text-secondary)]">
                         {report.columns.map((col, cIdx) => (
                           <div key={col} className="min-w-0">
-                            <div className="text-[10px] text-slate-400 uppercase tracking-wide">{col}</div>
-                            <div className="font-mono-num text-slate-900 font-medium break-words">
+                            <div className="text-[10px] text-[var(--cm-text-muted)] uppercase tracking-wide">{col}</div>
+                            <div className="font-mono-num text-[var(--cm-text-primary)] font-medium break-words">
                               {row[cIdx] ?? '—'}
                             </div>
                           </div>

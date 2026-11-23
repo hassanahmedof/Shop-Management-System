@@ -175,3 +175,23 @@ export function roundMoney(val: number): number {
 export function csvSafe(value: string): string {
   return value.replace(/[\r\n]+/g, ' ').trim();
 }
+
+export function normalizeCustomerWhatsapp(raw?: string | null): string | undefined {
+  const cleaned = (raw || '').trim().replace(/\s+/g, ' ');
+  if (!cleaned) return undefined;
+  return cleaned.slice(0, 30);
+}
+
+export function validateOptionalCustomerWhatsapp(raw?: string | null): string | null {
+  const cleaned = normalizeCustomerWhatsapp(raw);
+  if (!cleaned) return null;
+  if (!/^\+?[\d(][\d\s\-().]{4,29}$/.test(cleaned)) {
+    return 'Enter a valid WhatsApp/mobile number (e.g. +92 300 1234567 or 03001234567), or leave blank.';
+  }
+  const digitsOnly = cleaned.replace(/\D/g, '');
+  if (digitsOnly.length < 7 || digitsOnly.length > 15) {
+    return 'Phone number should contain between 7 and 15 digits, or leave blank.';
+  }
+  return null;
+}
+

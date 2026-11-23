@@ -44,10 +44,10 @@ export function CompactSection({
   };
 
   return (
-    <section className={`bg-white border border-slate-200 rounded-xl ${className}`}>
+    <section className={`cm-surface border rounded-2xl overflow-hidden ${className}`}>
       <div
         className={`px-3.5 py-2.5 sm:px-4 sm:py-3 flex flex-wrap items-center justify-between gap-2 ${
-          isOpen ? 'border-b border-slate-200' : ''
+          isOpen ? 'border-b border-[var(--cm-border)]' : ''
         }`}
       >
         {collapsible ? (
@@ -57,20 +57,20 @@ export function CompactSection({
             aria-expanded={isOpen}
             className="flex items-center gap-2 min-w-0 flex-1 text-left cursor-pointer group"
           >
-            <span className="text-slate-400 group-hover:text-teal-600 shrink-0">
+            <span className="text-[var(--cm-text-muted)] group-hover:text-[var(--cm-accent-text)] shrink-0">
               {isOpen ? (
-                <ChevronDown className="w-4 h-4 text-teal-600" />
+                <ChevronDown className="w-4 h-4 text-[var(--cm-accent-text)]" />
               ) : (
                 <ChevronRight className="w-4 h-4" />
               )}
             </span>
             {icon && <span className="shrink-0">{icon}</span>}
             <div className="min-w-0 flex-1">
-              <div className="text-sm sm:text-base font-semibold text-slate-900 truncate">
+              <div className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)] truncate">
                 {title}
               </div>
               {subtitle && (
-                <div className="text-[11px] sm:text-xs text-slate-500 truncate">{subtitle}</div>
+                <div className="text-[11px] sm:text-xs text-[var(--cm-text-muted)] truncate">{subtitle}</div>
               )}
             </div>
           </button>
@@ -78,11 +78,11 @@ export function CompactSection({
           <div className="flex items-center gap-2 min-w-0 flex-1">
             {icon && <span className="shrink-0">{icon}</span>}
             <div className="min-w-0 flex-1">
-              <h2 className="text-sm sm:text-base font-semibold text-slate-900 truncate">
+              <h2 className="text-sm sm:text-base font-semibold text-[var(--cm-text-primary)] truncate">
                 {title}
               </h2>
               {subtitle && (
-                <p className="text-[11px] sm:text-xs text-slate-500 truncate">{subtitle}</p>
+                <p className="text-[11px] sm:text-xs text-[var(--cm-text-muted)] truncate">{subtitle}</p>
               )}
             </div>
           </div>
@@ -91,7 +91,7 @@ export function CompactSection({
         {(summary || actions) && (
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             {summary && (
-              <div className="text-xs text-slate-500 font-mono-num tabular-nums">{summary}</div>
+              <div className="text-xs text-[var(--cm-text-muted)] font-mono-num tabular-nums">{summary}</div>
             )}
             {actions}
           </div>
@@ -132,20 +132,20 @@ export function CompactExpandableRow({
         type="button"
         onClick={onToggle}
         aria-expanded={isExpanded}
-        className="w-full px-3 py-2.5 min-h-[48px] flex items-center justify-between gap-2.5 text-left hover:bg-slate-50/80 transition-colors cursor-pointer"
+        className="w-full px-3 py-2.5 min-h-[48px] flex items-center justify-between gap-2.5 text-left hover:bg-[var(--cm-bg-hover)] transition-colors cursor-pointer"
       >
         <div className="flex items-center gap-2 min-w-0 flex-1">
-          <span className="text-slate-400 shrink-0">
+          <span className="text-[var(--cm-text-muted)] shrink-0">
             {isExpanded ? (
-              <ChevronDown className="w-4 h-4 text-teal-600" />
+              <ChevronDown className="w-4 h-4 text-[var(--cm-accent-text)]" />
             ) : (
               <ChevronRight className="w-4 h-4" />
             )}
           </span>
           <div className="min-w-0 flex-1">
-            <div className="text-xs sm:text-sm font-medium text-slate-900 truncate">{title}</div>
+            <div className="text-xs sm:text-sm font-medium text-[var(--cm-text-primary)] truncate">{title}</div>
             {subtitle && (
-              <div className="text-[11px] text-slate-500 truncate font-mono-num tabular-nums">
+              <div className="text-[11px] text-[var(--cm-text-muted)] truncate font-mono-num tabular-nums">
                 {subtitle}
               </div>
             )}
@@ -153,11 +153,11 @@ export function CompactExpandableRow({
         </div>
 
         <div className="text-right shrink-0">
-          <div className="text-xs sm:text-sm font-semibold font-mono-num tabular-nums text-slate-900 whitespace-nowrap">
+          <div className="text-xs sm:text-sm font-semibold font-mono-num tabular-nums text-[var(--cm-text-primary)] whitespace-nowrap">
             {rightPrimary}
           </div>
           {rightSecondary && (
-            <div className="text-[11px] font-mono-num tabular-nums text-slate-500 whitespace-nowrap">
+            <div className="text-[11px] font-mono-num tabular-nums text-[var(--cm-text-muted)] whitespace-nowrap">
               {rightSecondary}
             </div>
           )}
@@ -165,7 +165,7 @@ export function CompactExpandableRow({
       </button>
 
       {isExpanded && (
-        <div className="px-3.5 py-2.5 bg-slate-50 border-t border-slate-100 space-y-2 text-xs">
+        <div className="px-3.5 py-2.5 bg-[var(--cm-bg-subtle)] border-t border-[var(--cm-border)] space-y-2 text-xs">
           {expandedContent}
         </div>
       )}

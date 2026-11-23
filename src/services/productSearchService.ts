@@ -1,6 +1,22 @@
 import { collection, getDocs, limit, query, where } from 'firebase/firestore';
 import { db } from '../lib/firebase';
-import type { Product, StaffCatalogItem } from '../types/shop';
+import type {
+  OriginType,
+  Product,
+  ProductPackagingUnit,
+  StaffCatalogItem,
+  StaffPackagingOption,
+} from '../types/shop';
+import { getEffectiveBaseUnit } from '../utils/packaging';
+import { recordPerfMetric, startPerfTimer } from '../utils/perfMonitor';
+
+export interface ProductSearchIndex {
+  nameLower: string;
+  brandLower: string;
+  categoryLower: string;
+  combined: string;
+  nameWords: string[];
+}
 
 export interface SearchableProductItem {
   id: string;
@@ -8,10 +24,20 @@ export interface SearchableProductItem {
   brandName: string;
   categoryName: string;
   salePrice: number;
+  wholesalePrice?: number;
   purchasePrice?: number;
   currentStock: number;
   unit: string;
+  baseUnit: string;
+  packagingUnits?: Array<ProductPackagingUnit | StaffPackagingOption>;
+  originType?: OriginType;
+  bottleSize?: string;
+  storageLocation?: string;
+  isReturnable?: boolean;
+  returnableUnitName?: string;
+  depositPerReturnable?: number;
   isActive: boolean;
+  _searchIdx?: ProductSearchIndex;
 }
 
 export interface ProductSearchResult {
@@ -24,31 +50,106 @@ export interface HighlightSegment {
   match: boolean;
 }
 
+const WORD_SPLIT_REGEX = /[\s\-_/]+/;
+
+function buildProductSearchIndex(fields: {
+  name: string;
+  brandName: string;
+  categoryName: string;
+  originType?: string;
+  bottleSize?: string;
+  storageLocation?: string;
+}): ProductSearchIndex {
+  const nameLower = fields.name.toLowerCase();
+  const brandLower = fields.brandName.toLowerCase();
+  const categoryLower = fields.categoryName.toLowerCase();
+  const sizeLower = (fields.bottleSize || '').toLowerCase();
+  const locLower = (fields.storageLocation || '').toLowerCase();
+  const originLower = (fields.originType || '').toLowerCase();
+  return {
+    nameLower,
+    brandLower,
+    categoryLower,
+    combined: `${nameLower} ${brandLower} ${categoryLower} ${originLower} ${sizeLower} ${locLower}`,
+    nameWords: nameLower.split(WORD_SPLIT_REGEX).filter(Boolean),
+  };
+}
+
 export function mapProductsToSearchable(products: Product[]): SearchableProductItem[] {
-  return products.map((p) => ({
-    id: p.id,
-    name: p.name,
-    brandName: p.brandName || '',
-    categoryName: p.categoryName || '',
-    salePrice: p.salePrice,
-    purchasePrice: p.purchasePrice,
-    currentStock: p.currentStock,
-    unit: p.unit || 'Unit',
-    isActive: p.isActive !== false,
-  }));
+  return products.map((p) => {
+    const baseUnit = getEffectiveBaseUnit(p);
+    const brandName = p.brandName || '';
+    const categoryName = p.categoryName || '';
+    const originType = p.originType || '';
+    const bottleSize = p.bottleSize || '';
+    const storageLocation = p.storageLocation || '';
+    return {
+      id: p.id,
+      name: p.name,
+      brandName,
+      categoryName,
+      salePrice: p.salePrice,
+      wholesalePrice: p.wholesalePrice ?? 0,
+      purchasePrice: p.purchasePrice,
+      currentStock: p.currentStock,
+      unit: baseUnit,
+      baseUnit,
+      packagingUnits: Array.isArray(p.packagingUnits) ? p.packagingUnits : [],
+      originType,
+      bottleSize,
+      storageLocation,
+      isReturnable: Boolean(p.isReturnable),
+      returnableUnitName: p.returnableUnitName || '',
+      depositPerReturnable: p.depositPerReturnable ?? 0,
+      isActive: p.isActive !== false,
+      _searchIdx: buildProductSearchIndex({
+        name: p.name,
+        brandName,
+        categoryName,
+        originType,
+        bottleSize,
+        storageLocation,
+      }),
+    };
+  });
 }
 
 export function mapStaffCatalogToSearchable(catalog: StaffCatalogItem[]): SearchableProductItem[] {
-  return catalog.map((c) => ({
-    id: c.productId,
-    name: c.name,
-    brandName: c.brandName || '',
-    categoryName: c.categoryName || '',
-    salePrice: c.salePrice,
-    currentStock: c.currentStock,
-    unit: c.unit || 'Unit',
-    isActive: c.isActive !== false,
-  }));
+  return catalog.map((c) => {
+    const baseUnit = getEffectiveBaseUnit(c);
+    const brandName = c.brandName || '';
+    const categoryName = c.categoryName || '';
+    const originType = c.originType || '';
+    const bottleSize = c.bottleSize || '';
+    const storageLocation = c.storageLocation || '';
+    return {
+      id: c.productId,
+      name: c.name,
+      brandName,
+      categoryName,
+      salePrice: c.salePrice,
+      wholesalePrice: c.wholesalePrice ?? 0,
+      currentStock: c.currentStock,
+      unit: baseUnit,
+      baseUnit,
+      packagingUnits: Array.isArray(c.packagingUnits) ? c.packagingUnits : [],
+      originType,
+      bottleSize,
+      storageLocation,
+      isReturnable: Boolean(c.isReturnable),
+      returnableUnitName: c.returnableUnitName || '',
+      depositPerReturnable: c.depositPerReturnable ?? 0,
+      isActive: c.isActive !== false,
+      _searchIdx: buildProductSearchIndex({
+        name: c.name,
+        brandName,
+        categoryName,
+        originType,
+        bottleSize,
+        storageLocation,
+      }),
+    };
+  });
 }
 
 export function normalizeSearchTokens(rawQuery: string): string[] {
@@ -97,25 +198,37 @@ export function searchProductsCatalog(
   rawQuery: string
 ): ProductSearchResult[] {
   const tokens = normalizeSearchTokens(rawQuery);
-  const normalizedQuery = tokens.join(' ');
-  const activeItems = items.filter((item) => item.isActive);
-
   if (tokens.length === 0) {
     return [];
   }
 
+  const stopTimer = startPerfTimer();
+  const normalizedQuery = tokens.join(' ');
   const results: ProductSearchResult[] = [];
+  const tokenCount = tokens.length;
 
-  for (const item of activeItems) {
-    const nameLower = item.name.toLowerCase();
-    const brandLower = item.brandName.toLowerCase();
-    const categoryLower = item.categoryName.toLowerCase();
-    const combined = `${nameLower} ${brandLower} ${categoryLower}`;
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i];
+    if (!item.isActive) continue;
+
+    const idx =
+      item._searchIdx ||
+      buildProductSearchIndex({
+        name: item.name,
+        brandName: item.brandName,
+        categoryName: item.categoryName,
+        originType: item.originType,
+        bottleSize: item.bottleSize,
+        storageLocation: item.storageLocation,
+      });
+
+    const { nameLower, brandLower, categoryLower, combined, nameWords } = idx;
 
     let allMatched = true;
     let score = 0;
 
-    for (const token of tokens) {
+    for (let t = 0; t < tokenCount; t += 1) {
+      const token = tokens[t];
       if (!combined.includes(token)) {
         allMatched = false;
         break;
@@ -125,10 +238,15 @@ export function searchProductsCatalog(
         score += 80;
       } else if (nameLower.startsWith(token)) {
         score += 55;
-      } else if (nameLower.split(/[\s\-_/]+/).some((word) => word.startsWith(token))) {
-        score += 42;
       } else if (nameLower.includes(token)) {
-        score += 28;
+        let wordStarts = false;
+        for (let w = 0; w < nameWords.length; w += 1) {
+          if (nameWords[w].startsWith(token)) {
+            wordStarts = true;
+            break;
+          }
+        }
+        score += wordStarts ? 42 : 28;
       } else if (brandLower.startsWith(token)) {
         score += 20;
       } else if (brandLower.includes(token)) {
@@ -159,6 +277,13 @@ export function searchProductsCatalog(
     }
     return a.item.name.localeCompare(b.item.name);
   });
+
+  if (items.length >= 25) {
+    recordPerfMetric('catalog_search', 'search_products', stopTimer(), {
+      catalogSize: items.length,
+      matchCount: results.length,
+    });
+  }
 
   return results;
 }

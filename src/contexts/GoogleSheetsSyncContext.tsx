@@ -11,6 +11,16 @@ import {
 } from 'react';
 import { SHEET_TABS, type SheetTabName } from '../../shared/googleSheetsSchema';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import {
+  type BackgroundSheetsTask,
+  getDueSheetsTasks,
+  getNextSheetsRetryAt,
+  getSheetsQueueTasks,
+  markSheetsTasksCompleted,
+  markSheetsTasksRetryOrFailed,
+  retryFailedSheetsTasks,
+  subscribeSheetsQueue,
+} from '../services/backgroundTaskQueue';
 import { buildSheetSyncPayload, type ShopSnapshotData } from '../services/googleSheetsMapper';
 import { isNetworkOrOfflineError } from '../services/offlineSyncService';
 import {
@@ -19,6 +29,7 @@ import {
   enqueueOrUpdateSyncJob,
 } from '../services/sheetsQueueService';
 import type { GoogleSheetsIntegration, SheetsSyncJob } from '../types/shop';
+import { recordPerfMetric, startPerfTimer } from '../utils/perfMonitor';
 import {
   buildPolicyEnforcedResolution,
   classifySheetsSyncError,
@@ -63,7 +74,7 @@ function computeSignatures(data: ShopSnapshotData): ModuleSignatures {
     sales: data.sales
       .map(
         (s) =>
-          `${s.id}:${s.saleDate}:${s.totalAmount}:${s.paymentMethod}:${s.status}:${s.notes}:${tsKey(s.updatedAt)}`
+          `${s.id}:${s.saleDate}:${s.totalAmount}:${s.paymentMethod}:${s.status}:${s.customerWhatsapp || ''}:${s.notes}:${tsKey(s.updatedAt)}`
       )
       .join('|'),
     saleItems: data.saleItems
@@ -186,7 +197,9 @@ export interface GoogleSheetsSyncContextValue {
   serviceAccountDiagnostic: string | null;
   isSyncing: boolean;
   pendingCount: number;
+  completedCount: number;
   failedCount: number;
+  sheetsQueueTasks: BackgroundSheetsTask[];
   consecutiveFailures: number;
   lastError: string | null;
   lastErrorResolution: SheetsErrorResolution | null;
@@ -226,6 +239,7 @@ export function GoogleSheetsSyncProvider({
 
   const [integration, setIntegration] = useState<GoogleSheetsIntegration | null>(null);
   const [queueJobs, setQueueJobs] = useState<SheetsSyncJob[]>([]);
+  const [bgTasks, setBgTasks] = useState<BackgroundSheetsTask[]>([]);
   const [integrationLoaded, setIntegrationLoaded] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [consecutiveFailures, setConsecutiveFailures] = useState(0);
@@ -398,6 +412,18 @@ export function GoogleSheetsSyncProvider({
     };
   }, [user, sessionRole, shopId, shopReady]);
 
+  // Subscribe to persistent localStorage Google Sheets background task queue
+  useEffect(() => {
+    if (!user || sessionRole !== 'owner' || !shopId || !shopReady) {
+      setBgTasks([]);
+      return;
+    }
+    setBgTasks(getSheetsQueueTasks(shopId));
+    return subscribeSheetsQueue(() => {
+      setBgTasks(getSheetsQueueTasks(shopId));
+    });
+  }, [user, sessionRole, shopId, shopReady]);
+
   const fetchCapabilities = useCallback(async () => {
     const currentUser = userRef.current;
     if (!currentUser || sessionRole !== 'owner' || !shopId || !shopReady) {
@@ -524,6 +550,17 @@ export function GoogleSheetsSyncProvider({
       const accessToken = options?.explicitToken || tokenRef.current;
       const hasServerServiceAccount = capabilitiesRef.current.serviceAccountConfigured;
       const attempt = options?.retryAttempt ?? 0;
+      const syncStartedAt = Date.now();
+      const syncedTabSet = new Set<SheetTabName>(tabsToSync);
+      const coveredBgTaskIds = getSheetsQueueTasks(shopId)
+        .filter(
+          (t) =>
+            t.status === 'pending' &&
+            t.createdAtMs <= syncStartedAt &&
+            (tabsToSync.length >= ALL_SHEET_NAMES.length ||
+              t.targetSheets.some((tab) => syncedTabSet.has(tab)))
+        )
+        .map((t) => t.id);
 
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         const resolution = classifySheetsSyncError({
@@ -535,6 +572,9 @@ export function GoogleSheetsSyncProvider({
         });
         setLocalError(resolution.summary);
         setLocalErrorResolution(resolution);
+        markSheetsTasksRetryOrFailed(shopId, coveredBgTaskIds, resolution.summary, {
+          deferWithoutPenalty: true,
+        });
         await persistPendingJob(tabsToSync, 'pending', resolution.summary, attempt);
         if (options?.throwOnError) throw new SheetsOAuthError(resolution);
         return;
@@ -555,6 +595,9 @@ export function GoogleSheetsSyncProvider({
         setLocalError(resolution.summary);
         setLocalErrorResolution(resolution);
         recordSyncFailure();
+        markSheetsTasksRetryOrFailed(shopId, coveredBgTaskIds, resolution.summary, {
+          deferWithoutPenalty: true,
+        });
         await persistPendingJob(tabsToSync, 'pending', resolution.summary, attempt);
         await ensureIntegrationDoc(shopId, {
           connectionState: integrationRef.current?.spreadsheetId ? 'error' : 'disconnected',
@@ -575,12 +618,9 @@ export function GoogleSheetsSyncProvider({
       setLocalError(null);
       setLocalErrorResolution(null);
       clearScheduledRetry();
+      const stopSyncTimer = startPerfTimer();
 
       try {
-        await ensureIntegrationDoc(shopId, {
-          lastSyncStatus: 'syncing',
-        }).catch(() => undefined);
-
         const idToken = await currentUser.getIdToken();
         const snapshot = latestDataRef.current;
         const sheetsPayload = buildSheetSyncPayload(snapshot, tabsToSync);
@@ -633,14 +673,26 @@ export function GoogleSheetsSyncProvider({
             serviceAccountStatus: capabilitiesRef.current.serviceAccountStatus,
             serviceAccountDiagnostic: capabilitiesRef.current.serviceAccountDiagnostic,
           });
+          const isAuthMissing =
+            body.code === 'GOOGLE_TOKEN_EXPIRED' ||
+            body.code === 'GOOGLE_TOKEN_MISSING' ||
+            res.status === 401;
           const isRetryable =
             res.status === 429 || res.status >= 500 || body.code === 'GOOGLE_RATE_LIMIT';
 
+          const nextRetryAt = markSheetsTasksRetryOrFailed(
+            shopId,
+            coveredBgTaskIds,
+            resolution.summary,
+            {
+              deferWithoutPenalty: isAuthMissing,
+              forcePermanentFail: !isRetryable && !isAuthMissing,
+            }
+          );
+
           await persistPendingJob(
             tabsToSync,
-            body.code === 'GOOGLE_TOKEN_EXPIRED' || body.code === 'GOOGLE_TOKEN_MISSING'
-              ? 'pending'
-              : 'failed',
+            isAuthMissing ? 'pending' : 'failed',
             resolution.summary,
             attempt + 1
           );
@@ -653,7 +705,12 @@ export function GoogleSheetsSyncProvider({
           setLocalErrorResolution(resolution);
           recordSyncFailure();
 
-          if (isRetryable && attempt < 3) {
+          if (isRetryable && nextRetryAt !== null) {
+            const delayMs = Math.max(1500, nextRetryAt - Date.now());
+            retryTimerRef.current = window.setTimeout(() => {
+              void executeSync(tabsToSync, { retryAttempt: attempt + 1 });
+            }, delayMs);
+          } else if (isRetryable && attempt < 3) {
             const delayMs = [5000, 15000, 45000][attempt] || 45000;
             retryTimerRef.current = window.setTimeout(() => {
               void executeSync(tabsToSync, { retryAttempt: attempt + 1 });
@@ -666,16 +723,39 @@ export function GoogleSheetsSyncProvider({
           return;
         }
 
-        // Sync succeeded — clear pending queue jobs and update integration metadata
+        // Sync succeeded — mark covered persisted background tasks completed & clear Firestore queue
+        const fullyCoveredBgIds = getSheetsQueueTasks(shopId)
+          .filter(
+            (t) =>
+              t.status !== 'completed' &&
+              t.createdAtMs <= syncStartedAt &&
+              (tabsToSync.length >= ALL_SHEET_NAMES.length ||
+                t.targetSheets.every((tab) => syncedTabSet.has(tab)))
+          )
+          .map((t) => t.id);
+
+        markSheetsTasksCompleted(
+          shopId,
+          fullyCoveredBgIds,
+          tabsToSync.length >= ALL_SHEET_NAMES.length ? syncStartedAt : undefined
+        );
+
         const syncedAtIso = new Date().toISOString();
         const existingQueued = queueJobsRef.current;
-        for (const job of existingQueued) {
-          await deleteSyncJob(shopId, job.id).catch(() => undefined);
+        if (existingQueued.length > 0) {
+          await Promise.all(
+            existingQueued.map((job) => deleteSyncJob(shopId, job.id).catch(() => undefined))
+          );
         }
 
         setLocalError(null);
         setLocalErrorResolution(null);
         resetSyncFailures();
+
+        recordPerfMetric('sheets_sync', 'sync_tabs', stopSyncTimer(), {
+          tabCount: tabsToSync.length,
+          rowCount: totalRowsInSync,
+        });
 
         await ensureIntegrationDoc(shopId, {
           spreadsheetId: body.spreadsheetId || integrationRef.current?.spreadsheetId || '',
@@ -707,6 +787,15 @@ export function GoogleSheetsSyncProvider({
           resolution.code === 'policy_enforced' ||
           resolution.code === 'permission_denied';
 
+        const nextRetryAt = markSheetsTasksRetryOrFailed(
+          shopId,
+          coveredBgTaskIds,
+          resolution.summary,
+          {
+            deferWithoutPenalty: isAuthErr,
+          }
+        );
+
         await persistPendingJob(
           tabsToSync,
           isAuthErr ? 'pending' : 'failed',
@@ -722,7 +811,12 @@ export function GoogleSheetsSyncProvider({
         setLocalErrorResolution(resolution);
         recordSyncFailure();
 
-        if (!isAuthErr && attempt < 3) {
+        if (!isAuthErr && nextRetryAt !== null) {
+          const delayMs = Math.max(1500, nextRetryAt - Date.now());
+          retryTimerRef.current = window.setTimeout(() => {
+            void executeSync(tabsToSync, { retryAttempt: attempt + 1 });
+          }, delayMs);
+        } else if (!isAuthErr && attempt < 3) {
           const delayMs = [5000, 15000, 45000][attempt] || 45000;
           retryTimerRef.current = window.setTimeout(() => {
             void executeSync(tabsToSync, { retryAttempt: attempt + 1 });
@@ -899,14 +993,23 @@ export function GoogleSheetsSyncProvider({
   );
 
   const retryQueuedJobs = useCallback(async () => {
+    if (shopId) {
+      retryFailedSheetsTasks(shopId);
+    }
+    const localTabs = shopId
+      ? getSheetsQueueTasks(shopId)
+          .filter((t) => t.status === 'pending' || t.status === 'failed')
+          .flatMap((t) => t.targetSheets)
+      : [];
     const queuedTabs = Array.from(
-      new Set<SheetTabName>(
-        queueJobsRef.current.flatMap((j) => j.targetSheets as SheetTabName[])
-      )
+      new Set<SheetTabName>([
+        ...queueJobsRef.current.flatMap((j) => j.targetSheets as SheetTabName[]),
+        ...localTabs,
+      ])
     );
     const tabsToRun = queuedTabs.length > 0 ? queuedTabs : ALL_SHEET_NAMES;
     await executeSync(tabsToRun, { throwOnError: true });
-  }, [executeSync]);
+  }, [shopId, executeSync]);
 
   const saveServiceAccountJson = useCallback(
     async (rawJson: string): Promise<SaveServiceAccountResult> => {
@@ -1076,7 +1179,8 @@ export function GoogleSheetsSyncProvider({
     if (integration?.autoSyncEnabled === false) return;
 
     const alreadyInitializedSpreadsheet = Boolean(integration?.spreadsheetId);
-    const hasPendingQueue = queueJobs.length > 0;
+    const dueBgTasks = getDueSheetsTasks(shopId);
+    const hasPendingQueue = queueJobs.length > 0 || dueBgTasks.length > 0;
     const neverSynced = !integration?.lastSyncAt;
     const authSuffix = googleSheetsAccessToken
       ? googleSheetsAccessToken.slice(-8)
@@ -1094,13 +1198,34 @@ export function GoogleSheetsSyncProvider({
 
     if (hasPendingQueue && !syncInFlightRef.current) {
       const queuedTabs = Array.from(
-        new Set<SheetTabName>(queueJobs.flatMap((j) => j.targetSheets as SheetTabName[]))
+        new Set<SheetTabName>([
+          ...queueJobs.flatMap((j) => j.targetSheets as SheetTabName[]),
+          ...dueBgTasks.flatMap((t) => t.targetSheets),
+        ])
       );
       if (queuedTabs.length > 0) {
         void executeSync(queuedTabs, {
           explicitToken: googleSheetsAccessToken || undefined,
         });
       }
+      return;
+    }
+
+    // Ensure future backoff-scheduled background tasks wake up even after reloads
+    const nextRetryAt = getNextSheetsRetryAt(shopId);
+    if (nextRetryAt !== null && retryTimerRef.current === null) {
+      const delayMs = Math.max(500, nextRetryAt - Date.now());
+      retryTimerRef.current = window.setTimeout(() => {
+        retryTimerRef.current = null;
+        const readyTabs = Array.from(
+          new Set<SheetTabName>(getDueSheetsTasks(shopId).flatMap((t) => t.targetSheets))
+        );
+        if (readyTabs.length > 0) {
+          void executeSync(readyTabs, {
+            explicitToken: googleSheetsAccessToken || undefined,
+          });
+        }
+      }, delayMs);
     }
   }, [
     sessionRole,
@@ -1117,42 +1242,47 @@ export function GoogleSheetsSyncProvider({
     googleSheetsAccessToken,
     isOnline,
     queueJobs,
+    bgTasks,
     executeSync,
   ]);
 
-  // Real-time background change detection across all Firebase collections
+  // Real-time background change detection across all Firebase collections (off main interaction frame)
   useEffect(() => {
     if (sessionRole !== 'owner' || !user || !shopId || !shopReady || shopData.loading) {
       return;
     }
 
-    const nextSigs = computeSignatures(latestDataRef.current);
+    const detectTimer = window.setTimeout(() => {
+      const nextSigs = computeSignatures(latestDataRef.current);
 
-    if (!prevSigRef.current) {
-      prevSigRef.current = nextSigs;
-      return;
-    }
-
-    const dirtyTabs = getDirtyTabsFromSigDiff(prevSigRef.current, nextSigs);
-    prevSigRef.current = nextSigs;
-
-    if (dirtyTabs.length === 0) return;
-    if (integration?.autoSyncEnabled === false) return;
-
-    dirtyTabs.forEach((t) => dirtyTabsRef.current.add(t));
-
-    if (debounceTimerRef.current !== null) {
-      window.clearTimeout(debounceTimerRef.current);
-    }
-
-    debounceTimerRef.current = window.setTimeout(() => {
-      debounceTimerRef.current = null;
-      const batchTabs = Array.from(dirtyTabsRef.current);
-      dirtyTabsRef.current.clear();
-      if (batchTabs.length > 0) {
-        void executeSync(batchTabs);
+      if (!prevSigRef.current) {
+        prevSigRef.current = nextSigs;
+        return;
       }
-    }, 1200);
+
+      const dirtyTabs = getDirtyTabsFromSigDiff(prevSigRef.current, nextSigs);
+      prevSigRef.current = nextSigs;
+
+      if (dirtyTabs.length === 0) return;
+      if (integration?.autoSyncEnabled === false) return;
+
+      dirtyTabs.forEach((t) => dirtyTabsRef.current.add(t));
+
+      if (debounceTimerRef.current !== null) {
+        window.clearTimeout(debounceTimerRef.current);
+      }
+
+      debounceTimerRef.current = window.setTimeout(() => {
+        debounceTimerRef.current = null;
+        const batchTabs = Array.from(dirtyTabsRef.current);
+        dirtyTabsRef.current.clear();
+        if (batchTabs.length > 0) {
+          void executeSync(batchTabs);
+        }
+      }, 1800);
+    }, 0);
+
+    return () => window.clearTimeout(detectTimer);
   }, [
     sessionRole,
     user,
@@ -1186,21 +1316,26 @@ export function GoogleSheetsSyncProvider({
     };
   }, []);
 
-  const pendingCount = useMemo(
-    () =>
-      queueJobs
-        .filter((j) => j.status === 'pending')
-        .reduce((sum, j) => sum + (j.recordCount || j.targetSheets.length), 0),
-    [queueJobs]
+  const pendingCount = useMemo(() => {
+    const bgPending = bgTasks.filter((t) => t.status === 'pending').length;
+    if (bgPending > 0) return bgPending;
+    return queueJobs
+      .filter((j) => j.status === 'pending')
+      .reduce((sum, j) => sum + (j.recordCount || j.targetSheets.length), 0);
+  }, [bgTasks, queueJobs]);
+
+  const completedCount = useMemo(
+    () => bgTasks.filter((t) => t.status === 'completed').length,
+    [bgTasks]
   );
 
-  const failedCount = useMemo(
-    () =>
-      queueJobs
-        .filter((j) => j.status === 'failed')
-        .reduce((sum, j) => sum + (j.recordCount || j.targetSheets.length), 0),
-    [queueJobs]
-  );
+  const failedCount = useMemo(() => {
+    const bgFailed = bgTasks.filter((t) => t.status === 'failed').length;
+    if (bgFailed > 0) return bgFailed;
+    return queueJobs
+      .filter((j) => j.status === 'failed')
+      .reduce((sum, j) => sum + (j.recordCount || j.targetSheets.length), 0);
+  }, [bgTasks, queueJobs]);
 
   const derivedErrorResolution = useMemo<SheetsErrorResolution | null>(() => {
     if (localErrorResolution) return localErrorResolution;
@@ -1246,7 +1381,9 @@ export function GoogleSheetsSyncProvider({
       serviceAccountDiagnostic: capabilities.serviceAccountDiagnostic,
       isSyncing,
       pendingCount,
+      completedCount,
       failedCount,
+      sheetsQueueTasks: bgTasks,
       consecutiveFailures,
       lastError: localError || integration?.lastError || capabilities.serviceAccountDiagnostic || null,
       lastErrorResolution: derivedErrorResolution,
@@ -1276,7 +1413,9 @@ export function GoogleSheetsSyncProvider({
       capabilities.serviceAccountDiagnostic,
       isSyncing,
       pendingCount,
+      completedCount,
       failedCount,
+      bgTasks,
       consecutiveFailures,
       localError,
       derivedErrorResolution,

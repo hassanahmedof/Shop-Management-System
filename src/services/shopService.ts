@@ -17,7 +17,10 @@ import {
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { enqueueSheetsBackgroundTask } from './backgroundTaskQueue';
 import { notifyDiscordTransaction } from './discordNotificationService';
-import { enqueueSaleCooccurrenceUpdate } from './upsellCooccurrenceService';
+import {
+  enqueueCooccurrenceMutationReconcile,
+  enqueueSaleCooccurrenceUpdate,
+} from './upsellCooccurrenceService';
 import type {
   AdjustmentType,
   BatchAllocation,
@@ -2484,7 +2487,13 @@ export async function createSale(
       ],
     });
 
-    enqueueSaleCooccurrenceUpdate(uid, saleRef.id, Array.from(merged.keys()));
+    enqueueSaleCooccurrenceUpdate(
+      uid,
+      saleRef.id,
+      Array.from(merged.keys()),
+      () => (auth.currentUser ? auth.currentUser.getIdToken() : Promise.resolve(null)),
+      { isOwner: true }
+    );
 
     return saleRef.id;
   } catch (err) {
@@ -2931,6 +2940,8 @@ export async function editSale(
         'Staff Performance',
       ],
     });
+
+    enqueueCooccurrenceMutationReconcile(uid, sale.id);
   } catch (err) {
     if (err instanceof Error && (err.message.includes('Insufficient stock') || err.message.includes('Cancelled'))) {
       throw err;
@@ -3111,6 +3122,8 @@ export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by
         'Staff Performance',
       ],
     });
+
+    enqueueCooccurrenceMutationReconcile(uid, sale.id);
   } catch (err) {
     if (err instanceof Error && err.message.includes('already cancelled')) throw err;
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/sales/${sale.id}`);

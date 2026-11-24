@@ -1,9 +1,11 @@
 import { collection, getDocs, limit, query, where } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import type {
+  Category,
   OriginType,
   Product,
   ProductPackagingUnit,
+  ProductTemplate,
   StaffCatalogItem,
   StaffPackagingOption,
 } from '../types/shop';
@@ -25,6 +27,9 @@ export interface SearchableProductItem {
   brandName: string;
   categoryId?: string;
   categoryName: string;
+  categoryDescription?: string;
+  variant?: string;
+  searchKeywords?: string[];
   salePrice: number;
   wholesalePrice?: number;
   purchasePrice?: number;
@@ -77,7 +82,38 @@ function buildProductSearchIndex(fields: {
   };
 }
 
-export function mapProductsToSearchable(products: Product[]): SearchableProductItem[] {
+export function mapProductsToSearchable(
+  products: Product[],
+  enrichment?: {
+    categories?: Category[];
+    productTemplates?: ProductTemplate[];
+  }
+): SearchableProductItem[] {
+  const categoryDescById = new Map<string, string>();
+  const categoryDescByName = new Map<string, string>();
+  if (enrichment?.categories) {
+    for (const cat of enrichment.categories) {
+      const desc = (cat.description || '').trim();
+      if (!desc) continue;
+      if (cat.id) categoryDescById.set(cat.id, desc);
+      if (cat.name) categoryDescByName.set(cat.name.trim().toLowerCase(), desc);
+    }
+  }
+
+  const templateByKey = new Map<string, ProductTemplate>();
+  const templateByName = new Map<string, ProductTemplate>();
+  if (enrichment?.productTemplates) {
+    for (const tpl of enrichment.productTemplates) {
+      const cleanName = (tpl.name || '').trim().toLowerCase();
+      if (!cleanName) continue;
+      const key = `${(tpl.categoryId || '').trim()}::${(tpl.brandId || '').trim()}::${cleanName}`;
+      templateByKey.set(key, tpl);
+      if (!templateByName.has(cleanName)) {
+        templateByName.set(cleanName, tpl);
+      }
+    }
+  }
+
   return products.map((p) => {
     const baseUnit = getEffectiveBaseUnit(p);
     const brandName = p.brandName || '';
@@ -85,6 +121,15 @@ export function mapProductsToSearchable(products: Product[]): SearchableProductI
     const originType = p.originType || '';
     const bottleSize = p.bottleSize || '';
     const storageLocation = p.storageLocation || '';
+    const categoryDescription =
+      categoryDescById.get(p.categoryId || '') ||
+      categoryDescByName.get(categoryName.trim().toLowerCase()) ||
+      undefined;
+    const cleanName = (p.name || '').trim().toLowerCase();
+    const matchedTemplate =
+      templateByKey.get(`${(p.categoryId || '').trim()}::${(p.brandId || '').trim()}::${cleanName}`) ||
+      templateByName.get(cleanName);
+
     return {
       id: p.id,
       name: p.name,
@@ -92,6 +137,11 @@ export function mapProductsToSearchable(products: Product[]): SearchableProductI
       brandName,
       categoryId: p.categoryId || '',
       categoryName,
+      categoryDescription,
+      variant: matchedTemplate?.variant || undefined,
+      searchKeywords: Array.isArray(matchedTemplate?.searchKeywords)
+        ? matchedTemplate.searchKeywords
+        : undefined,
       salePrice: p.salePrice,
       wholesalePrice: p.wholesalePrice ?? 0,
       purchasePrice: p.purchasePrice,

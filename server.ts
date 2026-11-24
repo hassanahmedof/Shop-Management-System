@@ -27,6 +27,21 @@ import {
   sanitizeUpsellRequestInput,
   suggestUpsellWithGemini,
 } from './server/upsellAdvisor.ts';
+import {
+  getServerCooccurrenceSnapshot,
+  hydrateServerCooccurrenceFromExternalSnapshot,
+  recordServerCooccurrenceBatch,
+} from './server/upsellCooccurrenceStore.ts';
+import {
+  getServerFeedbackSnapshot,
+  recordServerFeedbackEvent,
+} from './server/upsellFeedbackStore.ts';
+import {
+  COOCCURRENCE_CACHE_VERSION,
+  type CooccurrenceSaleInput,
+  type UpsellFeedbackEventInput,
+  type UpsellFeedbackEventType,
+} from './shared/upsellCacheSchema.ts';
 
 interface FirebaseAppletConfig {
   projectId: string;
@@ -1317,65 +1332,240 @@ async function startServer() {
   });
 
   // ------------------------------------------------------------------
-  // Hybrid Upsell Gemini Fallback Route (Owner/Admin or Active Sales Staff)
+  // Hybrid Upsell & Persistent Shared Co-Occurrence Cache Routes
   // ------------------------------------------------------------------
-  app.post('/api/upsell/suggest', async (req, res) => {
+  const cooccurrenceFirestoreCheckedShops = new Set<string>();
+
+  async function resolveShopIdForUpsellRoute(
+    req: Request,
+    res: Response,
+    options: { allowStaff: boolean }
+  ): Promise<{ shopId: string; role: 'owner' | 'sales_staff'; token: string } | null> {
     const token = extractBearerToken(req);
     if (!token) {
       res.status(401).json({ ok: false, error: 'Authentication token required.' });
-      return;
-    }
-
-    const sanitized = sanitizeUpsellRequestInput(req.body);
-    if (!sanitized) {
-      res.status(400).json({ ok: false, error: 'Invalid upsell suggestion payload.' });
-      return;
+      return null;
     }
 
     let user: VerifiedFirebaseUser;
     try {
       user = await verifyFirebaseIdToken(token);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Invalid or expired authentication token.';
+      const message =
+        err instanceof Error ? err.message : 'Invalid or expired authentication token.';
       res.status(401).json({ ok: false, error: message });
+      return null;
+    }
+
+    const ownerCheck = await authorizeOwnerUser(user, token, {
+      requireExistingAdminOrSetup: true,
+    });
+
+    if (ownerCheck.ok) {
+      return { shopId: ownerCheck.shopId, role: 'owner', token };
+    }
+
+    if (options.allowStaff && user.provider === 'password') {
+      const authMap = await firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
+      const shopId = String(authMap?.shopId || '');
+      const staffId = String(authMap?.staffId || '');
+      if (!authMap || authMap.isActive !== true || !shopId || !staffId) {
+        res.status(403).json({ ok: false, error: 'Staff account is inactive or unauthorized.' });
+        return null;
+      }
+      const staff = await firestoreGetDoc(`shops/${shopId}/staff/${staffId}`, token);
+      const permissions = (staff?.permissions || {}) as { canAddSales?: boolean };
+      if (
+        !staff ||
+        staff.isActive !== true ||
+        staff.authUid !== user.uid ||
+        permissions.canAddSales !== true
+      ) {
+        res.status(403).json({
+          ok: false,
+          error: 'You do not have permission to access sales recommendations.',
+        });
+        return null;
+      }
+      return { shopId, role: 'sales_staff', token };
+    }
+
+    res.status(ownerCheck.status).json({ ok: false, error: ownerCheck.error });
+    return null;
+  }
+
+  function sanitizeCooccurrenceSaleInput(raw: unknown): CooccurrenceSaleInput | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const rec = raw as Record<string, unknown>;
+    const saleId = typeof rec.saleId === 'string' ? rec.saleId.trim().slice(0, 128) : '';
+    const status = typeof rec.status === 'string' ? rec.status.trim().toLowerCase() : 'completed';
+    if (!saleId || status === 'cancelled' || status !== 'completed') return null;
+    if (!Array.isArray(rec.productIds) || rec.productIds.length === 0 || rec.productIds.length > 80) {
+      return null;
+    }
+    const productIds = rec.productIds
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+      .map((id) => id.trim().slice(0, 128));
+    if (productIds.length === 0) return null;
+    return { saleId, status: 'completed', productIds };
+  }
+
+  app.get('/api/upsell/cooccurrence', async (req, res) => {
+    try {
+      const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
+      if (!authCtx) return;
+
+      let { snapshot, recovered } = getServerCooccurrenceSnapshot(authCtx.shopId);
+      if (
+        snapshot.totalCompletedSales === 0 &&
+        snapshot.revision === 0 &&
+        !cooccurrenceFirestoreCheckedShops.has(authCtx.shopId)
+      ) {
+        cooccurrenceFirestoreCheckedShops.add(authCtx.shopId);
+        try {
+          const fsDoc = await firestoreGetDoc(
+            `shops/${authCtx.shopId}/upsellCache/cooccurrence_v${COOCCURRENCE_CACHE_VERSION}`,
+            authCtx.token
+          );
+          if (fsDoc && Number(fsDoc.version) === COOCCURRENCE_CACHE_VERSION) {
+            const hydrated = hydrateServerCooccurrenceFromExternalSnapshot(authCtx.shopId, {
+              version: Number(fsDoc.version),
+              shopId: authCtx.shopId,
+              revision: Number(fsDoc.revision) || 0,
+              totalCompletedSales: Number(fsDoc.totalCompletedSales) || 0,
+              saleCountsByProduct: fsDoc.saleCountsByProduct,
+              pairCounts: fsDoc.pairCounts,
+              processedSaleIds: fsDoc.processedSaleIds,
+              updatedAt: Date.now(),
+            });
+            if (hydrated) {
+              snapshot = hydrated;
+              recovered = false;
+            }
+          }
+        } catch {
+          // Cold Firestore hydration is best-effort only
+        }
+      }
+
+      const sinceRevision = Number(req.query?.sinceRevision);
+      if (
+        !recovered &&
+        Number.isFinite(sinceRevision) &&
+        sinceRevision >= 0 &&
+        sinceRevision === snapshot.revision
+      ) {
+        res.json({
+          ok: true,
+          unchanged: true,
+          version: snapshot.version,
+          revision: snapshot.revision,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        unchanged: false,
+        recovered,
+        snapshot,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unable to load co-occurrence cache.';
+      res.status(502).json({ ok: false, error: message });
+    }
+  });
+
+  app.post('/api/upsell/cooccurrence/update', async (req, res) => {
+    const sale = sanitizeCooccurrenceSaleInput(req.body);
+    if (!sale) {
+      res.status(400).json({ ok: false, error: 'Valid completed sale payload is required.' });
       return;
     }
 
     try {
-      let resolvedShopId = '';
+      const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
+      if (!authCtx) return;
 
-      const ownerCheck = await authorizeOwnerUser(user, token, {
-        requireExistingAdminOrSetup: true,
+      const result = recordServerCooccurrenceBatch(authCtx.shopId, [sale]);
+      res.json({
+        ok: true,
+        version: result.snapshot.version,
+        revision: result.snapshot.revision,
+        totalCompletedSales: result.snapshot.totalCompletedSales,
+        ingestedCount: result.ingestedCount,
+        skippedDuplicateCount: result.skippedDuplicateCount,
       });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unable to update co-occurrence cache.';
+      res.status(502).json({ ok: false, error: message });
+    }
+  });
 
-      if (ownerCheck.ok) {
-        resolvedShopId = ownerCheck.shopId;
-      } else if (user.provider === 'password') {
-        const authMap = await firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
-        const shopId = String(authMap?.shopId || '');
-        const staffId = String(authMap?.staffId || '');
-        if (!authMap || authMap.isActive !== true || !shopId || !staffId) {
-          res.status(403).json({ ok: false, error: 'Staff account is inactive or unauthorized.' });
-          return;
-        }
-        const staff = await firestoreGetDoc(`shops/${shopId}/staff/${staffId}`, token);
-        const permissions = (staff?.permissions || {}) as { canAddSales?: boolean };
-        if (
-          !staff ||
-          staff.isActive !== true ||
-          staff.authUid !== user.uid ||
-          permissions.canAddSales !== true
-        ) {
-          res.status(403).json({ ok: false, error: 'You do not have permission to access sales suggestions.' });
-          return;
-        }
-        resolvedShopId = shopId;
-      } else {
-        res.status(ownerCheck.status).json({ ok: false, error: ownerCheck.error });
-        return;
-      }
+  app.post('/api/upsell/cooccurrence/rebuild', async (req, res) => {
+    const body = req.body as {
+      version?: unknown;
+      resetFirst?: unknown;
+      sales?: unknown;
+    } | null;
 
-      const result = await suggestUpsellWithGemini(resolvedShopId, sanitized);
+    if (!body || typeof body !== 'object' || !Array.isArray(body.sales) || body.sales.length > 300) {
+      res.status(400).json({ ok: false, error: 'Sales batch (max 300 entries) is required.' });
+      return;
+    }
+
+    const clientVersion = Number(body.version);
+    if (Number.isFinite(clientVersion) && clientVersion !== COOCCURRENCE_CACHE_VERSION) {
+      res.status(409).json({
+        ok: false,
+        error: 'Co-occurrence cache version mismatch.',
+        expectedVersion: COOCCURRENCE_CACHE_VERSION,
+      });
+      return;
+    }
+
+    const sanitizedSales: CooccurrenceSaleInput[] = [];
+    for (const rawSale of body.sales) {
+      const clean = sanitizeCooccurrenceSaleInput(rawSale);
+      if (clean) sanitizedSales.push(clean);
+    }
+
+    try {
+      const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: false });
+      if (!authCtx) return;
+
+      const result = recordServerCooccurrenceBatch(authCtx.shopId, sanitizedSales, {
+        resetFirst: body.resetFirst === true,
+      });
+      res.json({
+        ok: true,
+        version: result.snapshot.version,
+        revision: result.snapshot.revision,
+        totalCompletedSales: result.snapshot.totalCompletedSales,
+        ingestedCount: result.ingestedCount,
+        skippedDuplicateCount: result.skippedDuplicateCount,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unable to reconcile co-occurrence cache.';
+      res.status(502).json({ ok: false, error: message });
+    }
+  });
+
+  app.post('/api/upsell/suggest', async (req, res) => {
+    const sanitized = sanitizeUpsellRequestInput(req.body);
+    if (!sanitized) {
+      res.status(400).json({ ok: false, error: 'Invalid upsell suggestion payload.' });
+      return;
+    }
+
+    try {
+      const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
+      if (!authCtx) return;
+
+      const result = await suggestUpsellWithGemini(authCtx.shopId, sanitized);
       if (!result.available) {
         res.json({
           ok: true,
@@ -1401,6 +1591,88 @@ async function startServer() {
         suggestion: null,
         error: message,
       });
+    }
+  });
+
+  app.get('/api/upsell/feedback', async (req, res) => {
+    try {
+      const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
+      if (!authCtx) return;
+
+      const { snapshot, recovered } = getServerFeedbackSnapshot(authCtx.shopId);
+      const sinceRevision = Number(req.query?.sinceRevision);
+      if (
+        !recovered &&
+        Number.isFinite(sinceRevision) &&
+        sinceRevision >= 0 &&
+        sinceRevision === snapshot.revision
+      ) {
+        res.json({
+          ok: true,
+          unchanged: true,
+          version: snapshot.version,
+          revision: snapshot.revision,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        unchanged: false,
+        recovered,
+        snapshot,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to load upsell feedback.';
+      res.status(502).json({ ok: false, error: message });
+    }
+  });
+
+  app.post('/api/upsell/feedback', async (req, res) => {
+    const body = req.body as Record<string, unknown> | null;
+    const validEventTypes = new Set<UpsellFeedbackEventType>([
+      'shown',
+      'accepted',
+      'dismissed',
+      'removed_after_add',
+    ]);
+    const productId =
+      body && typeof body.productId === 'string' ? body.productId.trim().slice(0, 128) : '';
+    const eventType =
+      body && typeof body.eventType === 'string'
+        ? (body.eventType.trim() as UpsellFeedbackEventType)
+        : null;
+    if (!productId || !eventType || !validEventTypes.has(eventType)) {
+      res.status(400).json({ ok: false, error: 'Valid upsell feedback event payload is required.' });
+      return;
+    }
+
+    const sanitized: UpsellFeedbackEventInput = {
+      productId,
+      eventType,
+      categoryKey:
+        typeof body?.categoryKey === 'string' ? body.categoryKey.trim().slice(0, 80) : undefined,
+      anchorCategoryKeys: Array.isArray(body?.anchorCategoryKeys)
+        ? body.anchorCategoryKeys
+            .filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+            .slice(0, 10)
+            .map((k) => k.trim().slice(0, 80))
+        : undefined,
+    };
+
+    try {
+      const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
+      if (!authCtx) return;
+
+      const snapshot = recordServerFeedbackEvent(authCtx.shopId, sanitized);
+      res.json({
+        ok: true,
+        version: snapshot.version,
+        revision: snapshot.revision,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to record upsell feedback.';
+      res.status(502).json({ ok: false, error: message });
     }
   });
 

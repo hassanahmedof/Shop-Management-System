@@ -59,8 +59,17 @@ interface LineFormRow {
 export function SalesPage() {
   const { user, shopId } = useAuth();
   const activeShopId = shopId || user?.uid || '';
-  const { products, sales, saleItems, staffMembers, adminMembers, settings, inventoryBatches } =
-    useShopData();
+  const {
+    products,
+    categories,
+    productTemplates,
+    sales,
+    saleItems,
+    staffMembers,
+    adminMembers,
+    settings,
+    inventoryBatches,
+  } = useShopData();
   const { showToast } = useToast();
   const sheetsSync = useGoogleSheetsSync();
   const todayIso = getKarachiDateIso();
@@ -163,14 +172,15 @@ export function SalesPage() {
 
   const searchableItems = useMemo(() => {
     if (products.length > 0) {
-      return mapProductsToSearchable(products);
+      return mapProductsToSearchable(products, { categories, productTemplates });
     }
     return dbFallbackItems || [];
-  }, [products, dbFallbackItems]);
+  }, [products, categories, productTemplates, dbFallbackItems]);
 
   const {
     suggestion: upsellSuggestion,
     dismissSuggestion,
+    onSuggestionAccepted,
     onProductAdded: notifyAssistantProductAdded,
     onCartCleared: notifyAssistantCartCleared,
     onSaleSaved: notifyAssistantSaleSaved,
@@ -978,6 +988,7 @@ export function SalesPage() {
             suggestion={upsellSuggestion}
             onAddProduct={handleQuickAddProduct}
             onDismiss={dismissSuggestion}
+            onAccepted={onSuggestionAccepted}
           />
 
           {/* Compact Collapsible Products List */}

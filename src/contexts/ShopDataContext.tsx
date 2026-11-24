@@ -23,10 +23,16 @@ import {
   reconcileStaffSaleToOwnerLedger,
   syncStaffCatalogDocuments,
 } from '../services/staffService';
+import { scheduleCatalogIntelligenceBuild } from '../services/catalogIntelligenceService';
+import {
+  mapProductsToSearchable,
+  mapStaffCatalogToSearchable,
+} from '../services/productSearchService';
 import {
   type CooccurrenceSaleInput,
-  scheduleCooccurrenceBackfill,
+  syncCooccurrenceWithBackend,
 } from '../services/upsellCooccurrenceService';
+import { syncFeedbackWithBackend } from '../services/upsellFeedbackService';
 import type {
   AdminMember,
   AuditLog,
@@ -120,6 +126,10 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   const lookupBackfillSigRef = useRef<string>('');
   const reconcilingIdsRef = useRef<Set<string>>(new Set());
   const cooccurrenceBackfillSigRef = useRef<string>('');
+  const prevCompletedSaleMapRef = useRef<{ shopId: string; map: Map<string, string> }>({
+    shopId: '',
+    map: new Map(),
+  });
   const ownerCacheSaveTimerRef = useRef<number | null>(null);
   const cachedOwnerCatalogRef = useRef<{
     shopId: string;
@@ -589,19 +599,13 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     stockAdjustments.length,
   ]);
 
-  // Background precompute / catch-up product co-occurrence graph from already-loaded completed sales (zero extra Firestore reads)
+  // Background precompute / catch-up shared backend co-occurrence cache from already-loaded completed sales (zero extra Firestore reads)
   useEffect(() => {
-    if (!shopId || !sessionRole || !liveListenersSettled) return;
-
-    const sig =
-      sessionRole === 'owner'
-        ? `owner:${shopId}:${sales.length}:${saleItems.length}:${staffSales.length}`
-        : `staff:${shopId}:${staffSales.length}`;
-
-    if (cooccurrenceBackfillSigRef.current === sig) return;
-    cooccurrenceBackfillSigRef.current = sig;
+    if (!user || !shopId || !sessionRole || !liveListenersSettled) return;
 
     const completedSales: CooccurrenceSaleInput[] = [];
+    let sig = '';
+    let forceResetRebuild = false;
 
     if (sessionRole === 'owner') {
       const productIdsBySaleId = new Map<string, string[]>();
@@ -615,8 +619,16 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
         }
       }
 
+      const nextCompletedMap = new Map<string, string>();
+      let cancelledCount = 0;
+      let rollingHash = 2166136261;
+
       for (const sale of sales) {
-        if (sale.status === 'cancelled' || !sale.id) continue;
+        if (!sale.id) continue;
+        if (sale.status === 'cancelled') {
+          cancelledCount += 1;
+          continue;
+        }
         const pids = productIdsBySaleId.get(sale.id);
         if (pids && pids.length > 0) {
           completedSales.push({
@@ -624,32 +636,81 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
             status: sale.status,
             productIds: pids,
           });
+          const itemFingerprint = pids.slice().sort().join(',');
+          nextCompletedMap.set(sale.id, itemFingerprint);
+          const entryStr = `${sale.id}=${itemFingerprint}`;
+          for (let i = 0; i < entryStr.length; i += 1) {
+            rollingHash ^= entryStr.charCodeAt(i);
+            rollingHash = Math.imul(rollingHash, 16777619);
+          }
         }
       }
 
       for (const ss of staffSales) {
         if (ss.status === 'cancelled' || !ss.id || ss.syncedToLedger) continue;
+        const staffPids = (ss.items || []).map((i) => i.productId).filter(Boolean);
         completedSales.push({
           saleId: ss.id,
           status: ss.status,
-          productIds: (ss.items || []).map((i) => i.productId).filter(Boolean),
+          productIds: staffPids,
         });
       }
-    } else if (sessionRole === 'sales_staff') {
-      for (const ss of staffSales) {
-        if (ss.status === 'cancelled' || !ss.id) continue;
-        completedSales.push({
-          saleId: ss.id,
-          status: ss.status,
-          productIds: (ss.items || []).map((i) => i.productId).filter(Boolean),
-        });
+
+      if (prevCompletedSaleMapRef.current.shopId === shopId) {
+        for (const [prevSaleId, prevFingerprint] of prevCompletedSaleMapRef.current.map.entries()) {
+          const nextFingerprint = nextCompletedMap.get(prevSaleId);
+          if (nextFingerprint !== prevFingerprint) {
+            forceResetRebuild = true;
+            break;
+          }
+        }
       }
+      prevCompletedSaleMapRef.current = { shopId, map: nextCompletedMap };
+
+      sig = `owner:${shopId}:${completedSales.length}:${cancelledCount}:${rollingHash >>> 0}:${staffSales.length}`;
+    } else {
+      sig = `staff:${shopId}:${staffSales.length}`;
     }
 
-    if (completedSales.length > 0) {
-      scheduleCooccurrenceBackfill(shopId, completedSales);
+    if (cooccurrenceBackfillSigRef.current === sig && !forceResetRebuild) return;
+    cooccurrenceBackfillSigRef.current = sig;
+
+    const timer = window.setTimeout(() => {
+      void syncCooccurrenceWithBackend({
+        shopId,
+        isOwner: sessionRole === 'owner',
+        getIdToken: () => user.getIdToken(),
+        completedSales,
+        forceResetRebuild,
+      });
+      void syncFeedbackWithBackend({
+        shopId,
+        getIdToken: () => user.getIdToken(),
+      });
+    }, 80);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [user, sessionRole, shopId, liveListenersSettled, sales, saleItems, staffSales]);
+
+  // Background incremental semantic & cross-category index builder (non-blocking, zero Firestore reads)
+  useEffect(() => {
+    if (!shopId || !sessionRole || !liveListenersSettled) return;
+    if (sessionRole === 'owner') {
+      if (products.length === 0) return;
+      scheduleCatalogIntelligenceBuild(
+        shopId,
+        mapProductsToSearchable(products, { categories, productTemplates })
+      );
+      return;
     }
-  }, [sessionRole, shopId, liveListenersSettled, sales, saleItems, staffSales]);
+    if (staffCatalog.length === 0) return;
+    scheduleCatalogIntelligenceBuild(
+      shopId,
+      mapStaffCatalogToSearchable(staffCatalog.filter((c) => c.isActive))
+    );
+  }, [shopId, sessionRole, liveListenersSettled, products, categories, productTemplates, staffCatalog]);
 
   // Independent per-collection memoization preserves referential identity across pages
   // (e.g. recording a sale updates `sales`/`products` without re-sorting categories/brands/templates)

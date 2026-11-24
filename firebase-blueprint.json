@@ -689,6 +689,27 @@
         "ownerUid", "jobType", "targetSheets", "recordCount",
         "status", "retryCount", "lastError", "summary", "createdAt", "updatedAt"
       ]
+    },
+    "UpsellCooccurrenceCache": {
+      "title": "UpsellCooccurrenceCache",
+      "description": "Shared anonymized historical product co-occurrence matrix computed from completed sales only (zero PII or financial data).",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "version": { "type": "number" },
+        "revision": { "type": "number" },
+        "totalCompletedSales": { "type": "number" },
+        "saleCountsByProduct": { "type": "object" },
+        "pairCounts": { "type": "object" },
+        "processedSaleIds": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "version", "revision", "totalCompletedSales",
+        "saleCountsByProduct", "pairCounts", "processedSaleIds",
+        "createdAt", "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -815,6 +836,10 @@
     "/shops/{shopId}/sheetsSyncQueue/{jobId}": {
       "schema": { "$ref": "#/entities/SheetsSyncJob" },
       "description": "Owner-only persistent retry queue for pending/failed Google Sheets synchronizations."
+    },
+    "/shops/{shopId}/upsellCache/{cacheId}": {
+      "schema": { "$ref": "#/entities/UpsellCooccurrenceCache" },
+      "description": "Shared persistent co-occurrence cache derived from completed sales for Owner and Sales Staff POS recommendations."
     }
   }
 }

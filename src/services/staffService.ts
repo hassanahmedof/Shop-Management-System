@@ -882,7 +882,12 @@ export async function createStaffSale(
       items: merged.size,
     });
 
-    enqueueSaleCooccurrenceUpdate(shopId, saleRef.id, distinctProductIds);
+    enqueueSaleCooccurrenceUpdate(
+      shopId,
+      saleRef.id,
+      distinctProductIds,
+      () => (auth.currentUser ? auth.currentUser.getIdToken() : Promise.resolve(null))
+    );
 
     return saleRef.id;
   } catch (err) {

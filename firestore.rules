@@ -828,6 +828,29 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidUpsellCooccurrenceCache(data, shopId) {
+      return data.keys().hasAll([
+          'ownerUid', 'version', 'revision', 'totalCompletedSales',
+          'saleCountsByProduct', 'pairCounts', 'processedSaleIds',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid', 'version', 'revision', 'totalCompletedSales',
+          'saleCountsByProduct', 'pairCounts', 'processedSaleIds',
+          'createdAt', 'updatedAt'
+        ])
+        && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
+        && data.version is number && data.version == 2
+        && data.revision is number && data.revision >= 0
+        && data.totalCompletedSales is number && data.totalCompletedSales >= 0
+        && data.saleCountsByProduct is map && data.saleCountsByProduct.size() <= 1000
+        && data.pairCounts is map && data.pairCounts.size() <= 1000
+        && data.processedSaleIds is list && data.processedSaleIds.size() <= 2000
+        && (data.processedSaleIds.size() == 0 || (data.processedSaleIds[0] is string && data.processedSaleIds[0].size() <= 128))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // ------------------------------------------------------------------
     // Single-Owner Initial Setup Lock (Zero PII)
     // ------------------------------------------------------------------
@@ -1577,6 +1600,37 @@ service cloud.firestore {
             'isActive', 'isCustom', 'updatedAt'
           ]);
         allow delete: if isOwner(shopId) && isValidId(templateId) && shopExists(shopId) && existing().ownerUid == shopId;
+      }
+
+      match /upsellCache/{cacheId} {
+        allow get: if isValidId(cacheId)
+          && cacheId == 'cooccurrence_v2'
+          && (
+            (isOwner(shopId) && (resource == null || (shopExists(shopId) && existing().ownerUid == shopId))) ||
+            (staffCanAddSales(shopId) && shopExists(shopId) && (resource == null || existing().ownerUid == shopId))
+          );
+        allow list: if false;
+        allow create: if isOwner(shopId)
+          && isValidId(cacheId)
+          && cacheId == 'cooccurrence_v2'
+          && isValidUpsellCooccurrenceCache(incoming(), shopId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && shopExists(shopId);
+        allow update: if isOwner(shopId)
+          && isValidId(cacheId)
+          && cacheId == 'cooccurrence_v2'
+          && isValidUpsellCooccurrenceCache(incoming(), shopId)
+          && existing().ownerUid == shopId
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && shopExists(shopId)
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'version', 'revision', 'totalCompletedSales',
+            'saleCountsByProduct', 'pairCounts', 'processedSaleIds', 'updatedAt'
+          ]);
+        allow delete: if isOwner(shopId) && isValidId(cacheId) && cacheId == 'cooccurrence_v2' && shopExists(shopId) && existing().ownerUid == shopId;
       }
     }
   }

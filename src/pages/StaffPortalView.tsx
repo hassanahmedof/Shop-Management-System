@@ -137,6 +137,7 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
   const {
     suggestion: upsellSuggestion,
     dismissSuggestion,
+    onSuggestionAccepted,
     onProductAdded: notifyAssistantProductAdded,
     onCartCleared: notifyAssistantCartCleared,
     onSaleSaved: notifyAssistantSaleSaved,
@@ -913,6 +914,7 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
               suggestion={upsellSuggestion}
               onAddProduct={handleQuickAddStaffProduct}
               onDismiss={dismissSuggestion}
+              onAccepted={onSuggestionAccepted}
             />
 
             {/* Compact Collapsible Products List */}

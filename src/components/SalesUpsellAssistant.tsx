@@ -9,12 +9,14 @@ interface SalesUpsellAssistantProps {
   suggestion: UpsellSuggestion | null;
   onAddProduct: (item: SearchableProductItem) => void;
   onDismiss: (suggestedProductId: string) => void;
+  onAccepted?: (suggestedProductId: string) => void;
 }
 
 export function SalesUpsellAssistant({
   suggestion,
   onAddProduct,
   onDismiss,
+  onAccepted,
 }: SalesUpsellAssistantProps) {
   const lastAddClickRef = useRef<{ productId: string; timestamp: number } | null>(null);
 
@@ -30,6 +32,7 @@ export function SalesUpsellAssistant({
       return;
     }
     lastAddClickRef.current = { productId: product.id, timestamp: now };
+    onAccepted?.(product.id);
     onAddProduct(product);
   };
 

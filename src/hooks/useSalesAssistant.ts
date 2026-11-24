@@ -7,16 +7,18 @@ import {
   mapStaffCatalogToSearchable,
   type SearchableProductItem,
 } from '../services/productSearchService';
+import { recordUpsellFeedbackEvent } from '../services/upsellFeedbackService';
 import {
   buildUpsellCacheKey,
   fetchGeminiUpsellFallback,
   getCachedGeminiSuggestion,
   isGeminiFallbackTemporarilyDisabled,
 } from '../services/upsellFallbackClient';
+import { normalizeCategoryKey } from '../utils/packaging';
 import {
   type CartAssistantItem,
   filterEligibleUpsellCandidates,
-  getHistoricalUpsellSuggestion,
+  getHybridUpsellSuggestion,
   type UpsellSuggestion,
   validateGeminiUpsellResponse,
 } from '../utils/salesAssistant';
@@ -40,6 +42,7 @@ export interface UseSalesAssistantOptions {
 export interface UseSalesAssistantResult {
   suggestion: UpsellSuggestion | null;
   dismissSuggestion: (suggestedProductId?: string) => void;
+  onSuggestionAccepted: (suggestedProductId: string) => void;
   onProductAdded: () => void;
   onCartCleared: () => void;
   onSaleSaved: () => void;
@@ -53,7 +56,11 @@ export function useSalesAssistant({
   catalog,
 }: UseSalesAssistantOptions): UseSalesAssistantResult {
   const { user, shopId } = useAuth();
-  const { products, staffCatalog } = useShopData();
+  const shopData = useShopData();
+  const products = shopData?.products ?? [];
+  const staffCatalog = shopData?.staffCatalog ?? [];
+  const categories = shopData?.categories ?? [];
+  const productTemplates = shopData?.productTemplates ?? [];
   const { showToast, dismissToast } = useToast();
 
   const [dismissedUpsellIds, setDismissedUpsellIds] = useState<string[]>([]);
@@ -68,6 +75,8 @@ export function useSalesAssistant({
   const prevCartProductIdsRef = useRef<Set<string>>(new Set());
   const currentCartProductIdsRef = useRef<Set<string>>(new Set());
   const sessionResetPendingRef = useRef<boolean>(false);
+  const acceptedFromUpsellIdsRef = useRef<Set<string>>(new Set());
+  const lastShownEventKeyRef = useRef<string>('');
 
   const latestCartSignatureRef = useRef<string>('');
   const requestSeqRef = useRef<number>(0);
@@ -78,16 +87,37 @@ export function useSalesAssistant({
 
   const effectiveCatalog = useMemo<SearchableProductItem[]>(() => {
     if (catalog && catalog.length > 0) {
-      return catalog;
+      if (categories.length === 0) return catalog;
+      const descById = new Map<string, string>();
+      const descByName = new Map<string, string>();
+      for (const cat of categories) {
+        const desc = (cat.description || '').trim();
+        if (!desc) continue;
+        if (cat.id) descById.set(cat.id, desc);
+        if (cat.name) descByName.set(cat.name.trim().toLowerCase(), desc);
+      }
+      if (descById.size === 0 && descByName.size === 0) return catalog;
+      return catalog.map((item) => {
+        if (item.categoryDescription) return item;
+        const catDesc =
+          descById.get(item.categoryId || '') ||
+          descByName.get((item.categoryName || '').trim().toLowerCase());
+        return catDesc ? { ...item, categoryDescription: catDesc } : item;
+      });
     }
     if (products.length > 0) {
-      return mapProductsToSearchable(products);
+      return mapProductsToSearchable(products, { categories, productTemplates });
     }
     if (staffCatalog.length > 0) {
       return mapStaffCatalogToSearchable(staffCatalog.filter((item) => item.isActive));
     }
     return [];
-  }, [catalog, products, staffCatalog]);
+  }, [catalog, products, staffCatalog, categories, productTemplates]);
+
+  const catalogById = useMemo(
+    () => new Map(effectiveCatalog.map((item) => [item.id, item])),
+    [effectiveCatalog]
+  );
 
   const normalizedCartItems = useMemo<CartAssistantItem[]>(() => {
     return cart
@@ -117,6 +147,15 @@ export function useSalesAssistant({
     () => new Set(normalizedCartItems.map((item) => item.productId)),
     [normalizedCartItems]
   );
+
+  const anchorCategoryKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const pid of currentCartProductIds) {
+      const cat = catalogById.get(pid)?.categoryName;
+      if (cat) keys.add(normalizeCategoryKey(cat));
+    }
+    return Array.from(keys);
+  }, [currentCartProductIds, catalogById]);
 
   // Order-independent fingerprint captures product IDs, quantities, units and conversions
   const cartSignature = useMemo(
@@ -166,6 +205,21 @@ export function useSalesAssistant({
     prevCartProductIdsRef.current = new Set(currentCartProductIds);
 
     if (newlyRemoved.length > 0) {
+      for (const removedId of newlyRemoved) {
+        if (acceptedFromUpsellIdsRef.current.has(removedId)) {
+          acceptedFromUpsellIdsRef.current.delete(removedId);
+          const candCat = catalogById.get(removedId)?.categoryName;
+          recordUpsellFeedbackEvent({
+            shopId: effectiveShopId,
+            productId: removedId,
+            eventType: 'removed_after_add',
+            categoryKey: candCat ? normalizeCategoryKey(candCat) : undefined,
+            anchorCategoryKeys,
+            getIdToken: user ? () => user.getIdToken() : undefined,
+          });
+        }
+      }
+
       setRemovedProductIds((prev) => {
         const next = new Set(prev);
         let changed = false;
@@ -178,12 +232,13 @@ export function useSalesAssistant({
         return changed ? Array.from(next) : prev;
       });
     }
-  }, [currentCartProductIds]);
+  }, [currentCartProductIds, catalogById, effectiveShopId, anchorCategoryKeys, user]);
 
   useEffect(() => {
     if (cartSignature === '') {
       setHiddenAtSignature(null);
       setAiSuggestionState(null);
+      lastShownEventKeyRef.current = '';
     }
   }, [cartSignature]);
 
@@ -208,16 +263,18 @@ export function useSalesAssistant({
   const isHiddenForUnchangedCart =
     hiddenAtSignature !== null && hiddenAtSignature === cartSignature;
 
-  // 1) Primary engine: synchronous O(1) lookup on precomputed co-occurrence graph
-  const historicalSuggestion = useMemo<UpsellSuggestion | null>(() => {
+  // 1) Primary multi-layer hybrid engine: synchronous sub-ms evaluation using
+  //    co-occurrence history + dynamic category/cross-category affinity + TF-IDF semantic vectors
+  //    + brand/context portfolio + Bayesian self-learning feedback.
+  const hybridSuggestion = useMemo<UpsellSuggestion | null>(() => {
     if (isHiddenForUnchangedCart || normalizedCartItems.length === 0) return null;
-    return getHistoricalUpsellSuggestion({
+    return getHybridUpsellSuggestion({
       shopId: effectiveShopId,
       cartItems: normalizedCartItems,
       catalog: effectiveCatalog,
       dismissedProductIds: dismissedUpsellIds,
       removedProductIds: effectiveRemovedProductIds,
-    });
+    }).suggestion;
   }, [
     isHiddenForUnchangedCart,
     effectiveShopId,
@@ -227,12 +284,12 @@ export function useSalesAssistant({
     effectiveRemovedProductIds,
   ]);
 
-  // 2) Secondary engine: asynchronous, debounced, cached Gemini fallback ONLY when historical yields nothing
+  // 2) Async Gemini intelligence layer: debounced & cached fallback ONLY when local hybrid yields nothing
   useEffect(() => {
     cancelInFlightAi();
 
     if (
-      historicalSuggestion ||
+      hybridSuggestion ||
       isHiddenForUnchangedCart ||
       normalizedCartItems.length === 0 ||
       effectiveCatalog.length === 0
@@ -285,7 +342,6 @@ export function useSalesAssistant({
       return;
     }
 
-    // Clear stale AI card from a previous cart signature while debouncing new cart lookup
     setAiSuggestionState((prev) => (prev && prev.signature === cartSignature ? prev : null));
 
     const mySeq = requestSeqRef.current + 1;
@@ -342,7 +398,7 @@ export function useSalesAssistant({
     return cancelInFlightAi;
   }, [
     cancelInFlightAi,
-    historicalSuggestion,
+    hybridSuggestion,
     isHiddenForUnchangedCart,
     effectiveShopId,
     cartSignature,
@@ -356,7 +412,7 @@ export function useSalesAssistant({
   // Live re-validation of any AI suggestion against latest stock & exclusions
   const validatedAiSuggestion = useMemo<UpsellSuggestion | null>(() => {
     if (
-      historicalSuggestion ||
+      hybridSuggestion ||
       isHiddenForUnchangedCart ||
       !aiSuggestionState ||
       aiSuggestionState.signature !== cartSignature
@@ -372,7 +428,7 @@ export function useSalesAssistant({
       removedProductIds: effectiveRemovedProductIds,
     });
   }, [
-    historicalSuggestion,
+    hybridSuggestion,
     isHiddenForUnchangedCart,
     aiSuggestionState,
     cartSignature,
@@ -382,7 +438,26 @@ export function useSalesAssistant({
     effectiveRemovedProductIds,
   ]);
 
-  const suggestion = historicalSuggestion ?? validatedAiSuggestion;
+  const suggestion = hybridSuggestion ?? validatedAiSuggestion;
+
+  // Track displayed suggestion cleanly once per (cartSignature, product.id) in background
+  useEffect(() => {
+    if (!suggestion || !cartSignature) return;
+    const eventKey = `${cartSignature}::${suggestion.product.id}`;
+    if (lastShownEventKeyRef.current === eventKey) return;
+    lastShownEventKeyRef.current = eventKey;
+
+    recordUpsellFeedbackEvent({
+      shopId: effectiveShopId,
+      productId: suggestion.product.id,
+      eventType: 'shown',
+      categoryKey: suggestion.product.categoryName
+        ? normalizeCategoryKey(suggestion.product.categoryName)
+        : undefined,
+      anchorCategoryKeys,
+      getIdToken: user ? () => user.getIdToken() : undefined,
+    });
+  }, [suggestion, cartSignature, effectiveShopId, anchorCategoryKeys, user]);
 
   const dismissSuggestion = useCallback(
     (suggestedProductId?: string) => {
@@ -392,10 +467,36 @@ export function useSalesAssistant({
         setDismissedUpsellIds((prev) =>
           prev.includes(suggestedProductId) ? prev : [...prev, suggestedProductId]
         );
+        const candCat = catalogById.get(suggestedProductId)?.categoryName;
+        recordUpsellFeedbackEvent({
+          shopId: effectiveShopId,
+          productId: suggestedProductId,
+          eventType: 'dismissed',
+          categoryKey: candCat ? normalizeCategoryKey(candCat) : undefined,
+          anchorCategoryKeys,
+          getIdToken: user ? () => user.getIdToken() : undefined,
+        });
       }
       setHiddenAtSignature(cartSignature);
     },
-    [cancelInFlightAi, cartSignature]
+    [cancelInFlightAi, cartSignature, catalogById, effectiveShopId, anchorCategoryKeys, user]
+  );
+
+  const onSuggestionAccepted = useCallback(
+    (suggestedProductId: string) => {
+      if (!suggestedProductId) return;
+      acceptedFromUpsellIdsRef.current.add(suggestedProductId);
+      const candCat = catalogById.get(suggestedProductId)?.categoryName;
+      recordUpsellFeedbackEvent({
+        shopId: effectiveShopId,
+        productId: suggestedProductId,
+        eventType: 'accepted',
+        categoryKey: candCat ? normalizeCategoryKey(candCat) : undefined,
+        anchorCategoryKeys,
+        getIdToken: user ? () => user.getIdToken() : undefined,
+      });
+    },
+    [catalogById, effectiveShopId, anchorCategoryKeys, user]
   );
 
   const onProductAdded = useCallback(() => {
@@ -413,6 +514,8 @@ export function useSalesAssistant({
     setRemovedProductIds([]);
     setHiddenAtSignature(null);
     setAiSuggestionState(null);
+    acceptedFromUpsellIdsRef.current.clear();
+    lastShownEventKeyRef.current = '';
     if (currentCartProductIdsRef.current.size > 0) {
       sessionResetPendingRef.current = true;
     } else {
@@ -445,6 +548,7 @@ export function useSalesAssistant({
   return {
     suggestion,
     dismissSuggestion,
+    onSuggestionAccepted,
     onProductAdded,
     onCartCleared,
     onSaleSaved,

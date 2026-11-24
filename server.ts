@@ -23,6 +23,10 @@ import {
   saveServiceAccountForOwner,
   syncSpreadsheetTabs,
 } from './server/googleSheetsService.ts';
+import {
+  sanitizeUpsellRequestInput,
+  suggestUpsellWithGemini,
+} from './server/upsellAdvisor.ts';
 
 interface FirebaseAppletConfig {
   projectId: string;
@@ -1307,6 +1311,94 @@ async function startServer() {
         ok: false,
         sent: false,
         retryable: true,
+        error: message,
+      });
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Hybrid Upsell Gemini Fallback Route (Owner/Admin or Active Sales Staff)
+  // ------------------------------------------------------------------
+  app.post('/api/upsell/suggest', async (req, res) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ ok: false, error: 'Authentication token required.' });
+      return;
+    }
+
+    const sanitized = sanitizeUpsellRequestInput(req.body);
+    if (!sanitized) {
+      res.status(400).json({ ok: false, error: 'Invalid upsell suggestion payload.' });
+      return;
+    }
+
+    let user: VerifiedFirebaseUser;
+    try {
+      user = await verifyFirebaseIdToken(token);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Invalid or expired authentication token.';
+      res.status(401).json({ ok: false, error: message });
+      return;
+    }
+
+    try {
+      let resolvedShopId = '';
+
+      const ownerCheck = await authorizeOwnerUser(user, token, {
+        requireExistingAdminOrSetup: true,
+      });
+
+      if (ownerCheck.ok) {
+        resolvedShopId = ownerCheck.shopId;
+      } else if (user.provider === 'password') {
+        const authMap = await firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
+        const shopId = String(authMap?.shopId || '');
+        const staffId = String(authMap?.staffId || '');
+        if (!authMap || authMap.isActive !== true || !shopId || !staffId) {
+          res.status(403).json({ ok: false, error: 'Staff account is inactive or unauthorized.' });
+          return;
+        }
+        const staff = await firestoreGetDoc(`shops/${shopId}/staff/${staffId}`, token);
+        const permissions = (staff?.permissions || {}) as { canAddSales?: boolean };
+        if (
+          !staff ||
+          staff.isActive !== true ||
+          staff.authUid !== user.uid ||
+          permissions.canAddSales !== true
+        ) {
+          res.status(403).json({ ok: false, error: 'You do not have permission to access sales suggestions.' });
+          return;
+        }
+        resolvedShopId = shopId;
+      } else {
+        res.status(ownerCheck.status).json({ ok: false, error: ownerCheck.error });
+        return;
+      }
+
+      const result = await suggestUpsellWithGemini(resolvedShopId, sanitized);
+      if (!result.available) {
+        res.json({
+          ok: true,
+          available: false,
+          reason: result.reason || 'GEMINI_NOT_CONFIGURED',
+          suggestion: null,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        available: true,
+        cached: Boolean(result.cached),
+        suggestion: result.suggested,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to compute upsell suggestion.';
+      res.status(502).json({
+        ok: false,
+        available: false,
+        reason: 'UPSELL_INTERNAL_ERROR',
+        suggestion: null,
         error: message,
       });
     }

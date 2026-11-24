@@ -21,7 +21,9 @@ export interface ProductSearchIndex {
 export interface SearchableProductItem {
   id: string;
   name: string;
+  brandId?: string;
   brandName: string;
+  categoryId?: string;
   categoryName: string;
   salePrice: number;
   wholesalePrice?: number;
@@ -86,7 +88,9 @@ export function mapProductsToSearchable(products: Product[]): SearchableProductI
     return {
       id: p.id,
       name: p.name,
+      brandId: p.brandId || '',
       brandName,
+      categoryId: p.categoryId || '',
       categoryName,
       salePrice: p.salePrice,
       wholesalePrice: p.wholesalePrice ?? 0,

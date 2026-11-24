@@ -23,6 +23,10 @@ import {
   reconcileStaffSaleToOwnerLedger,
   syncStaffCatalogDocuments,
 } from '../services/staffService';
+import {
+  type CooccurrenceSaleInput,
+  scheduleCooccurrenceBackfill,
+} from '../services/upsellCooccurrenceService';
 import type {
   AdminMember,
   AuditLog,
@@ -115,6 +119,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   const catalogSyncSigRef = useRef<string>('');
   const lookupBackfillSigRef = useRef<string>('');
   const reconcilingIdsRef = useRef<Set<string>>(new Set());
+  const cooccurrenceBackfillSigRef = useRef<string>('');
   const ownerCacheSaveTimerRef = useRef<number | null>(null);
   const cachedOwnerCatalogRef = useRef<{
     shopId: string;
@@ -583,6 +588,68 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     expenses.length,
     stockAdjustments.length,
   ]);
+
+  // Background precompute / catch-up product co-occurrence graph from already-loaded completed sales (zero extra Firestore reads)
+  useEffect(() => {
+    if (!shopId || !sessionRole || !liveListenersSettled) return;
+
+    const sig =
+      sessionRole === 'owner'
+        ? `owner:${shopId}:${sales.length}:${saleItems.length}:${staffSales.length}`
+        : `staff:${shopId}:${staffSales.length}`;
+
+    if (cooccurrenceBackfillSigRef.current === sig) return;
+    cooccurrenceBackfillSigRef.current = sig;
+
+    const completedSales: CooccurrenceSaleInput[] = [];
+
+    if (sessionRole === 'owner') {
+      const productIdsBySaleId = new Map<string, string[]>();
+      for (const item of saleItems) {
+        if (item.status === 'cancelled' || !item.saleId || !item.productId) continue;
+        const arr = productIdsBySaleId.get(item.saleId);
+        if (arr) {
+          arr.push(item.productId);
+        } else {
+          productIdsBySaleId.set(item.saleId, [item.productId]);
+        }
+      }
+
+      for (const sale of sales) {
+        if (sale.status === 'cancelled' || !sale.id) continue;
+        const pids = productIdsBySaleId.get(sale.id);
+        if (pids && pids.length > 0) {
+          completedSales.push({
+            saleId: sale.id,
+            status: sale.status,
+            productIds: pids,
+          });
+        }
+      }
+
+      for (const ss of staffSales) {
+        if (ss.status === 'cancelled' || !ss.id || ss.syncedToLedger) continue;
+        completedSales.push({
+          saleId: ss.id,
+          status: ss.status,
+          productIds: (ss.items || []).map((i) => i.productId).filter(Boolean),
+        });
+      }
+    } else if (sessionRole === 'sales_staff') {
+      for (const ss of staffSales) {
+        if (ss.status === 'cancelled' || !ss.id) continue;
+        completedSales.push({
+          saleId: ss.id,
+          status: ss.status,
+          productIds: (ss.items || []).map((i) => i.productId).filter(Boolean),
+        });
+      }
+    }
+
+    if (completedSales.length > 0) {
+      scheduleCooccurrenceBackfill(shopId, completedSales);
+    }
+  }, [sessionRole, shopId, liveListenersSettled, sales, saleItems, staffSales]);
 
   // Independent per-collection memoization preserves referential identity across pages
   // (e.g. recording a sale updates `sales`/`products` without re-sorting categories/brands/templates)

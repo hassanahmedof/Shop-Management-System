@@ -17,6 +17,7 @@ import {
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { enqueueSheetsBackgroundTask } from './backgroundTaskQueue';
 import { notifyDiscordTransaction } from './discordNotificationService';
+import { enqueueSaleCooccurrenceUpdate } from './upsellCooccurrenceService';
 import type {
   AdjustmentType,
   BatchAllocation,
@@ -2482,6 +2483,8 @@ export async function createSale(
         'Staff Performance',
       ],
     });
+
+    enqueueSaleCooccurrenceUpdate(uid, saleRef.id, Array.from(merged.keys()));
 
     return saleRef.id;
   } catch (err) {

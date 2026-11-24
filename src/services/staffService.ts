@@ -33,6 +33,7 @@ import {
 } from '../utils/packaging';
 import { enqueueSheetsBackgroundTask } from './backgroundTaskQueue';
 import { notifyDiscordTransaction } from './discordNotificationService';
+import { enqueueSaleCooccurrenceUpdate } from './upsellCooccurrenceService';
 import { recordPerfMetric, startPerfTimer } from '../utils/perfMonitor';
 
 function clip(val: string | undefined | null, maxLen: number): string {
@@ -880,6 +881,8 @@ export async function createStaffSale(
     recordPerfMetric('firebase_tx', 'create_staff_sale', stopTx(), {
       items: merged.size,
     });
+
+    enqueueSaleCooccurrenceUpdate(shopId, saleRef.id, distinctProductIds);
 
     return saleRef.id;
   } catch (err) {

@@ -79,16 +79,16 @@ export function CompactSaleItemsList({
     <div className="border border-[var(--cm-border)] rounded-xl bg-[var(--cm-bg-surface)] overflow-hidden">
       {/* Sticky Compact Column Header (Desktop) */}
       <div className="hidden sm:grid sm:grid-cols-12 items-center gap-2 px-3.5 py-2 bg-[var(--cm-bg-subtle)] border-b border-[var(--cm-border)] text-[11px] font-semibold text-[var(--cm-text-muted)]">
-        <div className="col-span-6">Product ({formatNumber(items.length)})</div>
-        <div className="col-span-2 text-right">Qty / Unit</div>
+        <div className="col-span-5">Product ({formatNumber(items.length)})</div>
+        <div className="col-span-3 text-center">Qty / Unit</div>
         <div className="col-span-2 text-right">Price</div>
-        <div className="col-span-2 text-right pr-8">Line Total</div>
+        <div className="col-span-2 text-right pr-9">Line Total</div>
       </div>
 
       {/* Mobile Compact Count Header */}
       <div className="sm:hidden flex items-center justify-between px-3 py-2 bg-[var(--cm-bg-subtle)] border-b border-[var(--cm-border)] text-xs font-semibold text-[var(--cm-text-secondary)]">
         <span>Added Products ({formatNumber(items.length)})</span>
-        <span className="text-[11px] font-normal text-[var(--cm-text-muted)]">Tap row to edit</span>
+        <span className="text-[11px] font-normal text-[var(--cm-text-muted)]">Tap item for details</span>
       </div>
 
       {/* Expandable Compact Rows (flows naturally with main page scroll) */}
@@ -115,6 +115,11 @@ export function CompactSaleItemsList({
           );
           const activeWholesale = selectedUnitMeta?.wholesalePrice ?? item.wholesalePrice ?? 0;
           const decimalAllowed = isFractionalUnit(selectedUnitLabel);
+          const minQty = decimalAllowed ? 0.25 : 1;
+          const atMinQty = qtyNum <= minQty;
+          const atMaxStock =
+            !allowStockOverride &&
+            roundStockQty(cumulativeProductBase + conv) > item.currentStock;
 
           return (
             <div
@@ -129,117 +134,227 @@ export function CompactSaleItemsList({
                       : 'bg-[var(--cm-bg-surface)]'
               }`}
             >
-              {/* Collapsed / Summary Header Row */}
-              <div className="flex items-center justify-between gap-2 px-2.5 sm:px-3.5 py-2 min-h-[48px] hover:bg-[var(--cm-bg-hover)]">
+              {/* Desktop Collapsed / Summary Row */}
+              <div className="hidden sm:grid sm:grid-cols-12 items-center gap-2 px-3.5 py-2 min-h-[48px] hover:bg-[var(--cm-bg-hover)]">
                 <button
                   type="button"
                   onClick={() => onToggleExpand(item.key)}
                   aria-expanded={isExpanded}
-                  className="flex-1 min-w-0 flex items-center justify-between gap-2 text-left cursor-pointer py-0.5"
+                  className="col-span-5 min-w-0 flex items-center gap-2 text-left cursor-pointer py-0.5"
                 >
-                  <div className="flex items-center gap-2 min-w-0 flex-1 sm:grid sm:grid-cols-12 sm:items-center sm:gap-2">
-                    <div className="flex items-center gap-2 min-w-0 flex-1 sm:col-span-6">
-                      <span className="text-[var(--cm-text-muted)] shrink-0">
-                        {isExpanded ? (
-                          <ChevronDown className="w-4 h-4 text-[var(--cm-accent-text)]" />
-                        ) : (
-                          <ChevronRight className="w-4 h-4" />
-                        )}
+                  <span className="text-[var(--cm-text-muted)] shrink-0">
+                    {isExpanded ? (
+                      <ChevronDown className="w-4 h-4 text-[var(--cm-accent-text)]" />
+                    ) : (
+                      <ChevronRight className="w-4 h-4" />
+                    )}
+                  </span>
+                  <span className="text-[11px] font-mono-num text-[var(--cm-text-muted)] shrink-0 w-5 text-right">
+                    {rowNumber}.
+                  </span>
+                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                    <span className="text-sm font-medium text-[var(--cm-text-primary)] truncate">
+                      {item.name}
+                    </span>
+                    {exceedsStock && (
+                      <span className="text-[11px] font-semibold text-[var(--cm-danger)] whitespace-nowrap shrink-0">
+                        · Low ({formatNumber(item.currentStock)} {item.unit})
                       </span>
-                      <span className="text-[11px] font-mono-num text-[var(--cm-text-muted)] shrink-0 w-5 text-right">
-                        {rowNumber}.
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <span className="text-xs sm:text-sm font-medium text-[var(--cm-text-primary)] truncate">
-                            {item.name}
-                          </span>
-                          {exceedsStock && (
-                            <span className="text-[11px] font-semibold text-[var(--cm-danger)] whitespace-nowrap shrink-0">
-                              · Low ({formatNumber(item.currentStock)} {item.unit})
-                            </span>
-                          )}
-                        </div>
-                        {/* Mobile compact sub-line */}
-                        <div className="sm:hidden flex flex-wrap items-center gap-1.5 text-[11px] text-[var(--cm-text-muted)] font-mono-num tabular-nums">
-                          <span>
-                            {item.quantity || '1'} {selectedUnitLabel}
-                            {conv > 1 ? ` (=${formatNumber(baseUsed)} ${item.unit})` : ''}
-                          </span>
-                          <span aria-hidden="true">·</span>
-                          <span>{formatPKR(priceNum)}</span>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Desktop Qty + Unit */}
-                    <div
-                      className={`hidden sm:flex sm:col-span-2 items-center justify-end gap-1.5 font-mono-num tabular-nums text-xs ${
-                        exceedsStock ? 'text-[var(--cm-danger)] font-semibold' : 'text-[var(--cm-text-secondary)]'
-                      }`}
-                    >
-                      <span>×{item.quantity || '1'}</span>
-                      {allowedUnits.length > 1 && onChangeUnit ? (
-                        <select
-                          aria-label={`Quick unit for ${item.name}`}
-                          value={selectedUnitLabel}
-                          onClick={(e) => e.stopPropagation()}
-                          onChange={(e) => {
-                            e.stopPropagation();
-                            onChangeUnit(item.key, e.target.value);
-                          }}
-                          className="cm-input px-1.5 py-0.5 text-[11px] font-sans border rounded-md cursor-pointer max-w-[92px]"
-                        >
-                          {allowedUnits.map((u) => (
-                            <option key={u.unitName} value={u.unitName}>
-                              {u.unitName}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        <span>{selectedUnitLabel}</span>
-                      )}
-                    </div>
-
-                    {/* Desktop Selling Price */}
-                    <div className="hidden sm:block sm:col-span-2 text-right font-mono-num tabular-nums text-xs text-[var(--cm-text-secondary)]">
-                      {formatPKR(priceNum)}
-                    </div>
-
-                    {/* Desktop & Mobile Line Total */}
-                    <div className="sm:col-span-2 text-right font-mono-num tabular-nums text-xs sm:text-sm font-semibold text-[var(--cm-text-primary)] whitespace-nowrap shrink-0">
-                      {formatPKR(lineTotal)}
-                    </div>
+                    )}
                   </div>
                 </button>
 
-                {/* Mobile 1-tap unit switcher (when multiple units enabled) */}
-                {allowedUnits.length > 1 && onChangeUnit && (
-                  <select
-                    aria-label={`Mobile quick unit for ${item.name}`}
-                    value={selectedUnitLabel}
-                    onClick={(e) => e.stopPropagation()}
-                    onChange={(e) => onChangeUnit(item.key, e.target.value)}
-                    className="sm:hidden cm-input min-h-[34px] px-1.5 py-1 text-[11px] font-medium border rounded-lg max-w-[82px] shrink-0"
-                  >
-                    {allowedUnits.map((u) => (
-                      <option key={u.unitName} value={u.unitName}>
-                        {u.unitName}
-                      </option>
-                    ))}
-                  </select>
-                )}
+                {/* Desktop Inline Quick Stepper + Unit */}
+                <div className="col-span-3 flex items-center justify-center gap-1.5">
+                  <div className="inline-flex items-center rounded-lg border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] p-0.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => onStepQuantity(item.key, -1)}
+                      disabled={atMinQty}
+                      aria-label={`Decrease quantity of ${item.name}`}
+                      className="w-7 h-7 flex items-center justify-center rounded-md text-[var(--cm-text-primary)] hover:bg-[var(--cm-bg-surface)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer transition-colors touch-manipulation"
+                    >
+                      <Minus className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onOpenKeypad(item.key)}
+                      aria-label={`Edit quantity of ${item.name}`}
+                      title="Tap to enter exact quantity"
+                      className={`min-w-[28px] px-1.5 h-7 flex items-center justify-center text-xs font-bold font-mono-num tabular-nums cursor-pointer ${
+                        exceedsStock ? 'text-[var(--cm-danger)]' : 'text-[var(--cm-text-primary)]'
+                      }`}
+                    >
+                      {item.quantity || '1'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onStepQuantity(item.key, 1)}
+                      disabled={atMaxStock}
+                      aria-label={`Increase quantity of ${item.name}`}
+                      className="w-7 h-7 flex items-center justify-center rounded-md text-[var(--cm-text-primary)] hover:bg-[var(--cm-bg-surface)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer transition-colors touch-manipulation"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
 
-                {/* Quick Remove Button */}
+                  {allowedUnits.length > 1 && onChangeUnit ? (
+                    <select
+                      aria-label={`Quick unit for ${item.name}`}
+                      value={selectedUnitLabel}
+                      onChange={(e) => onChangeUnit(item.key, e.target.value)}
+                      className="cm-input px-1.5 py-1 text-[11px] font-sans border rounded-md cursor-pointer max-w-[84px]"
+                    >
+                      {allowedUnits.map((u) => (
+                        <option key={u.unitName} value={u.unitName}>
+                          {u.unitName}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <span className="text-[11px] text-[var(--cm-text-muted)] truncate max-w-[64px]">
+                      {selectedUnitLabel}
+                    </span>
+                  )}
+                </div>
+
+                {/* Desktop Selling Price */}
                 <button
                   type="button"
-                  onClick={() => onRemove(item.key)}
-                  aria-label={`Remove ${item.name}`}
-                  title="Remove item"
-                  className="min-w-[38px] min-h-[38px] sm:min-w-[32px] sm:min-h-[32px] flex items-center justify-center text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] hover:bg-[var(--cm-danger-soft)] rounded-lg transition-colors shrink-0 cursor-pointer"
+                  onClick={() => onToggleExpand(item.key)}
+                  className="col-span-2 text-right font-mono-num tabular-nums text-xs text-[var(--cm-text-secondary)] cursor-pointer py-1"
                 >
-                  <Trash2 className="w-4 h-4" />
+                  {formatPKR(priceNum)}
                 </button>
+
+                {/* Desktop Line Total + Remove */}
+                <div className="col-span-2 flex items-center justify-end gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => onToggleExpand(item.key)}
+                    className="text-right font-mono-num tabular-nums text-sm font-semibold text-[var(--cm-text-primary)] whitespace-nowrap cursor-pointer py-1"
+                  >
+                    {formatPKR(lineTotal)}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onRemove(item.key)}
+                    aria-label={`Remove ${item.name}`}
+                    title="Remove item"
+                    className="min-w-[32px] min-h-[32px] flex items-center justify-center text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] hover:bg-[var(--cm-danger-soft)] rounded-lg transition-colors shrink-0 cursor-pointer"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Mobile Compact Collapsed Cart Card (Inline − / + Stepper) */}
+              <div className="sm:hidden px-2.5 py-2 space-y-1.5">
+                <div className="flex items-center justify-between gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => onToggleExpand(item.key)}
+                    aria-expanded={isExpanded}
+                    className="flex-1 min-w-0 flex items-center gap-1.5 text-left cursor-pointer py-0.5"
+                  >
+                    <span className="text-[var(--cm-text-muted)] shrink-0">
+                      {isExpanded ? (
+                        <ChevronDown className="w-4 h-4 text-[var(--cm-accent-text)]" />
+                      ) : (
+                        <ChevronRight className="w-4 h-4" />
+                      )}
+                    </span>
+                    <span className="text-[11px] font-mono-num text-[var(--cm-text-muted)] shrink-0">
+                      {rowNumber}.
+                    </span>
+                    <span className="text-xs font-semibold text-[var(--cm-text-primary)] truncate">
+                      {item.name}
+                    </span>
+                    {exceedsStock && (
+                      <span className="text-[10px] font-semibold text-[var(--cm-danger)] whitespace-nowrap shrink-0">
+                        · Low ({formatNumber(item.currentStock)})
+                      </span>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => onRemove(item.key)}
+                    aria-label={`Remove ${item.name}`}
+                    title="Remove item"
+                    className="w-8 h-8 flex items-center justify-center text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] hover:bg-[var(--cm-danger-soft)] rounded-lg transition-colors shrink-0 cursor-pointer"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pl-5">
+                  <div className="min-w-0 flex items-center gap-1.5 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => onToggleExpand(item.key)}
+                      className="text-[11px] text-[var(--cm-text-muted)] font-mono-num tabular-nums text-left cursor-pointer"
+                    >
+                      {formatPKR(priceNum)}/{selectedUnitLabel}
+                      {conv > 1 ? ` (=${formatNumber(baseUsed)} ${item.unit})` : ''}
+                    </button>
+                    {allowedUnits.length > 1 && onChangeUnit && (
+                      <select
+                        aria-label={`Mobile quick unit for ${item.name}`}
+                        value={selectedUnitLabel}
+                        onChange={(e) => onChangeUnit(item.key, e.target.value)}
+                        className="cm-input min-h-[30px] px-1.5 py-0.5 text-[11px] font-medium border rounded-md max-w-[78px]"
+                      >
+                        {allowedUnits.map((u) => (
+                          <option key={u.unitName} value={u.unitName}>
+                            {u.unitName}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <div className="inline-flex items-center rounded-lg border border-[var(--cm-border)] bg-[var(--cm-bg-subtle)] p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => onStepQuantity(item.key, -1)}
+                        disabled={atMinQty}
+                        aria-label={`Decrease quantity of ${item.name}`}
+                        className="w-9 h-9 flex items-center justify-center rounded-md text-[var(--cm-text-primary)] hover:bg-[var(--cm-bg-surface)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer transition-colors touch-manipulation"
+                      >
+                        <Minus className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onOpenKeypad(item.key)}
+                        aria-label={`Edit quantity of ${item.name}`}
+                        className={`min-w-[30px] px-1.5 h-9 flex items-center justify-center text-xs font-bold font-mono-num tabular-nums cursor-pointer ${
+                          exceedsStock ? 'text-[var(--cm-danger)]' : 'text-[var(--cm-text-primary)]'
+                        }`}
+                      >
+                        {item.quantity || '1'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onStepQuantity(item.key, 1)}
+                        disabled={atMaxStock}
+                        aria-label={`Increase quantity of ${item.name}`}
+                        className="w-9 h-9 flex items-center justify-center rounded-md text-[var(--cm-text-primary)] hover:bg-[var(--cm-bg-surface)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer transition-colors touch-manipulation"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => onToggleExpand(item.key)}
+                      className="min-w-[64px] text-right font-mono-num tabular-nums text-xs font-bold text-[var(--cm-text-primary)] whitespace-nowrap cursor-pointer"
+                    >
+                      {formatPKR(lineTotal)}
+                    </button>
+                  </div>
+                </div>
               </div>
 
               {/* Expanded Inline Editor Drawer */}
@@ -324,8 +439,9 @@ export function CompactSaleItemsList({
                         <button
                           type="button"
                           onClick={() => onStepQuantity(item.key, -1)}
+                          disabled={atMinQty}
                           aria-label="Decrease quantity"
-                          className="min-w-[44px] min-h-[44px] flex items-center justify-center bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg text-[var(--cm-text-primary)] cursor-pointer"
+                          className="min-w-[44px] min-h-[44px] flex items-center justify-center bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] disabled:opacity-35 disabled:cursor-not-allowed rounded-lg text-[var(--cm-text-primary)] cursor-pointer touch-manipulation"
                         >
                           <Minus className="w-4 h-4" />
                         </button>
@@ -345,8 +461,9 @@ export function CompactSaleItemsList({
                         <button
                           type="button"
                           onClick={() => onStepQuantity(item.key, 1)}
+                          disabled={atMaxStock}
                           aria-label="Increase quantity"
-                          className="min-w-[44px] min-h-[44px] flex items-center justify-center bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg text-[var(--cm-text-primary)] cursor-pointer"
+                          className="min-w-[44px] min-h-[44px] flex items-center justify-center bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] disabled:opacity-35 disabled:cursor-not-allowed rounded-lg text-[var(--cm-text-primary)] cursor-pointer touch-manipulation"
                         >
                           <Plus className="w-4 h-4" />
                         </button>

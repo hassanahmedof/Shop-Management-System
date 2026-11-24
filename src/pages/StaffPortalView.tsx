@@ -14,9 +14,11 @@ import { CompactExpandableRow } from '../components/CompactSection';
 import { NumericKeypadOverlay } from '../components/NumericKeypadOverlay';
 import { SearchableProductSelector } from '../components/SearchableProductSelector';
 import { SearchableSelect, type SearchableSelectOption } from '../components/SearchableSelect';
+import { SalesUpsellAssistant } from '../components/SalesUpsellAssistant';
 import { useAuth } from '../contexts/AuthContext';
 import { useOfflineSync } from '../contexts/OfflineSyncContext';
 import { useToast } from '../contexts/ToastContext';
+import { useSalesAssistant } from '../hooks/useSalesAssistant';
 import { isNetworkOrOfflineError } from '../services/offlineSyncService';
 import {
   mapStaffCatalogToSearchable,
@@ -131,6 +133,17 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
     }
     return dbFallbackCatalog || [];
   }, [activeCatalog, dbFallbackCatalog]);
+
+  const {
+    suggestion: upsellSuggestion,
+    dismissSuggestion,
+    onProductAdded: notifyAssistantProductAdded,
+    onCartCleared: notifyAssistantCartCleared,
+    onSaleSaved: notifyAssistantSaleSaved,
+  } = useSalesAssistant({
+    cart: rows,
+    catalog: searchableStaffItems,
+  });
 
   const handleRefreshStaffCatalog = async () => {
     if (!shopId || !user || !isOnline) return;
@@ -361,6 +374,7 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
   const handleQuickAddStaffProduct = (item: SearchableProductItem) => {
     setSaleError(null);
     setSaleSuccess(null);
+    notifyAssistantProductAdded();
 
     const prod = catalogMap.get(item.id);
     const source = prod || item;
@@ -530,6 +544,7 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
       setRows([]);
       setExpandedRowKey(null);
       setQuickAddFeedback(null);
+      notifyAssistantSaleSaved();
       setSaleSuccess(successMsg);
       window.requestAnimationFrame(() => {
         const searchEl = document.getElementById('staff-quick-add-product-search') as HTMLInputElement | null;
@@ -765,6 +780,7 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
                   setExpandedRowKey(null);
                   setQuickAddFeedback(null);
                   setSaleError(null);
+                  notifyAssistantCartCleared();
                 }}
                 className="text-xs font-medium text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] cursor-pointer"
               >
@@ -892,6 +908,12 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
                 </div>
               )}
             </div>
+
+            <SalesUpsellAssistant
+              suggestion={upsellSuggestion}
+              onAddProduct={handleQuickAddStaffProduct}
+              onDismiss={dismissSuggestion}
+            />
 
             {/* Compact Collapsible Products List */}
             <CompactSaleItemsList

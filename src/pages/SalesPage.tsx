@@ -5,10 +5,12 @@ import { CompactExpandableRow, CompactSection } from '../components/CompactSecti
 import { NumericKeypadOverlay } from '../components/NumericKeypadOverlay';
 import { SearchableProductSelector } from '../components/SearchableProductSelector';
 import { SearchableSelect, type SearchableSelectOption } from '../components/SearchableSelect';
+import { SalesUpsellAssistant } from '../components/SalesUpsellAssistant';
 import { useAuth } from '../contexts/AuthContext';
 import { useGoogleSheetsSync } from '../contexts/GoogleSheetsSyncContext';
 import { useShopData } from '../contexts/ShopDataContext';
 import { useToast } from '../contexts/ToastContext';
+import { useSalesAssistant } from '../hooks/useSalesAssistant';
 import {
   mapProductsToSearchable,
   queryProductsFromDatabase,
@@ -166,6 +168,17 @@ export function SalesPage() {
     return dbFallbackItems || [];
   }, [products, dbFallbackItems]);
 
+  const {
+    suggestion: upsellSuggestion,
+    dismissSuggestion,
+    onProductAdded: notifyAssistantProductAdded,
+    onCartCleared: notifyAssistantCartCleared,
+    onSaleSaved: notifyAssistantSaleSaved,
+  } = useSalesAssistant({
+    cart: rows,
+    catalog: searchableItems,
+  });
+
   const handleRefreshCatalog = async () => {
     if (!activeShopId) return;
     const fetched = await queryProductsFromDatabase({
@@ -258,6 +271,7 @@ export function SalesPage() {
   const handleQuickAddProduct = (item: SearchableProductItem) => {
     setFormError(null);
     setFormSuccess(null);
+    notifyAssistantProductAdded();
 
     const prod = productMap.get(item.id);
     const source = prod || item;
@@ -524,6 +538,7 @@ export function SalesPage() {
       setRows([]);
       setExpandedRowKey(null);
       setQuickAddFeedback(null);
+      notifyAssistantSaleSaved();
       setFormSuccess('Sale saved and inventory updated.');
       window.requestAnimationFrame(() => {
         const searchEl = document.getElementById('quick-add-product-search') as HTMLInputElement | null;
@@ -831,6 +846,7 @@ export function SalesPage() {
                   setExpandedRowKey(null);
                   setQuickAddFeedback(null);
                   setFormError(null);
+                  notifyAssistantCartCleared();
                 }}
                 className="text-xs font-medium text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] cursor-pointer"
               >
@@ -957,6 +973,12 @@ export function SalesPage() {
               </div>
             )}
           </div>
+
+          <SalesUpsellAssistant
+            suggestion={upsellSuggestion}
+            onAddProduct={handleQuickAddProduct}
+            onDismiss={dismissSuggestion}
+          />
 
           {/* Compact Collapsible Products List */}
           <CompactSaleItemsList

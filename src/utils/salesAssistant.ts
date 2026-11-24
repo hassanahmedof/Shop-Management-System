@@ -329,6 +329,440 @@ function buildRomanUrduPrompt(params: {
   return `${buildShortProductLabel(anchorName)} ke saath ${candidateName} bhi rakh lain?`;
 }
 
+export type RecommendationEvidenceType = 'history' | 'catalog';
+
+export interface EvaluatedHybridCandidate {
+  candidate: SearchableProductItem;
+  confidence: number;
+  score100: number;
+  totalSortScore: number;
+  triggerProductId: string;
+  distinctAnchorMatches: number;
+  ruleId: string;
+  source: 'history' | 'hybrid';
+  evidenceType: RecommendationEvidenceType;
+  historicalPairCount: number;
+  reasonLabel: string;
+}
+
+export interface ProductRelatedSuggestion {
+  product: SearchableProductItem;
+  stockSummary: string;
+  unitPrice: number;
+  unitName: string;
+  confidence: number;
+  score: number;
+  ruleId: string;
+  source: 'history' | 'hybrid';
+  evidenceType: RecommendationEvidenceType;
+  historicalPairCount: number;
+  reasonLabel: string;
+}
+
+export interface HybridCandidateEvaluationBatch {
+  evaluated: EvaluatedHybridCandidate[];
+  eligibleCandidateCount: number;
+  catalogById: Map<string, SearchableProductItem>;
+  extractsById: Map<string, ProductFeatureExtract>;
+}
+
+/**
+ * Shared Multi-Layer Hybrid Candidate Evaluation Pipeline.
+ * Used by both Sales Entry upselling (top-1) and Product Details related products (top-N),
+ * reading solely from cached catalog intelligence and pre-aggregated co-occurrence state.
+ */
+export function evaluateHybridUpsellCandidates(params: {
+  shopId: string;
+  cartItems?: CartAssistantItem[];
+  cartProductIds?: string[];
+  catalog: SearchableProductItem[];
+  dismissedProductIds?: string[];
+  removedProductIds?: string[];
+}): HybridCandidateEvaluationBatch {
+  const {
+    shopId,
+    cartItems,
+    cartProductIds,
+    catalog,
+    dismissedProductIds,
+    removedProductIds,
+  } = params;
+
+  if (!shopId || !Array.isArray(catalog) || catalog.length === 0) {
+    return {
+      evaluated: [],
+      eligibleCandidateCount: 0,
+      catalogById: new Map(),
+      extractsById: new Map(),
+    };
+  }
+
+  const intel = getOrUpdateCatalogIntelligenceSync(shopId, catalog);
+  const extractsById = new Map<string, ProductFeatureExtract>();
+  for (const [pid, prof] of intel.profilesById.entries()) {
+    extractsById.set(pid, prof.extract);
+  }
+
+  const { normalizedCart, cartCatalogItems, eligibleCandidates, catalogById } =
+    filterEligibleUpsellCandidates({
+      cartItems,
+      cartProductIds,
+      catalog,
+      dismissedProductIds,
+      removedProductIds,
+      extractsById,
+    });
+
+  if (normalizedCart.length === 0 || cartCatalogItems.length === 0 || eligibleCandidates.length === 0) {
+    return {
+      evaluated: [],
+      eligibleCandidateCount: eligibleCandidates.length,
+      catalogById,
+      extractsById,
+    };
+  }
+
+  // Aggregate per-cart-item effective quantities
+  const cartEffectiveQtyById = new Map<string, number>();
+  let totalEffectiveBasketQty = 0;
+  let totalBasketValue = 0;
+  let totalPriceWeight = 0;
+
+  for (const line of normalizedCart) {
+    const prod = catalogById.get(line.productId);
+    if (!prod) continue;
+    const qty = Math.max(0.25, Number(line.quantity) || 1);
+    const conv = Math.max(1, Number(line.conversionFactor) || 1);
+    const effQty = roundStockQty(qty * conv);
+    cartEffectiveQtyById.set(
+      line.productId,
+      roundStockQty((cartEffectiveQtyById.get(line.productId) || 0) + effQty)
+    );
+    totalEffectiveBasketQty = roundStockQty(totalEffectiveBasketQty + effQty);
+
+    const linePrice =
+      Number.isFinite(Number(line.salePricePerUnit)) && Number(line.salePricePerUnit) > 0
+        ? Number(line.salePricePerUnit)
+        : getDefaultSaleUnit(prod).salePrice;
+    if (linePrice > 0) {
+      totalBasketValue += linePrice * qty;
+      totalPriceWeight += qty;
+    }
+  }
+
+  const avgCartUnitPrice = totalPriceWeight > 0 ? totalBasketValue / totalPriceWeight : 0;
+
+  // Build weighted cart semantic centroid across ALL items in cart
+  const rawCartCentroid = new Map<string, number>();
+  const anchorWeightById = new Map<string, number>();
+  const anchorCategoryKeysSet = new Set<string>();
+
+  for (const cartProd of cartCatalogItems) {
+    const effQty = cartEffectiveQtyById.get(cartProd.id) || 1;
+    const qtyWeight = 1 + Math.log1p(Math.max(0, effQty - 1)) * 0.35;
+    anchorWeightById.set(cartProd.id, qtyWeight);
+
+    const prof = intel.profilesById.get(cartProd.id);
+    if (prof) {
+      if (prof.extract.categoryKey && !CATCHALL_CATEGORY_KEYS.has(prof.extract.categoryKey)) {
+        anchorCategoryKeysSet.add(prof.extract.categoryKey);
+      }
+      for (const [term, w] of prof.tfidfVector.entries()) {
+        rawCartCentroid.set(term, (rawCartCentroid.get(term) || 0) + w * qtyWeight);
+      }
+    }
+  }
+
+  let centroidNormSq = 0;
+  for (const val of rawCartCentroid.values()) centroidNormSq += val * val;
+  const cartCentroid = new Map<string, number>();
+  if (centroidNormSq > 0) {
+    const invNorm = 1 / Math.sqrt(centroidNormSq);
+    for (const [term, val] of rawCartCentroid.entries()) {
+      cartCentroid.set(term, val * invNorm);
+    }
+  }
+
+  const anchorCategoryKeys = Array.from(anchorCategoryKeysSet);
+
+  // Layer 1 data: Historical co-occurrence (cached snapshot only, never scans raw sales)
+  const histStats = getCooccurrenceStatsSnapshot(shopId);
+  const histRanks =
+    histStats.totalCompletedSales > 0
+      ? getHistoricalCooccurrenceCandidates(shopId, normalizedCart)
+      : [];
+  const histByProductId = new Map(histRanks.map((r) => [r.productId, r]));
+  const historyActiveForCart = histRanks.length > 0;
+
+  const evaluated: EvaluatedHybridCandidate[] = [];
+
+  for (const candidate of eligibleCandidates) {
+    const candProf = intel.profilesById.get(candidate.id);
+    const candExt = candProf?.extract || extractProductFeatures(candidate);
+
+    // 1) Historical Co-Occurrence signal [0..1]
+    const hist = histByProductId.get(candidate.id);
+    let H = 0;
+    if (hist) {
+      const supportNorm = Math.min(1, Math.log1p(hist.pairCount) / Math.log1p(6));
+      const confNorm = clamp01(hist.confidence);
+      const liftNorm = clamp01((hist.lift - 0.75) / 2.25);
+      const multiHistBonus = Math.min(0.18, Math.max(0, hist.distinctAnchorMatches - 1) * 0.12);
+      H = clamp01(0.36 * supportNorm + 0.34 * confNorm + 0.30 * liftNorm + multiHistBonus);
+    }
+
+    // 2) Dynamic Category & Cross-Category Complementarity [0..1]
+    let catWeightedSum = 0;
+    let catWeightDenom = 0;
+    let catMatches = 0;
+    let bestAnchorCatScore = 0;
+    let bestAnchorId = cartCatalogItems[0]?.id || '';
+
+    // 3) & 4) Per-anchor semantic + brand/context evaluation across ENTIRE cart
+    let semanticMatchAnchors = 0;
+    let maxCoreTokenOverlap = 0;
+    let bestSameBrandCrossScore = 0;
+    let sharedStorageMatch = false;
+    let sharedOriginMatch = false;
+    let sharedReturnableMatch = false;
+    let bestSemanticAnchorScore = 0;
+
+    const candCatValid =
+      Boolean(candExt.categoryKey) && !CATCHALL_CATEGORY_KEYS.has(candExt.categoryKey);
+
+    for (const cartProd of cartCatalogItems) {
+      const anchorProf = intel.profilesById.get(cartProd.id);
+      const anchorExt = anchorProf?.extract || extractProductFeatures(cartProd);
+      const qtyWeight = anchorWeightById.get(cartProd.id) || 1;
+
+      const coreOverlap = jaccardSet(anchorExt.coreTitleTokens, candExt.coreTitleTokens);
+      if (coreOverlap > maxCoreTokenOverlap) {
+        maxCoreTokenOverlap = coreOverlap;
+      }
+
+      // Pairwise semantic similarity
+      if (anchorProf && candProf) {
+        const pairSem = cosineSimilaritySparse(anchorProf.tfidfVector, candProf.tfidfVector);
+        if (pairSem >= 0.16) {
+          semanticMatchAnchors += 1;
+        }
+        if (pairSem * qtyWeight > bestSemanticAnchorScore) {
+          bestSemanticAnchorScore = pairSem * qtyWeight;
+          if (!hist) {
+            bestAnchorId = cartProd.id;
+          }
+        }
+      }
+
+      // Category complementarity
+      const anchorCatValid =
+        Boolean(anchorExt.categoryKey) && !CATCHALL_CATEGORY_KEYS.has(anchorExt.categoryKey);
+      if (candCatValid && anchorCatValid) {
+        catWeightDenom += qtyWeight;
+        let pairCatScore = 0;
+
+        if (anchorExt.categoryKey === candExt.categoryKey) {
+          // Same category: reward clearly distinct complementary lines; reject near-duplicate titles
+          if (coreOverlap < 0.35) {
+            pairCatScore = 0.56 * (1 - coreOverlap);
+            catMatches += 1;
+          } else if (coreOverlap < 0.60) {
+            pairCatScore = 0.24 * (1 - coreOverlap);
+          }
+        } else {
+          const aff =
+            intel.categoryAffinities.get(anchorExt.categoryKey)?.get(candExt.categoryKey) || 0;
+          if (aff >= 0.10) {
+            pairCatScore = Math.min(1, aff * 1.25 + 0.08);
+            catMatches += 1;
+          }
+        }
+
+        catWeightedSum += pairCatScore * qtyWeight;
+        if (pairCatScore > bestAnchorCatScore) {
+          bestAnchorCatScore = pairCatScore;
+          if (!hist && pairCatScore >= 0.25) {
+            bestAnchorId = cartProd.id;
+          }
+        }
+      }
+
+      // Brand portfolio affinity: same known brand, distinct line / cross-category
+      const brandInfo = fromExtractToBrandMatch(anchorExt, candExt);
+      const catInfo = fromExtractToCategoryMatch(anchorExt, candExt);
+      if (brandInfo.same && (!catInfo.same || coreOverlap < 0.35)) {
+        const lineStrength = !catInfo.same ? 0.78 : 0.62;
+        const boosted = clamp01(lineStrength * Math.min(1.2, qtyWeight * 0.95));
+        if (boosted > bestSameBrandCrossScore) {
+          bestSameBrandCrossScore = boosted;
+          if (!hist) {
+            bestAnchorId = cartProd.id;
+          }
+        }
+      }
+
+      if (
+        anchorExt.storageLocationKey &&
+        candExt.storageLocationKey &&
+        anchorExt.storageLocationKey === candExt.storageLocationKey
+      ) {
+        sharedStorageMatch = true;
+      }
+      if (
+        anchorExt.originType &&
+        candExt.originType &&
+        anchorExt.originType === candExt.originType
+      ) {
+        sharedOriginMatch = true;
+      }
+      if (anchorExt.isReturnable && candExt.isReturnable && !catInfo.same) {
+        sharedReturnableMatch = true;
+      }
+    }
+
+    const Cat =
+      catWeightDenom > 0
+        ? clamp01(
+            catWeightedSum / catWeightDenom +
+              (catMatches > 1 ? Math.min(0.16, (catMatches - 1) * 0.09) : 0)
+          )
+        : 0;
+
+    // 3) Semantic similarity to whole basket [0..1]
+    const rawCartCosine = candProf
+      ? cosineSimilaritySparse(cartCentroid, candProf.tfidfVector)
+      : 0;
+    const substituteDampen = maxCoreTokenOverlap >= 0.65 ? 0.45 : 1;
+    const multiSemBonus =
+      semanticMatchAnchors > 1 ? Math.min(0.22, (semanticMatchAnchors - 1) * 0.12) : 0;
+    const Sem = clamp01((rawCartCosine * 1.65 + multiSemBonus) * substituteDampen);
+
+    // 4) Brand portfolio & POS context [0..1]
+    const defUnit = getDefaultSaleUnit(candidate);
+    const candPrice = defUnit.salePrice || candExt.unitSalePrice || 0;
+    let priceAdjust = 0;
+    if (avgCartUnitPrice > 0 && candPrice > 0) {
+      const priceRatio = candPrice / avgCartUnitPrice;
+      if (priceRatio >= 0.08 && priceRatio <= 2.2) {
+        priceAdjust = 0.08;
+      } else if (priceRatio > 4.5) {
+        priceAdjust = -0.10;
+      }
+    }
+
+    const availableBaseStock = roundStockQty(Math.max(0, Number(candidate.currentStock) || 0));
+    const sellableUnits = Math.floor(
+      availableBaseStock / Math.max(1, defUnit.conversionQty)
+    );
+    const stockTiebreak = 0.04 * Math.min(1, sellableUnits / 10);
+    const packAlignBonus =
+      (totalEffectiveBasketQty >= 2 || normalizedCart.length >= 2) &&
+      candExt.packNumericScore >= 2
+        ? 0.07
+        : 0;
+
+    const BrandCtx = clamp01(
+      bestSameBrandCrossScore * 0.78 +
+        (sharedStorageMatch ? 0.24 : 0) +
+        (sharedOriginMatch ? 0.08 : 0) +
+        (sharedReturnableMatch ? 0.08 : 0) +
+        packAlignBonus +
+        priceAdjust +
+        stockTiebreak
+    );
+
+    // 5) Self-learning Bayesian feedback adjustment [-0.18..+0.22]
+    const feedbackDelta = getUpsellFeedbackAdjustment({
+      shopId,
+      candidateProductId: candidate.id,
+      candidateCategoryKey: candExt.categoryKey,
+      anchorCategoryKeys,
+    });
+
+    // Dynamic weight allocation across currently available catalog layers + non-diluting history fusion
+    const wCat = catWeightDenom > 0 ? 0.24 : 0;
+    const wSem = candProf && cartCentroid.size > 0 ? 0.20 : 0;
+    const wCtx = 0.12;
+    const catalogWeightSum = wCat + wSem + wCtx;
+
+    const catalogConfidence =
+      catalogWeightSum > 0
+        ? (wCat * Cat + wSem * Sem + wCtx * BrandCtx) / catalogWeightSum
+        : 0;
+
+    const baseConfidence =
+      historyActiveForCart && H > 0
+        ? clamp01(0.58 * H + 0.42 * catalogConfidence + 0.22 * Math.max(H, catalogConfidence))
+        : catalogConfidence;
+
+    const finalConfidence = clamp01(baseConfidence + feedbackDelta);
+
+    // Core signal gate prevents pure price/stock noise from triggering unrelated upsells
+    const strongestCoreSignal = Math.max(
+      H,
+      Cat,
+      rawCartCosine * 1.45,
+      bestSameBrandCrossScore,
+      sharedStorageMatch ? 0.24 : 0
+    );
+
+    if (strongestCoreSignal < 0.22 || finalConfidence < MIN_RECOMMENDATION_CONFIDENCE) {
+      continue;
+    }
+
+    const distinctAnchors = hist
+      ? hist.distinctAnchorMatches
+      : Math.max(catMatches, semanticMatchAnchors, 1);
+    const triggerId = hist ? hist.triggerProductId : bestAnchorId;
+    const usedHistoryPrimary = Boolean(hist && H >= catalogConfidence * 0.85);
+    const hasHistoricalEvidence = Boolean(hist && hist.maxSinglePairCount >= 2 && H > 0);
+    const historicalPairCount = hasHistoricalEvidence ? hist!.maxSinglePairCount : 0;
+    const ruleId = usedHistoryPrimary
+      ? `history_cooccur_${hist!.maxSinglePairCount}x`
+      : bestSameBrandCrossScore >= 0.5
+        ? 'hybrid_brand_complement'
+        : Cat >= Sem
+          ? 'hybrid_category_affinity'
+          : 'hybrid_semantic_match';
+
+    const reasonLabel = hasHistoricalEvidence
+      ? `Bought together · ${historicalPairCount}×`
+      : ruleId === 'hybrid_brand_complement'
+        ? 'Same brand complement'
+        : ruleId === 'hybrid_category_affinity'
+          ? 'Related category'
+          : 'Similar attributes';
+
+    evaluated.push({
+      candidate,
+      confidence: Math.round(finalConfidence * 1000) / 1000,
+      score100: Math.round(finalConfidence * 10000) / 100,
+      totalSortScore: finalConfidence + stockTiebreak * 0.05,
+      triggerProductId: triggerId,
+      distinctAnchorMatches: distinctAnchors,
+      ruleId,
+      source: usedHistoryPrimary ? 'history' : 'hybrid',
+      evidenceType: hasHistoricalEvidence ? 'history' : 'catalog',
+      historicalPairCount,
+      reasonLabel,
+    });
+  }
+
+  evaluated.sort((a, b) => {
+    if (Math.abs(b.totalSortScore - a.totalSortScore) > 1e-6) {
+      return b.totalSortScore - a.totalSortScore;
+    }
+    return a.candidate.name.localeCompare(b.candidate.name);
+  });
+
+  return {
+    evaluated,
+    eligibleCandidateCount: eligibleCandidates.length,
+    catalogById,
+    extractsById,
+  };
+}
+
 /**
  * Multi-Layer Adaptive Hybrid Recommendation Engine:
  * Evaluates the ENTIRE current cart across:
@@ -351,388 +785,16 @@ export function getHybridUpsellSuggestion(params: {
   removedProductIds?: string[];
 }): HybridUpsellEvaluationResult {
   try {
-    const {
-      shopId,
-      cartItems,
-      cartProductIds,
-      catalog,
-      dismissedProductIds,
-      removedProductIds,
-    } = params;
+    const { evaluated, eligibleCandidateCount, catalogById } =
+      evaluateHybridUpsellCandidates(params);
 
-    if (!shopId || !Array.isArray(catalog) || catalog.length === 0) {
-      return {
-        suggestion: null,
-        confidence: 0,
-        needsAiRefinement: false,
-        eligibleCandidateCount: 0,
-      };
-    }
-
-    const intel = getOrUpdateCatalogIntelligenceSync(shopId, catalog);
-    const extractsById = new Map<string, ProductFeatureExtract>();
-    for (const [pid, prof] of intel.profilesById.entries()) {
-      extractsById.set(pid, prof.extract);
-    }
-
-    const { normalizedCart, cartCatalogItems, eligibleCandidates, catalogById } =
-      filterEligibleUpsellCandidates({
-        cartItems,
-        cartProductIds,
-        catalog,
-        dismissedProductIds,
-        removedProductIds,
-        extractsById,
-      });
-
-    if (normalizedCart.length === 0 || cartCatalogItems.length === 0 || eligibleCandidates.length === 0) {
-      return {
-        suggestion: null,
-        confidence: 0,
-        needsAiRefinement: false,
-        eligibleCandidateCount: eligibleCandidates.length,
-      };
-    }
-
-    // Aggregate per-cart-item effective quantities
-    const cartEffectiveQtyById = new Map<string, number>();
-    let totalEffectiveBasketQty = 0;
-    let totalBasketValue = 0;
-    let totalPriceWeight = 0;
-
-    for (const line of normalizedCart) {
-      const prod = catalogById.get(line.productId);
-      if (!prod) continue;
-      const qty = Math.max(0.25, Number(line.quantity) || 1);
-      const conv = Math.max(1, Number(line.conversionFactor) || 1);
-      const effQty = roundStockQty(qty * conv);
-      cartEffectiveQtyById.set(
-        line.productId,
-        roundStockQty((cartEffectiveQtyById.get(line.productId) || 0) + effQty)
-      );
-      totalEffectiveBasketQty = roundStockQty(totalEffectiveBasketQty + effQty);
-
-      const linePrice =
-        Number.isFinite(Number(line.salePricePerUnit)) && Number(line.salePricePerUnit) > 0
-          ? Number(line.salePricePerUnit)
-          : getDefaultSaleUnit(prod).salePrice;
-      if (linePrice > 0) {
-        totalBasketValue += linePrice * qty;
-        totalPriceWeight += qty;
-      }
-    }
-
-    const avgCartUnitPrice = totalPriceWeight > 0 ? totalBasketValue / totalPriceWeight : 0;
-
-    // Build weighted cart semantic centroid across ALL items in cart
-    const rawCartCentroid = new Map<string, number>();
-    const anchorWeightById = new Map<string, number>();
-    const anchorCategoryKeysSet = new Set<string>();
-
-    for (const cartProd of cartCatalogItems) {
-      const effQty = cartEffectiveQtyById.get(cartProd.id) || 1;
-      const qtyWeight = 1 + Math.log1p(Math.max(0, effQty - 1)) * 0.35;
-      anchorWeightById.set(cartProd.id, qtyWeight);
-
-      const prof = intel.profilesById.get(cartProd.id);
-      if (prof) {
-        if (prof.extract.categoryKey && !CATCHALL_CATEGORY_KEYS.has(prof.extract.categoryKey)) {
-          anchorCategoryKeysSet.add(prof.extract.categoryKey);
-        }
-        for (const [term, w] of prof.tfidfVector.entries()) {
-          rawCartCentroid.set(term, (rawCartCentroid.get(term) || 0) + w * qtyWeight);
-        }
-      }
-    }
-
-    let centroidNormSq = 0;
-    for (const val of rawCartCentroid.values()) centroidNormSq += val * val;
-    const cartCentroid = new Map<string, number>();
-    if (centroidNormSq > 0) {
-      const invNorm = 1 / Math.sqrt(centroidNormSq);
-      for (const [term, val] of rawCartCentroid.entries()) {
-        cartCentroid.set(term, val * invNorm);
-      }
-    }
-
-    const anchorCategoryKeys = Array.from(anchorCategoryKeysSet);
-
-    // Layer 1 data: Historical co-occurrence
-    const histStats = getCooccurrenceStatsSnapshot(shopId);
-    const histRanks =
-      histStats.totalCompletedSales > 0
-        ? getHistoricalCooccurrenceCandidates(shopId, normalizedCart)
-        : [];
-    const histByProductId = new Map(histRanks.map((r) => [r.productId, r]));
-    const historyActiveForCart = histRanks.length > 0;
-
-    let bestCandidate: {
-      candidate: SearchableProductItem;
-      confidence: number;
-      score100: number;
-      triggerProductId: string;
-      distinctAnchorMatches: number;
-      ruleId: string;
-      source: 'history' | 'hybrid';
-    } | null = null;
-
-    for (const candidate of eligibleCandidates) {
-      const candProf = intel.profilesById.get(candidate.id);
-      const candExt = candProf?.extract || extractProductFeatures(candidate);
-
-      // 1) Historical Co-Occurrence signal [0..1]
-      const hist = histByProductId.get(candidate.id);
-      let H = 0;
-      if (hist) {
-        const supportNorm = Math.min(1, Math.log1p(hist.pairCount) / Math.log1p(6));
-        const confNorm = clamp01(hist.confidence);
-        const liftNorm = clamp01((hist.lift - 0.75) / 2.25);
-        const multiHistBonus = Math.min(0.18, Math.max(0, hist.distinctAnchorMatches - 1) * 0.12);
-        H = clamp01(0.36 * supportNorm + 0.34 * confNorm + 0.30 * liftNorm + multiHistBonus);
-      }
-
-      // 2) Dynamic Category & Cross-Category Complementarity [0..1]
-      let catWeightedSum = 0;
-      let catWeightDenom = 0;
-      let catMatches = 0;
-      let bestAnchorCatScore = 0;
-      let bestAnchorId = cartCatalogItems[0]?.id || '';
-
-      // 3) & 4) Per-anchor semantic + brand/context evaluation across ENTIRE cart
-      let semanticMatchAnchors = 0;
-      let maxCoreTokenOverlap = 0;
-      let bestSameBrandCrossScore = 0;
-      let sharedStorageMatch = false;
-      let sharedOriginMatch = false;
-      let sharedReturnableMatch = false;
-      let bestSemanticAnchorScore = 0;
-
-      const candCatValid =
-        Boolean(candExt.categoryKey) && !CATCHALL_CATEGORY_KEYS.has(candExt.categoryKey);
-
-      for (const cartProd of cartCatalogItems) {
-        const anchorProf = intel.profilesById.get(cartProd.id);
-        const anchorExt = anchorProf?.extract || extractProductFeatures(cartProd);
-        const qtyWeight = anchorWeightById.get(cartProd.id) || 1;
-
-        const coreOverlap = jaccardSet(anchorExt.coreTitleTokens, candExt.coreTitleTokens);
-        if (coreOverlap > maxCoreTokenOverlap) {
-          maxCoreTokenOverlap = coreOverlap;
-        }
-
-        // Pairwise semantic similarity
-        if (anchorProf && candProf) {
-          const pairSem = cosineSimilaritySparse(anchorProf.tfidfVector, candProf.tfidfVector);
-          if (pairSem >= 0.16) {
-            semanticMatchAnchors += 1;
-          }
-          if (pairSem * qtyWeight > bestSemanticAnchorScore) {
-            bestSemanticAnchorScore = pairSem * qtyWeight;
-            if (!hist) {
-              bestAnchorId = cartProd.id;
-            }
-          }
-        }
-
-        // Category complementarity
-        const anchorCatValid =
-          Boolean(anchorExt.categoryKey) && !CATCHALL_CATEGORY_KEYS.has(anchorExt.categoryKey);
-        if (candCatValid && anchorCatValid) {
-          catWeightDenom += qtyWeight;
-          let pairCatScore = 0;
-
-          if (anchorExt.categoryKey === candExt.categoryKey) {
-            // Same category: reward clearly distinct complementary lines; reject near-duplicate titles
-            if (coreOverlap < 0.35) {
-              pairCatScore = 0.56 * (1 - coreOverlap);
-              catMatches += 1;
-            } else if (coreOverlap < 0.60) {
-              pairCatScore = 0.24 * (1 - coreOverlap);
-            }
-          } else {
-            const aff =
-              intel.categoryAffinities.get(anchorExt.categoryKey)?.get(candExt.categoryKey) || 0;
-            if (aff >= 0.10) {
-              pairCatScore = Math.min(1, aff * 1.25 + 0.08);
-              catMatches += 1;
-            }
-          }
-
-          catWeightedSum += pairCatScore * qtyWeight;
-          if (pairCatScore > bestAnchorCatScore) {
-            bestAnchorCatScore = pairCatScore;
-            if (!hist && pairCatScore >= 0.25) {
-              bestAnchorId = cartProd.id;
-            }
-          }
-        }
-
-        // Brand portfolio affinity: same known brand, distinct line / cross-category
-        const brandInfo = fromExtractToBrandMatch(anchorExt, candExt);
-        const catInfo = fromExtractToCategoryMatch(anchorExt, candExt);
-        if (brandInfo.same && (!catInfo.same || coreOverlap < 0.35)) {
-          const lineStrength = !catInfo.same ? 0.78 : 0.62;
-          const boosted = clamp01(lineStrength * Math.min(1.2, qtyWeight * 0.95));
-          if (boosted > bestSameBrandCrossScore) {
-            bestSameBrandCrossScore = boosted;
-            if (!hist) {
-              bestAnchorId = cartProd.id;
-            }
-          }
-        }
-
-        if (
-          anchorExt.storageLocationKey &&
-          candExt.storageLocationKey &&
-          anchorExt.storageLocationKey === candExt.storageLocationKey
-        ) {
-          sharedStorageMatch = true;
-        }
-        if (
-          anchorExt.originType &&
-          candExt.originType &&
-          anchorExt.originType === candExt.originType
-        ) {
-          sharedOriginMatch = true;
-        }
-        if (anchorExt.isReturnable && candExt.isReturnable && !catInfo.same) {
-          sharedReturnableMatch = true;
-        }
-      }
-
-      const Cat =
-        catWeightDenom > 0
-          ? clamp01(
-              catWeightedSum / catWeightDenom +
-                (catMatches > 1 ? Math.min(0.16, (catMatches - 1) * 0.09) : 0)
-            )
-          : 0;
-
-      // 3) Semantic similarity to whole basket [0..1]
-      const rawCartCosine = candProf
-        ? cosineSimilaritySparse(cartCentroid, candProf.tfidfVector)
-        : 0;
-      const substituteDampen = maxCoreTokenOverlap >= 0.65 ? 0.45 : 1;
-      const multiSemBonus =
-        semanticMatchAnchors > 1 ? Math.min(0.22, (semanticMatchAnchors - 1) * 0.12) : 0;
-      const Sem = clamp01((rawCartCosine * 1.65 + multiSemBonus) * substituteDampen);
-
-      // 4) Brand portfolio & POS context [0..1]
-      const defUnit = getDefaultSaleUnit(candidate);
-      const candPrice = defUnit.salePrice || candExt.unitSalePrice || 0;
-      let priceAdjust = 0;
-      if (avgCartUnitPrice > 0 && candPrice > 0) {
-        const priceRatio = candPrice / avgCartUnitPrice;
-        if (priceRatio >= 0.08 && priceRatio <= 2.2) {
-          priceAdjust = 0.08;
-        } else if (priceRatio > 4.5) {
-          priceAdjust = -0.10;
-        }
-      }
-
-      const availableBaseStock = roundStockQty(Math.max(0, Number(candidate.currentStock) || 0));
-      const sellableUnits = Math.floor(
-        availableBaseStock / Math.max(1, defUnit.conversionQty)
-      );
-      const stockTiebreak = 0.04 * Math.min(1, sellableUnits / 10);
-      const packAlignBonus =
-        (totalEffectiveBasketQty >= 2 || normalizedCart.length >= 2) &&
-        candExt.packNumericScore >= 2
-          ? 0.07
-          : 0;
-
-      const BrandCtx = clamp01(
-        bestSameBrandCrossScore * 0.78 +
-          (sharedStorageMatch ? 0.24 : 0) +
-          (sharedOriginMatch ? 0.08 : 0) +
-          (sharedReturnableMatch ? 0.08 : 0) +
-          packAlignBonus +
-          priceAdjust +
-          stockTiebreak
-      );
-
-      // 5) Self-learning Bayesian feedback adjustment [-0.18..+0.22]
-      const feedbackDelta = getUpsellFeedbackAdjustment({
-        shopId,
-        candidateProductId: candidate.id,
-        candidateCategoryKey: candExt.categoryKey,
-        anchorCategoryKeys,
-      });
-
-      // Dynamic weight allocation across currently available catalog layers + non-diluting history fusion
-      const wCat = catWeightDenom > 0 ? 0.24 : 0;
-      const wSem = candProf && cartCentroid.size > 0 ? 0.20 : 0;
-      const wCtx = 0.12;
-      const catalogWeightSum = wCat + wSem + wCtx;
-
-      const catalogConfidence =
-        catalogWeightSum > 0
-          ? (wCat * Cat + wSem * Sem + wCtx * BrandCtx) / catalogWeightSum
-          : 0;
-
-      // When history has co-occurrence evidence for this cart+candidate, fuse behavioral history
-      // with catalog signals so valid non-lexical cross-category pairs (e.g. Tea -> Biscuit)
-      // are never diluted below threshold by zero lexical overlap.
-      const baseConfidence =
-        historyActiveForCart && H > 0
-          ? clamp01(0.58 * H + 0.42 * catalogConfidence + 0.22 * Math.max(H, catalogConfidence))
-          : catalogConfidence;
-
-      const finalConfidence = clamp01(baseConfidence + feedbackDelta);
-
-      // Core signal gate prevents pure price/stock noise from triggering unrelated upsells
-      const strongestCoreSignal = Math.max(
-        H,
-        Cat,
-        rawCartCosine * 1.45,
-        bestSameBrandCrossScore,
-        sharedStorageMatch ? 0.24 : 0
-      );
-
-      if (strongestCoreSignal < 0.22 || finalConfidence < MIN_RECOMMENDATION_CONFIDENCE) {
-        continue;
-      }
-
-      // Tie-breaker uses sellable stock slightly only when confidence is nearly identical
-      const totalSortScore = finalConfidence + stockTiebreak * 0.05;
-      const existingBestSort = bestCandidate ? bestCandidate.confidence : -1;
-
-      if (
-        !bestCandidate ||
-        totalSortScore > existingBestSort + 1e-6 ||
-        (Math.abs(totalSortScore - existingBestSort) <= 1e-6 &&
-          candidate.name.localeCompare(bestCandidate.candidate.name) < 0)
-      ) {
-        const distinctAnchors = hist
-          ? hist.distinctAnchorMatches
-          : Math.max(catMatches, semanticMatchAnchors, 1);
-        const triggerId = hist ? hist.triggerProductId : bestAnchorId;
-        const usedHistoryPrimary = Boolean(hist && H >= catalogConfidence * 0.85);
-
-        bestCandidate = {
-          candidate,
-          confidence: Math.round(finalConfidence * 1000) / 1000,
-          score100: Math.round(finalConfidence * 10000) / 100,
-          triggerProductId: triggerId,
-          distinctAnchorMatches: distinctAnchors,
-          ruleId: usedHistoryPrimary
-            ? `history_cooccur_${hist!.maxSinglePairCount}x`
-            : bestSameBrandCrossScore >= 0.5
-              ? 'hybrid_brand_complement'
-              : Cat >= Sem
-                ? 'hybrid_category_affinity'
-                : 'hybrid_semantic_match',
-          source: usedHistoryPrimary ? 'history' : 'hybrid',
-        };
-      }
-    }
-
+    const bestCandidate = evaluated[0];
     if (!bestCandidate) {
       return {
         suggestion: null,
         confidence: 0,
-        needsAiRefinement: eligibleCandidates.length > 0,
-        eligibleCandidateCount: eligibleCandidates.length,
+        needsAiRefinement: eligibleCandidateCount > 0,
+        eligibleCandidateCount,
       };
     }
 
@@ -758,7 +820,7 @@ export function getHybridUpsellSuggestion(params: {
       },
       confidence: bestCandidate.confidence,
       needsAiRefinement: bestCandidate.confidence < GEMINI_CONFIDENT_SKIP_THRESHOLD,
-      eligibleCandidateCount: eligibleCandidates.length,
+      eligibleCandidateCount,
     };
   } catch {
     return {
@@ -767,6 +829,81 @@ export function getHybridUpsellSuggestion(params: {
       needsAiRefinement: false,
       eligibleCandidateCount: 0,
     };
+  }
+}
+
+/**
+ * Reuses the hybrid recommendation engine for Product Details inspection.
+ * Returns active, live-in-stock complementary products with variant deduplication
+ * across both the inspected product and sibling suggestions, tagged honestly by
+ * historical vs catalog-based evidence. Never scans sales history or calls Gemini.
+ */
+export function getProductRelatedSuggestions(params: {
+  shopId: string;
+  productId: string;
+  catalog: SearchableProductItem[];
+  limit?: number;
+}): ProductRelatedSuggestion[] {
+  try {
+    const { shopId, productId, catalog, limit = 4 } = params;
+    if (!shopId || !productId || !Array.isArray(catalog) || catalog.length === 0) {
+      return [];
+    }
+
+    const anchor = catalog.find((item) => item.id === productId);
+    if (!anchor || anchor.isActive === false) {
+      return [];
+    }
+
+    const { evaluated, extractsById } = evaluateHybridUpsellCandidates({
+      shopId,
+      cartItems: [{ productId, quantity: 1, conversionFactor: 1 }],
+      catalog,
+    });
+
+    if (evaluated.length === 0) {
+      return [];
+    }
+
+    const maxItems = Math.max(1, Math.min(8, Math.floor(limit) || 4));
+    const selected: ProductRelatedSuggestion[] = [];
+
+    for (const entry of evaluated) {
+      if (selected.length >= maxItems) break;
+
+      const candExt = extractsById.get(entry.candidate.id);
+      const isDuplicateFamily = selected.some((already) =>
+        areSameProductOrVariant(
+          already.product,
+          entry.candidate,
+          extractsById.get(already.product.id),
+          candExt
+        )
+      );
+      if (isDuplicateFamily) continue;
+
+      const availableBaseStock = roundStockQty(Math.max(0, Number(entry.candidate.currentStock) || 0));
+      const stockBreakdown = formatStockBreakdown(availableBaseStock, entry.candidate);
+      const defUnit = getDefaultSaleUnit(entry.candidate);
+
+      selected.push({
+        product: entry.candidate,
+        stockSummary: stockBreakdown.summaryText,
+        unitPrice: defUnit.salePrice,
+        unitName: defUnit.unitName,
+        confidence: entry.confidence,
+        score: entry.score100,
+        ruleId: entry.ruleId,
+        source: entry.source,
+        evidenceType: entry.evidenceType,
+        historicalPairCount: entry.historicalPairCount,
+        reasonLabel: entry.reasonLabel,
+      });
+    }
+
+    return selected;
+  } catch {
+    return [];
   }
 }
 

@@ -1,5 +1,5 @@
-import { CheckCircle2, Filter, RefreshCw, Search, ShoppingBag } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { CheckCircle2, ChevronDown, ChevronRight, Filter, RefreshCw, Search, ShoppingBag } from 'lucide-react';
+import { Fragment, useMemo, useRef, useState } from 'react';
 import {
   Bar,
   BarChart,
@@ -12,6 +12,7 @@ import {
 import { CompactSaleItemsList, type CompactSaleRowItem } from '../components/CompactSaleItemsList';
 import { CompactExpandableRow } from '../components/CompactSection';
 import { NumericKeypadOverlay } from '../components/NumericKeypadOverlay';
+import { ProductRelatedSuggestions } from '../components/ProductRelatedSuggestions';
 import { SearchableProductSelector } from '../components/SearchableProductSelector';
 import { SearchableSelect, type SearchableSelectOption } from '../components/SearchableSelect';
 import { SalesUpsellAssistant } from '../components/SalesUpsellAssistant';
@@ -1489,6 +1490,12 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
                             </div>
                           </div>
                         )}
+                        <ProductRelatedSuggestions
+                          shopId={shopId || user?.uid || ''}
+                          productId={item.productId}
+                          catalog={searchableStaffItems}
+                          onSelectProduct={(id) => setExpandedStockId(id)}
+                        />
                       </div>
                     }
                   />
@@ -1513,44 +1520,75 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
                   {filteredCatalog.map((item) => {
                     const breakdown = formatStockBreakdown(item.currentStock, item);
                     const units = getAllowedSaleUnits(item);
+                    const isStockExpanded = expandedStockId === item.productId;
                     return (
-                      <tr key={item.productId} className="hover:bg-[var(--cm-bg-hover)]">
-                        <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">
-                          {item.name}
-                          {item.bottleSize && (
-                            <span className="ml-1.5 text-[11px] font-mono-num text-[var(--cm-text-muted)]">
-                              ({item.bottleSize})
+                      <Fragment key={item.productId}>
+                        <tr className="hover:bg-[var(--cm-bg-hover)]">
+                          <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedStockId((cur) =>
+                                  cur === item.productId ? null : item.productId
+                                )
+                              }
+                              aria-expanded={isStockExpanded}
+                              className="inline-flex items-center gap-1.5 text-left hover:text-[var(--cm-accent-text)] cursor-pointer"
+                            >
+                              {isStockExpanded ? (
+                                <ChevronDown className="w-3.5 h-3.5 text-[var(--cm-accent-text)] shrink-0" />
+                              ) : (
+                                <ChevronRight className="w-3.5 h-3.5 text-[var(--cm-text-muted)] shrink-0" />
+                              )}
+                              <span>{item.name}</span>
+                              {item.bottleSize && (
+                                <span className="text-[11px] font-mono-num text-[var(--cm-text-muted)]">
+                                  ({item.bottleSize})
+                                </span>
+                              )}
+                            </button>
+                          </td>
+                          <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">
+                            {item.categoryName} {item.brandName ? `· ${item.brandName}` : ''}
+                          </td>
+                          <td className="py-2 px-3 text-xs text-[var(--cm-info)]">
+                            {item.storageLocation || '—'}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono-num text-xs text-[var(--cm-text-primary)]">
+                            {units.map((u) => (
+                              <div key={u.unitName} className="whitespace-nowrap">
+                                <span className="text-[var(--cm-text-muted)]">{u.unitName}:</span>{' '}
+                                <span className="font-semibold">{formatPKR(u.salePrice)}</span>
+                              </div>
+                            ))}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)] whitespace-nowrap">
+                            <div>{breakdown.totalLabel}</div>
+                            {breakdown.packageBreakdownText && (
+                              <div className="text-[11px] text-[var(--cm-accent-text)]">
+                                ({breakdown.packageBreakdownText})
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-xs font-semibold">
+                            <span className={item.currentStock > 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
+                              {item.currentStock > 0 ? 'In Stock' : 'Out of Stock'}
                             </span>
-                          )}
-                        </td>
-                        <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">
-                          {item.categoryName} {item.brandName ? `· ${item.brandName}` : ''}
-                        </td>
-                        <td className="py-2 px-3 text-xs text-[var(--cm-info)]">
-                          {item.storageLocation || '—'}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono-num text-xs text-[var(--cm-text-primary)]">
-                          {units.map((u) => (
-                            <div key={u.unitName} className="whitespace-nowrap">
-                              <span className="text-[var(--cm-text-muted)]">{u.unitName}:</span>{' '}
-                              <span className="font-semibold">{formatPKR(u.salePrice)}</span>
-                            </div>
-                          ))}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)] whitespace-nowrap">
-                          <div>{breakdown.totalLabel}</div>
-                          {breakdown.packageBreakdownText && (
-                            <div className="text-[11px] text-[var(--cm-accent-text)]">
-                              ({breakdown.packageBreakdownText})
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-2 px-3 text-xs font-semibold">
-                          <span className={item.currentStock > 0 ? 'text-[var(--cm-success)]' : 'text-[var(--cm-danger)]'}>
-                            {item.currentStock > 0 ? 'In Stock' : 'Out of Stock'}
-                          </span>
-                        </td>
-                      </tr>
+                          </td>
+                        </tr>
+                        {isStockExpanded && (
+                          <tr className="bg-[var(--cm-bg-subtle)]">
+                            <td colSpan={6} className="px-4 py-3 text-xs">
+                              <ProductRelatedSuggestions
+                                shopId={shopId || user?.uid || ''}
+                                productId={item.productId}
+                                catalog={searchableStaffItems}
+                                onSelectProduct={(id) => setExpandedStockId(id)}
+                              />
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
                     );
                   })}
                 </tbody>

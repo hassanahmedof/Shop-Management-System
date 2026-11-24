@@ -13,12 +13,14 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
 import { CompactExpandableRow } from '../components/CompactSection';
+import { ProductRelatedSuggestions } from '../components/ProductRelatedSuggestions';
 import { SearchableSelect, type SearchableSelectOption } from '../components/SearchableSelect';
 import { useAuth } from '../contexts/AuthContext';
 import { useShopData } from '../contexts/ShopDataContext';
 import { useToast } from '../contexts/ToastContext';
+import { mapProductsToSearchable } from '../services/productSearchService';
 import { computeTopActivityValues } from '../services/recordSearchService';
 import {
   createBrand,
@@ -232,6 +234,11 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
   const [filterOrigin, setFilterOrigin] = useState<'' | 'local' | 'imported'>('');
   const [showMobileFilters, setShowMobileFilters] = useState(false);
   const [expandedProductId, setExpandedProductId] = useState<string | null>(null);
+
+  const searchableCatalog = useMemo(
+    () => mapProductsToSearchable(products, { categories, productTemplates }),
+    [products, categories, productTemplates]
+  );
 
   const categoryOptions = useMemo<SearchableSelectOption[]>(
     () =>
@@ -1337,6 +1344,13 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
                           </div>
                         )}
 
+                        <ProductRelatedSuggestions
+                          shopId={activeShopId}
+                          productId={p.id}
+                          catalog={searchableCatalog}
+                          onSelectProduct={(id) => setExpandedProductId(id)}
+                        />
+
                         <div className="flex items-center justify-end gap-2 pt-1">
                           <button
                             type="button"
@@ -1392,121 +1406,188 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
                       : st.isLowStock
                         ? 'text-[var(--cm-warning)] font-semibold'
                         : 'text-[var(--cm-text-primary)]';
+                    const isRowExpanded = expandedProductId === p.id;
 
                     return (
-                      <tr key={p.id} className="hover:bg-[var(--cm-bg-hover)]">
-                        <td className="py-2 px-3">
-                          <div className="font-medium text-[var(--cm-text-primary)]">{p.name}</div>
-                          {(p.bottleSize || p.storageLocation || p.originType || p.isReturnable) && (
-                            <div className="flex flex-wrap items-center gap-1 mt-0.5 text-[10px]">
-                              {p.bottleSize && (
-                                <span className="px-1.5 py-0.2 rounded bg-[var(--cm-info-soft)] text-[var(--cm-info)] font-mono-num">
-                                  {p.bottleSize}
-                                </span>
+                      <Fragment key={p.id}>
+                        <tr className="hover:bg-[var(--cm-bg-hover)]">
+                          <td className="py-2 px-3">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedProductId((cur) => (cur === p.id ? null : p.id))
+                              }
+                              aria-expanded={isRowExpanded}
+                              className="inline-flex items-center gap-1.5 font-medium text-[var(--cm-text-primary)] hover:text-[var(--cm-accent-text)] text-left cursor-pointer"
+                            >
+                              {isRowExpanded ? (
+                                <ChevronDown className="w-3.5 h-3.5 text-[var(--cm-accent-text)] shrink-0" />
+                              ) : (
+                                <ChevronRight className="w-3.5 h-3.5 text-[var(--cm-text-muted)] shrink-0" />
                               )}
-                              {p.originType && (
-                                <span className="px-1.5 py-0.2 rounded bg-[var(--cm-bg-subtle)] text-[var(--cm-text-secondary)] capitalize">
-                                  {p.originType}
-                                </span>
-                              )}
-                              {p.storageLocation && (
-                                <span className="text-[var(--cm-text-muted)]">{p.storageLocation}</span>
-                              )}
-                              {p.isReturnable && (
-                                <span className="px-1.5 py-0.2 rounded bg-[var(--cm-warning-soft)] text-[var(--cm-warning)] font-mono-num">
-                                  Empties: {formatNumber(p.emptyContainersOnHand || 0)}
-                                </span>
-                              )}
+                              <span>{p.name}</span>
+                            </button>
+                            {(p.bottleSize || p.storageLocation || p.originType || p.isReturnable) && (
+                              <div className="flex flex-wrap items-center gap-1 mt-0.5 pl-5 text-[10px]">
+                                {p.bottleSize && (
+                                  <span className="px-1.5 py-0.2 rounded bg-[var(--cm-info-soft)] text-[var(--cm-info)] font-mono-num">
+                                    {p.bottleSize}
+                                  </span>
+                                )}
+                                {p.originType && (
+                                  <span className="px-1.5 py-0.2 rounded bg-[var(--cm-bg-subtle)] text-[var(--cm-text-secondary)] capitalize">
+                                    {p.originType}
+                                  </span>
+                                )}
+                                {p.storageLocation && (
+                                  <span className="text-[var(--cm-text-muted)]">{p.storageLocation}</span>
+                                )}
+                                {p.isReturnable && (
+                                  <span className="px-1.5 py-0.2 rounded bg-[var(--cm-warning-soft)] text-[var(--cm-warning)] font-mono-num">
+                                    Empties: {formatNumber(p.emptyContainersOnHand || 0)}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-xs text-[var(--cm-text-muted)]">
+                            <div>{p.categoryName} · {p.brandName}</div>
+                            <div className="text-[11px]">{p.supplierName || '—'}</div>
+                          </td>
+                          <td className="py-2 px-3 text-xs">
+                            <div className="font-medium text-[var(--cm-text-secondary)]">
+                              Smallest Unit: {bd.baseUnit}
                             </div>
-                          )}
-                        </td>
-                        <td className="py-2 px-3 text-xs text-[var(--cm-text-muted)]">
-                          <div>{p.categoryName} · {p.brandName}</div>
-                          <div className="text-[11px]">{p.supplierName || '—'}</div>
-                        </td>
-                        <td className="py-2 px-3 text-xs">
-                          <div className="font-medium text-[var(--cm-text-secondary)]">
-                            Smallest Unit: {bd.baseUnit}
-                          </div>
-                          {Array.isArray(p.packagingUnits) && p.packagingUnits.length > 0 && (
-                            <div className="text-[11px] text-[var(--cm-text-muted)] space-y-0.5">
-                              {p.packagingUnits.slice(0, 2).map((pkg) => {
-                                const hasParentChain =
-                                  pkg.containsQty &&
-                                  pkg.parentUnitName &&
-                                  pkg.parentUnitName.toLowerCase() !== bd.baseUnit.toLowerCase();
-                                return (
-                                  <div key={pkg.unitName} className="font-mono-num">
-                                    {hasParentChain
-                                      ? `1 ${pkg.unitName} = ${formatNumber(pkg.containsQty!)} ${pluralizeUnit(pkg.parentUnitName!, pkg.containsQty!)} (${formatNumber(pkg.conversionQty)})`
-                                      : `1 ${pkg.unitName} = ${formatNumber(pkg.conversionQty)} ${pluralizeUnit(bd.baseUnit, pkg.conversionQty)}`}{' '}
-                                    · {formatPKR(pkg.salePrice)}
+                            {Array.isArray(p.packagingUnits) && p.packagingUnits.length > 0 && (
+                              <div className="text-[11px] text-[var(--cm-text-muted)] space-y-0.5">
+                                {p.packagingUnits.slice(0, 2).map((pkg) => {
+                                  const hasParentChain =
+                                    pkg.containsQty &&
+                                    pkg.parentUnitName &&
+                                    pkg.parentUnitName.toLowerCase() !== bd.baseUnit.toLowerCase();
+                                  return (
+                                    <div key={pkg.unitName} className="font-mono-num">
+                                      {hasParentChain
+                                        ? `1 ${pkg.unitName} = ${formatNumber(pkg.containsQty!)} ${pluralizeUnit(pkg.parentUnitName!, pkg.containsQty!)} (${formatNumber(pkg.conversionQty)})`
+                                        : `1 ${pkg.unitName} = ${formatNumber(pkg.conversionQty)} ${pluralizeUnit(bd.baseUnit, pkg.conversionQty)}`}{' '}
+                                      · {formatPKR(pkg.salePrice)}
+                                    </div>
+                                  );
+                                })}
+                                {p.packagingUnits.length > 2 && (
+                                  <div className="text-[10px] text-[var(--cm-accent-text)]">
+                                    +{p.packagingUnits.length - 2} more levels
                                   </div>
-                                );
-                              })}
-                              {p.packagingUnits.length > 2 && (
-                                <div className="text-[10px] text-[var(--cm-accent-text)]">
-                                  +{p.packagingUnits.length - 2} more levels
+                                )}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)] whitespace-nowrap">
+                            {formatPKR(p.purchasePrice)}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-text-primary)] whitespace-nowrap">
+                            {formatPKR(p.salePrice)}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-success)]">
+                            {p.profitMarginPct}%
+                          </td>
+                          <td className={`py-2 px-3 text-right font-mono-num whitespace-nowrap ${stockClass}`}>
+                            <div>{bd.totalLabel}</div>
+                            {bd.packageBreakdownText && (
+                              <div className="text-[11px] font-normal text-[var(--cm-text-muted)]">
+                                ({bd.packageBreakdownText})
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 font-mono-num text-xs">
+                            {p.expiryDate ? (
+                              <span
+                                className={
+                                  st.isExpired
+                                    ? 'text-[var(--cm-danger)] font-semibold'
+                                    : st.isNearingExpiry
+                                      ? 'text-[var(--cm-warning)] font-semibold'
+                                      : 'text-[var(--cm-text-secondary)]'
+                                }
+                              >
+                                {formatDateDDMMYYYY(p.expiryDate)}
+                              </span>
+                            ) : (
+                              <span className="text-[var(--cm-text-muted)]">—</span>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-right whitespace-nowrap">
+                            <div className="inline-flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => openEditModal(p)}
+                                className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-accent-text)] rounded cursor-pointer"
+                                title="Edit product"
+                              >
+                                <Edit3 className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => activeShopId && void deleteProduct(activeShopId, p)}
+                                className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] rounded cursor-pointer"
+                                title="Delete product"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                        {isRowExpanded && (
+                          <tr className="bg-[var(--cm-bg-subtle)]">
+                            <td colSpan={9} className="px-4 py-3 space-y-2 text-xs">
+                              <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[var(--cm-text-secondary)]">
+                                <span>
+                                  <span className="text-[var(--cm-text-muted)]">Supplier:</span>{' '}
+                                  <span className="text-[var(--cm-text-primary)]">{p.supplierName || '—'}</span>
+                                </span>
+                                {p.storageLocation && (
+                                  <span>
+                                    <span className="text-[var(--cm-text-muted)]">Location:</span>{' '}
+                                    <span className="text-[var(--cm-text-primary)]">{p.storageLocation}</span>
+                                  </span>
+                                )}
+                                {p.isReturnable && (
+                                  <span>
+                                    <span className="text-[var(--cm-text-muted)]">Empty Empties:</span>{' '}
+                                    <span className="font-mono-num text-[var(--cm-text-primary)]">
+                                      {formatNumber(p.emptyContainersOnHand || 0)} {p.returnableUnitName || 'Crate'}
+                                    </span>
+                                  </span>
+                                )}
+                                <span>
+                                  <span className="text-[var(--cm-text-muted)]">Wholesale:</span>{' '}
+                                  <span className="font-mono-num text-[var(--cm-text-primary)]">
+                                    {formatPKR(p.wholesalePrice || 0)}/{bd.baseUnit}
+                                  </span>
+                                </span>
+                              </div>
+                              {Array.isArray(p.packagingUnits) && p.packagingUnits.length > 0 && (
+                                <div className="flex flex-wrap gap-1.5">
+                                  {p.packagingUnits.map((pkg) => (
+                                    <span
+                                      key={pkg.unitName}
+                                      className="px-2 py-0.5 rounded cm-surface border border-[var(--cm-border)] text-[11px] font-mono-num text-[var(--cm-text-secondary)]"
+                                    >
+                                      {pkg.unitName} ({formatNumber(pkg.conversionQty)} {pluralizeUnit(bd.baseUnit, pkg.conversionQty)}) · Buy {formatPKR(pkg.purchasePrice)} · Sell {formatPKR(pkg.salePrice)}
+                                    </span>
+                                  ))}
                                 </div>
                               )}
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)] whitespace-nowrap">
-                          {formatPKR(p.purchasePrice)}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-text-primary)] whitespace-nowrap">
-                          {formatPKR(p.salePrice)}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-success)]">
-                          {p.profitMarginPct}%
-                        </td>
-                        <td className={`py-2 px-3 text-right font-mono-num whitespace-nowrap ${stockClass}`}>
-                          <div>{bd.totalLabel}</div>
-                          {bd.packageBreakdownText && (
-                            <div className="text-[11px] font-normal text-[var(--cm-text-muted)]">
-                              ({bd.packageBreakdownText})
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-2 px-3 font-mono-num text-xs">
-                          {p.expiryDate ? (
-                            <span
-                              className={
-                                st.isExpired
-                                  ? 'text-[var(--cm-danger)] font-semibold'
-                                  : st.isNearingExpiry
-                                    ? 'text-[var(--cm-warning)] font-semibold'
-                                    : 'text-[var(--cm-text-secondary)]'
-                              }
-                            >
-                              {formatDateDDMMYYYY(p.expiryDate)}
-                            </span>
-                          ) : (
-                            <span className="text-[var(--cm-text-muted)]">—</span>
-                          )}
-                        </td>
-                        <td className="py-2 px-3 text-right whitespace-nowrap">
-                          <div className="inline-flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => openEditModal(p)}
-                              className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-accent-text)] rounded cursor-pointer"
-                              title="Edit product"
-                            >
-                              <Edit3 className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => activeShopId && void deleteProduct(activeShopId, p)}
-                              className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] rounded cursor-pointer"
-                              title="Delete product"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
+                              <ProductRelatedSuggestions
+                                shopId={activeShopId}
+                                productId={p.id}
+                                catalog={searchableCatalog}
+                                onSelectProduct={(id) => setExpandedProductId(id)}
+                              />
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
                     );
                   })}
                 </tbody>

@@ -767,8 +767,8 @@ export function PurchasesPage() {
                   const allowFractional = isFractionalUnit(displayUnit);
 
                   return (
-                    <div key={row.key} className="group last:rounded-b-[11px]">
-                      <div className="flex items-center gap-2 px-3 py-2 min-h-[48px] hover:bg-[var(--cm-bg-hover)]">
+                    <div key={row.key} className="group last:rounded-b-[11px] touch-pan-y">
+                      <div className="flex items-center gap-2 px-3 py-2 min-h-[48px] hover:bg-[var(--cm-bg-hover)] touch-pan-y">
                         <button
                           type="button"
                           onClick={() =>
@@ -816,7 +816,7 @@ export function PurchasesPage() {
                       </div>
 
                       {isExpanded && (
-                        <div className="px-3 py-2.5 cm-subtle border-t border-[var(--cm-border)] group-last:rounded-b-[11px] grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+                        <div className="px-3 py-2.5 cm-subtle border-t border-[var(--cm-border)] group-last:rounded-b-[11px] grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end touch-pan-y">
                           <div className="sm:col-span-4">
                             <label className="block text-[11px] font-medium text-[var(--cm-text-secondary)] mb-1">
                               Product

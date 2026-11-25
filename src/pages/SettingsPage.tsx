@@ -336,13 +336,20 @@ export function SettingsPage() {
     }
   };
 
-  const handleExportAllTabsWorkbook = () => {
+  const handleExportAllTabsWorkbook = async () => {
     if (!sheetsSync) return;
-    const { filename, totalRows, tabCount } = sheetsSync.exportWorkbook();
-    setSheetsActionFeedback({
-      tone: 'success',
-      message: `Exported ${totalRows} business record rows across ${tabCount} worksheets to ${filename}.`,
-    });
+    try {
+      const { filename, totalRows, tabCount } = await sheetsSync.exportWorkbook();
+      setSheetsActionFeedback({
+        tone: 'success',
+        message: `Exported ${totalRows} business record rows across ${tabCount} worksheets to ${filename}.`,
+      });
+    } catch (err) {
+      setSheetsActionFeedback({
+        tone: 'error',
+        message: err instanceof Error ? err.message : 'Unable to export Excel workbook.',
+      });
+    }
   };
 
   const handleCopyServiceEmail = async () => {
@@ -1656,8 +1663,28 @@ export function SettingsPage() {
                     type="button"
                     onClick={async () => {
                       if (!activeShopId) return;
-                      await deleteSupplier(activeShopId, s.id);
-                      showToast({ title: 'Supplier Deleted', message: `"${s.name}" removed.`, tone: 'info', durationMs: 3000 });
+                      const hasLinkedRecords =
+                        products.some((p) => p.supplierId === s.id) ||
+                        purchases.some((p) => p.supplierId === s.id);
+                      try {
+                        await deleteSupplier(activeShopId, s.id, { hasLinkedRecords });
+                        showToast({
+                          title: 'Supplier Deleted',
+                          message: `"${s.name}" removed.`,
+                          tone: 'info',
+                          durationMs: 3000,
+                        });
+                      } catch (err) {
+                        showToast({
+                          title: 'Cannot Delete Supplier',
+                          message:
+                            err instanceof Error
+                              ? err.message
+                              : 'Supplier has existing records or balance.',
+                          tone: 'warning',
+                          durationMs: 5000,
+                        });
+                      }
                     }}
                     className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] cursor-pointer shrink-0"
                   >

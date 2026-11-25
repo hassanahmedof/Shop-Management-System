@@ -12,8 +12,12 @@ import {
 
 const DEFAULT_CACHE_DIR = path.resolve(process.cwd(), '.caremart-cache');
 
+const MAX_FEEDBACK_EVENT_IDS = 2000;
+
 interface ServerFeedbackRuntimeState {
   snapshot: UpsellFeedbackSnapshot;
+  processedEventIds: string[];
+  processedEventSet: Set<string>;
   recovered: boolean;
 }
 
@@ -72,12 +76,17 @@ function isValidCountersMap(obj: unknown): obj is Record<string, UpsellFeedbackC
   return true;
 }
 
+interface ParsedFeedbackDiskState {
+  snapshot: UpsellFeedbackSnapshot;
+  processedEventIds: string[];
+}
+
 function validateFeedbackSnapshot(
   raw: unknown,
   expectedShopId: string
-): UpsellFeedbackSnapshot | null {
+): ParsedFeedbackDiskState | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const cand = raw as Partial<UpsellFeedbackSnapshot>;
+  const cand = raw as Partial<UpsellFeedbackSnapshot> & { processedEventIds?: unknown };
   if (cand.version !== UPSELL_FEEDBACK_VERSION) return null;
   if (cand.shopId !== expectedShopId) return null;
   if (typeof cand.revision !== 'number' || !Number.isFinite(cand.revision) || cand.revision < 0) {
@@ -86,30 +95,43 @@ function validateFeedbackSnapshot(
   if (!isValidCountersMap(cand.productStats)) return null;
   if (!isValidCountersMap(cand.categoryPairStats)) return null;
 
+  const processedEventIds = Array.isArray(cand.processedEventIds)
+    ? cand.processedEventIds
+        .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+        .slice(-MAX_FEEDBACK_EVENT_IDS)
+    : [];
+
   return {
-    version: UPSELL_FEEDBACK_VERSION,
-    shopId: expectedShopId,
-    revision: Math.floor(cand.revision),
-    productStats: Object.fromEntries(
-      Object.entries(cand.productStats).map(([k, v]) => [k, { ...v }])
-    ),
-    categoryPairStats: Object.fromEntries(
-      Object.entries(cand.categoryPairStats).map(([k, v]) => [k, { ...v }])
-    ),
-    updatedAt: Number(cand.updatedAt) || Date.now(),
+    snapshot: {
+      version: UPSELL_FEEDBACK_VERSION,
+      shopId: expectedShopId,
+      revision: Math.floor(cand.revision),
+      productStats: Object.fromEntries(
+        Object.entries(cand.productStats).map(([k, v]) => [k, { ...v }])
+      ),
+      categoryPairStats: Object.fromEntries(
+        Object.entries(cand.categoryPairStats).map(([k, v]) => [k, { ...v }])
+      ),
+      updatedAt: Number(cand.updatedAt) || Date.now(),
+    },
+    processedEventIds,
   };
 }
 
 function writeFeedbackAtomic(
   shopId: string,
-  snapshot: UpsellFeedbackSnapshot,
+  state: Pick<ServerFeedbackRuntimeState, 'snapshot' | 'processedEventIds'>,
   cacheDir = DEFAULT_CACHE_DIR
 ): void {
   try {
     fs.mkdirSync(cacheDir, { recursive: true });
     const targetPath = getFeedbackFilePath(shopId, cacheDir);
     const tmpPath = `${targetPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(snapshot), 'utf8');
+    const payload = {
+      ...state.snapshot,
+      processedEventIds: state.processedEventIds.slice(-MAX_FEEDBACK_EVENT_IDS),
+    };
+    fs.writeFileSync(tmpPath, JSON.stringify(payload), 'utf8');
     fs.renameSync(tmpPath, targetPath);
   } catch {
     // Feedback persistence must never disrupt POS routes
@@ -124,29 +146,34 @@ function loadOrCreateState(
   const existing = feedbackMemoryCaches.get(memKey);
   if (existing) return existing;
 
-  let snapshot: UpsellFeedbackSnapshot | null = null;
+  let parsed: ParsedFeedbackDiskState | null = null;
   let recovered = false;
   const targetPath = getFeedbackFilePath(shopId, cacheDir);
 
   try {
     if (fs.existsSync(targetPath)) {
       const raw = fs.readFileSync(targetPath, 'utf8');
-      snapshot = validateFeedbackSnapshot(JSON.parse(raw), shopId);
-      if (!snapshot) recovered = true;
+      parsed = validateFeedbackSnapshot(JSON.parse(raw), shopId);
+      if (!parsed) recovered = true;
     }
   } catch {
     recovered = true;
-    snapshot = null;
+    parsed = null;
   }
 
-  if (!snapshot) {
-    snapshot = createEmptySnapshot(shopId);
-    if (recovered) {
-      writeFeedbackAtomic(shopId, snapshot, cacheDir);
-    }
+  const snapshot = parsed ? parsed.snapshot : createEmptySnapshot(shopId);
+  const processedEventIds = parsed ? parsed.processedEventIds : [];
+  const state: ServerFeedbackRuntimeState = {
+    snapshot,
+    processedEventIds,
+    processedEventSet: new Set(processedEventIds),
+    recovered,
+  };
+
+  if (recovered) {
+    writeFeedbackAtomic(shopId, state, cacheDir);
   }
 
-  const state: ServerFeedbackRuntimeState = { snapshot, recovered };
   feedbackMemoryCaches.set(memKey, state);
   return state;
 }
@@ -186,15 +213,21 @@ export function getServerFeedbackSnapshot(
   return { snapshot: state.snapshot, recovered: state.recovered };
 }
 
-export function recordServerFeedbackEvent(
+export function recordServerFeedbackEventWithStatus(
   shopId: string,
   event: UpsellFeedbackEventInput,
   cacheDir = DEFAULT_CACHE_DIR
-): UpsellFeedbackSnapshot {
+): { snapshot: UpsellFeedbackSnapshot; duplicate: boolean } {
   const state = loadOrCreateState(shopId, cacheDir);
   const now = Date.now();
   const productId = (event.productId || '').trim().slice(0, 128);
-  if (!productId) return state.snapshot;
+  if (!productId) return { snapshot: state.snapshot, duplicate: false };
+
+  const eventId =
+    typeof event.eventId === 'string' ? event.eventId.trim().slice(0, 128) : '';
+  if (eventId && state.processedEventSet.has(eventId)) {
+    return { snapshot: state.snapshot, duplicate: true };
+  }
 
   if (!state.snapshot.productStats[productId]) {
     state.snapshot.productStats[productId] = createEmptyCounters(now);
@@ -216,10 +249,32 @@ export function recordServerFeedbackEvent(
     pruneCountersMap(state.snapshot.categoryPairStats, MAX_FEEDBACK_PAIR_KEYS);
   }
 
+  if (eventId) {
+    state.processedEventIds.push(eventId);
+    state.processedEventSet.add(eventId);
+    if (state.processedEventIds.length > MAX_FEEDBACK_EVENT_IDS) {
+      const overflow = state.processedEventIds.splice(
+        0,
+        state.processedEventIds.length - MAX_FEEDBACK_EVENT_IDS
+      );
+      for (const oldId of overflow) {
+        state.processedEventSet.delete(oldId);
+      }
+    }
+  }
+
   state.snapshot.revision += 1;
   state.snapshot.updatedAt = now;
-  writeFeedbackAtomic(shopId, state.snapshot, cacheDir);
-  return state.snapshot;
+  writeFeedbackAtomic(shopId, state, cacheDir);
+  return { snapshot: state.snapshot, duplicate: false };
+}
+
+export function recordServerFeedbackEvent(
+  shopId: string,
+  event: UpsellFeedbackEventInput,
+  cacheDir = DEFAULT_CACHE_DIR
+): UpsellFeedbackSnapshot {
+  return recordServerFeedbackEventWithStatus(shopId, event, cacheDir).snapshot;
 }
 
 export function resetServerFeedbackStore(

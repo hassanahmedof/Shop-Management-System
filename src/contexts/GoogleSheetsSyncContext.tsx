@@ -63,63 +63,103 @@ interface ModuleSignatures {
   staffMembers: string;
 }
 
-function computeSignatures(data: ShopSnapshotData): ModuleSignatures {
+function computeSignaturesIncremental(
+  data: ShopSnapshotData,
+  prevData: ShopSnapshotData | null,
+  prevSigs: ModuleSignatures | null
+): ModuleSignatures {
   return {
-    products: data.products
-      .map(
-        (p) =>
-          `${p.id}:${p.name}:${p.currentStock}:${p.purchasePrice}:${p.salePrice}:${p.wholesalePrice}:${p.isActive}:${tsKey(p.updatedAt)}`
-      )
-      .join('|'),
-    sales: data.sales
-      .map(
-        (s) =>
-          `${s.id}:${s.saleDate}:${s.totalAmount}:${s.paymentMethod}:${s.status}:${s.customerWhatsapp || ''}:${s.notes}:${tsKey(s.updatedAt)}`
-      )
-      .join('|'),
-    saleItems: data.saleItems
-      .map(
-        (i) =>
-          `${i.id}:${i.saleId}:${i.quantity}:${i.lineTotal}:${i.purchasePriceAtSale}:${i.status}:${tsKey(i.updatedAt)}`
-      )
-      .join('|'),
-    purchases: data.purchases
-      .map(
-        (p) =>
-          `${p.id}:${p.purchaseDate}:${p.totalAmount}:${p.amountPaid}:${p.balanceDue}:${p.status}:${tsKey(p.updatedAt)}`
-      )
-      .join('|'),
-    purchaseItems: data.purchaseItems
-      .map(
-        (i) =>
-          `${i.id}:${i.purchaseId}:${i.quantity}:${i.lineTotal}:${i.status}:${tsKey(i.updatedAt)}`
-      )
-      .join('|'),
-    expenses: data.expenses
-      .map(
-        (e) =>
-          `${e.id}:${e.title}:${e.amount}:${e.expenseDate}:${e.categoryName}:${e.paymentMethod}:${tsKey(e.updatedAt)}`
-      )
-      .join('|'),
-    stockMovements: data.stockMovements
-      .map((m) => `${m.id}:${m.productId}:${m.quantityChange}:${m.newStock}`)
-      .join('|'),
-    stockAdjustments: data.stockAdjustments
-      .map((a) => `${a.id}:${a.productId}:${a.adjustmentType}:${a.quantity}`)
-      .join('|'),
-    suppliers: data.suppliers
-      .map(
-        (s) =>
-          `${s.id}:${s.name}:${s.phone}:${s.totalPurchased}:${s.totalPaid}:${s.outstandingBalance}:${tsKey(s.updatedAt)}`
-      )
-      .join('|'),
-    categoriesBrands: [
-      ...data.categories.map((c) => `c:${c.id}:${c.name}:${tsKey(c.updatedAt)}`),
-      ...data.brands.map((b) => `b:${b.id}:${b.name}:${tsKey(b.updatedAt)}`),
-    ].join('|'),
-    staffMembers: data.staffMembers
-      .map((st) => `${st.id}:${st.name}:${st.isActive}:${tsKey(st.updatedAt)}`)
-      .join('|'),
+    products:
+      prevData && prevSigs && prevData.products === data.products
+        ? prevSigs.products
+        : data.products
+            .map(
+              (p) =>
+                `${p.id}:${p.name}:${p.currentStock}:${p.purchasePrice}:${p.salePrice}:${p.wholesalePrice}:${p.isActive}:${tsKey(p.updatedAt)}`
+            )
+            .join('|'),
+    sales:
+      prevData && prevSigs && prevData.sales === data.sales
+        ? prevSigs.sales
+        : data.sales
+            .map(
+              (s) =>
+                `${s.id}:${s.saleDate}:${s.totalAmount}:${s.paymentMethod}:${s.status}:${s.customerWhatsapp || ''}:${s.notes}:${tsKey(s.updatedAt)}`
+            )
+            .join('|'),
+    saleItems:
+      prevData && prevSigs && prevData.saleItems === data.saleItems
+        ? prevSigs.saleItems
+        : data.saleItems
+            .map(
+              (i) =>
+                `${i.id}:${i.saleId}:${i.quantity}:${i.lineTotal}:${i.purchasePriceAtSale}:${i.status}:${tsKey(i.updatedAt)}`
+            )
+            .join('|'),
+    purchases:
+      prevData && prevSigs && prevData.purchases === data.purchases
+        ? prevSigs.purchases
+        : data.purchases
+            .map(
+              (p) =>
+                `${p.id}:${p.purchaseDate}:${p.totalAmount}:${p.amountPaid}:${p.balanceDue}:${p.status}:${tsKey(p.updatedAt)}`
+            )
+            .join('|'),
+    purchaseItems:
+      prevData && prevSigs && prevData.purchaseItems === data.purchaseItems
+        ? prevSigs.purchaseItems
+        : data.purchaseItems
+            .map(
+              (i) =>
+                `${i.id}:${i.purchaseId}:${i.quantity}:${i.lineTotal}:${i.status}:${tsKey(i.updatedAt)}`
+            )
+            .join('|'),
+    expenses:
+      prevData && prevSigs && prevData.expenses === data.expenses
+        ? prevSigs.expenses
+        : data.expenses
+            .map(
+              (e) =>
+                `${e.id}:${e.title}:${e.amount}:${e.expenseDate}:${e.categoryName}:${e.paymentMethod}:${tsKey(e.updatedAt)}`
+            )
+            .join('|'),
+    stockMovements:
+      prevData && prevSigs && prevData.stockMovements === data.stockMovements
+        ? prevSigs.stockMovements
+        : data.stockMovements
+            .map((m) => `${m.id}:${m.productId}:${m.quantityChange}:${m.newStock}`)
+            .join('|'),
+    stockAdjustments:
+      prevData && prevSigs && prevData.stockAdjustments === data.stockAdjustments
+        ? prevSigs.stockAdjustments
+        : data.stockAdjustments
+            .map((a) => `${a.id}:${a.productId}:${a.adjustmentType}:${a.quantity}`)
+            .join('|'),
+    suppliers:
+      prevData && prevSigs && prevData.suppliers === data.suppliers
+        ? prevSigs.suppliers
+        : data.suppliers
+            .map(
+              (s) =>
+                `${s.id}:${s.name}:${s.phone}:${s.totalPurchased}:${s.totalPaid}:${s.outstandingBalance}:${tsKey(s.updatedAt)}`
+            )
+            .join('|'),
+    categoriesBrands:
+      prevData &&
+      prevSigs &&
+      prevData.categories === data.categories &&
+      prevData.brands === data.brands
+        ? prevSigs.categoriesBrands
+        : [
+            ...data.categories.map((c) => `c:${c.id}:${c.name}:${tsKey(c.updatedAt)}`),
+            ...data.brands.map((b) => `b:${b.id}:${b.name}:${tsKey(b.updatedAt)}`),
+          ].join('|'),
+    staffMembers:
+      prevData && prevSigs && prevData.staffMembers === data.staffMembers
+        ? prevSigs.staffMembers
+        : data.staffMembers
+            .map((st) => `${st.id}:${st.name}:${st.isActive}:${tsKey(st.updatedAt)}`)
+            .join('|'),
   };
 }
 
@@ -213,7 +253,7 @@ export interface GoogleSheetsSyncContextValue {
   setAutoSyncEnabled: (enabled: boolean) => Promise<void>;
   clearSyncError: () => void;
   markPolicyEnforcedEncountered: () => void;
-  exportWorkbook: () => { filename: string; totalRows: number; tabCount: number };
+  exportWorkbook: () => Promise<{ filename: string; totalRows: number; tabCount: number }>;
 }
 
 const GoogleSheetsSyncContext = createContext<GoogleSheetsSyncContextValue | null>(null);
@@ -305,6 +345,7 @@ export function GoogleSheetsSyncProvider({
   userRef.current = user;
 
   const prevSigRef = useRef<ModuleSignatures | null>(null);
+  const prevSigDataRef = useRef<ShopSnapshotData | null>(null);
   const dirtyTabsRef = useRef<Set<SheetTabName>>(new Set());
   const debounceTimerRef = useRef<number | null>(null);
   const retryTimerRef = useRef<number | null>(null);
@@ -1155,7 +1196,7 @@ export function GoogleSheetsSyncProvider({
     }
   }, [shopId, sessionRole]);
 
-  const exportWorkbook = useCallback(() => {
+  const exportWorkbook = useCallback(async () => {
     return exportAllTabsWorkbook(latestDataRef.current);
   }, []);
 
@@ -1253,7 +1294,13 @@ export function GoogleSheetsSyncProvider({
     }
 
     const detectTimer = window.setTimeout(() => {
-      const nextSigs = computeSignatures(latestDataRef.current);
+      const currentData = latestDataRef.current;
+      const nextSigs = computeSignaturesIncremental(
+        currentData,
+        prevSigDataRef.current,
+        prevSigRef.current
+      );
+      prevSigDataRef.current = currentData;
 
       if (!prevSigRef.current) {
         prevSigRef.current = nextSigs;

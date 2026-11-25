@@ -1,8 +1,9 @@
-import { createUserWithEmailAndPassword, signOut } from 'firebase/auth';
+import { createUserWithEmailAndPassword, deleteUser, signOut, type User } from 'firebase/auth';
 import {
   collection,
   doc,
   getDoc,
+  runTransaction,
   serverTimestamp,
   writeBatch,
 } from 'firebase/firestore';
@@ -157,75 +158,100 @@ export async function createAdminMember(
 
   const syntheticEmail = buildAdminSyntheticEmail(usernameLower, 1, shopCode);
   const provisionAuth = getStaffProvisionAuth();
-  let adminAuthUid = '';
+  let createdAuthUser: User | null = null;
 
   try {
     const cred = await createUserWithEmailAndPassword(provisionAuth, syntheticEmail, input.password);
-    adminAuthUid = cred.user.uid;
-    await signOut(provisionAuth);
+    createdAuthUser = cred.user;
   } catch (err) {
     throw mapProvisionAuthError(err);
   }
 
+  const adminAuthUid = createdAuthUser.uid;
   const adminRef = doc(collection(db, 'shops', shopId, 'adminMembers'));
 
   try {
-    const batch = writeBatch(db);
-    const record: Omit<AdminMember, 'id'> = {
-      ownerUid: shopId,
-      shopId,
-      shopCode,
-      name,
-      phone,
-      username,
-      usernameLower,
-      authUid: adminAuthUid,
-      loginVersion: 1,
-      role: 'admin',
-      isActive: true,
-    };
+    await runTransaction(db, async (tx) => {
+      const adminLookupRef = doc(db, 'adminLookup', lookupKey);
+      const adminUserLookupRef = doc(db, 'adminLookup', usernameLookupKey);
+      const staffLookupRef = doc(db, 'staffLookup', lookupKey);
+      const staffUserLookupRef = doc(db, 'staffLookup', usernameLookupKey);
 
-    batch.set(adminRef, {
-      ...record,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+      const [l1, l2, l3, l4] = await Promise.all([
+        tx.get(adminLookupRef),
+        tx.get(adminUserLookupRef),
+        tx.get(staffLookupRef),
+        tx.get(staffUserLookupRef),
+      ]);
+      if (l1.exists() || l2.exists() || l3.exists() || l4.exists()) {
+        throw new Error(`Username "${username}" is already registered. Choose a different username.`);
+      }
+
+      const record: Omit<AdminMember, 'id'> = {
+        ownerUid: shopId,
+        shopId,
+        shopCode,
+        name,
+        phone,
+        username,
+        usernameLower,
+        authUid: adminAuthUid,
+        loginVersion: 1,
+        role: 'admin',
+        isActive: true,
+      };
+
+      tx.set(adminRef, {
+        ...record,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      const lookupDocPayload = {
+        ownerUid: shopId,
+        shopId,
+        adminMemberId: adminRef.id,
+        loginVersion: 1,
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      tx.set(adminLookupRef, lookupDocPayload);
+      tx.set(adminUserLookupRef, lookupDocPayload);
+
+      tx.set(doc(db, 'adminAuthMap', adminAuthUid), {
+        ownerUid: shopId,
+        shopId,
+        adminMemberId: adminRef.id,
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(collection(db, 'shops', shopId, 'auditLogs')), {
+        ownerUid: shopId,
+        action: 'CREATE_ADMIN',
+        entityType: 'admin',
+        entityId: adminRef.id,
+        summary: clip(`Added shop admin "${name}" (@${username})`, 400),
+        createdAt: serverTimestamp(),
+      });
     });
 
-    const lookupDocPayload = {
-      ownerUid: shopId,
-      shopId,
-      adminMemberId: adminRef.id,
-      loginVersion: 1,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    };
-
-    batch.set(doc(db, 'adminLookup', lookupKey), lookupDocPayload);
-    batch.set(doc(db, 'adminLookup', usernameLookupKey), lookupDocPayload);
-
-    batch.set(doc(db, 'adminAuthMap', adminAuthUid), {
-      ownerUid: shopId,
-      shopId,
-      adminMemberId: adminRef.id,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-
-    batch.set(doc(collection(db, 'shops', shopId, 'auditLogs')), {
-      ownerUid: shopId,
-      action: 'CREATE_ADMIN',
-      entityType: 'admin',
-      entityId: adminRef.id,
-      summary: clip(`Added shop admin "${name}" (@${username})`, 400),
-      createdAt: serverTimestamp(),
-    });
-
-    await batch.commit();
     return adminRef.id;
   } catch (err) {
+    try {
+      await deleteUser(createdAuthUser);
+    } catch {
+      // Best-effort rollback of provisioned auth account on Firestore failure
+    }
+    if (err instanceof Error && err.message.includes('already registered')) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.CREATE, `shops/${shopId}/adminMembers/${adminRef.id}`);
+  } finally {
+    await signOut(provisionAuth).catch(() => {});
   }
 }
 

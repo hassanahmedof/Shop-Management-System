@@ -36,7 +36,7 @@ import {
   resolveCumulativeConversion,
   STANDARD_UNITS,
 } from '../utils/packaging';
-import { normalizeTemplateKey } from '../utils/productTemplates';
+import { normalizeTemplateKey } from '../utils/productTemplateHelpers';
 import { CompactSection } from './CompactSection';
 
 interface CatalogTemplateManagerSectionProps {

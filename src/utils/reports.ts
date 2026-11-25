@@ -1,6 +1,3 @@
-import jsPDF from 'jspdf';
-import autoTable from 'jspdf-autotable';
-import * as XLSX from 'xlsx';
 import type {
   AdminMember,
   Expense,
@@ -459,7 +456,11 @@ export function buildReportData(
   }
 }
 
-export function exportReportPDF(report: ReportTableData, shopName: string): void {
+export async function exportReportPDF(report: ReportTableData, shopName: string): Promise<void> {
+  const [{ default: jsPDF }, { default: autoTable }] = await Promise.all([
+    import('jspdf'),
+    import('jspdf-autotable'),
+  ]);
   const doc = new jsPDF({ orientation: report.columns.length > 7 ? 'landscape' : 'portrait' });
   doc.setFontSize(16);
   doc.text(shopName || 'CareMart Shop Manager', 14, 16);
@@ -495,7 +496,8 @@ export function exportReportPDF(report: ReportTableData, shopName: string): void
   doc.save(`${slug}_${getKarachiDateIso()}.pdf`);
 }
 
-export function exportReportExcel(report: ReportTableData, shopName: string): void {
+export async function exportReportExcel(report: ReportTableData, shopName: string): Promise<void> {
+  const XLSX = await import('xlsx');
   const headerRows: (string | number)[][] = [
     [shopName || 'CareMart Shop Manager'],
     [report.title],

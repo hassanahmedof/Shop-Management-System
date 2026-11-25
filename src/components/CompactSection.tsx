@@ -44,7 +44,7 @@ export function CompactSection({
   };
 
   return (
-    <section className={`cm-surface border rounded-2xl overflow-hidden ${className}`}>
+    <section className={`cm-surface border rounded-2xl overflow-x-clip ${className}`}>
       <div
         className={`px-3.5 py-2.5 sm:px-4 sm:py-3 flex flex-wrap items-center justify-between gap-2 ${
           isOpen ? 'border-b border-[var(--cm-border)]' : ''
@@ -127,12 +127,12 @@ export function CompactExpandableRow({
   rowToneClass = '',
 }: CompactExpandableRowProps) {
   return (
-    <div className={`${dimmed ? 'opacity-65' : ''} ${rowToneClass}`}>
+    <div className={`touch-pan-y ${dimmed ? 'opacity-65' : ''} ${rowToneClass}`}>
       <button
         type="button"
         onClick={onToggle}
         aria-expanded={isExpanded}
-        className="w-full px-3 py-2.5 min-h-[48px] flex items-center justify-between gap-2.5 text-left hover:bg-[var(--cm-bg-hover)] transition-colors cursor-pointer"
+        className="w-full px-3 py-2.5 min-h-[48px] flex items-center justify-between gap-2.5 text-left hover:bg-[var(--cm-bg-hover)] transition-colors cursor-pointer touch-pan-y"
       >
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="text-[var(--cm-text-muted)] shrink-0">
@@ -165,7 +165,7 @@ export function CompactExpandableRow({
       </button>
 
       {isExpanded && (
-        <div className="px-3.5 py-2.5 bg-[var(--cm-bg-subtle)] border-t border-[var(--cm-border)] space-y-2 text-xs">
+        <div className="px-3.5 py-2.5 bg-[var(--cm-bg-subtle)] border-t border-[var(--cm-border)] space-y-2 text-xs touch-pan-y overflow-x-clip">
           {expandedContent}
         </div>
       )}

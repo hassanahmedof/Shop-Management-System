@@ -9,11 +9,25 @@ import {
 } from '../../shared/upsellCacheSchema';
 
 const MIRROR_STORAGE_PREFIX = `cm_upsell_feedback_mirror_v${UPSELL_FEEDBACK_VERSION}_`;
+const PENDING_QUEUE_PREFIX = `cm_upsell_feedback_pending_v${UPSELL_FEEDBACK_VERSION}_`;
+const MAX_PENDING_EVENTS = 300;
+const BASE_RETRY_MS = 1500;
+const MAX_RETRY_MS = 60_000;
+
+export interface PendingFeedbackItem {
+  event: UpsellFeedbackEventInput & { eventId: string };
+  attempts: number;
+  nextAttemptAt: number;
+  queuedAt: number;
+}
 
 interface FeedbackRuntimeState {
   snapshot: UpsellFeedbackSnapshot;
+  pendingQueue: PendingFeedbackItem[];
   authoritativeLoaded: boolean;
   hydrationInFlight: Promise<void> | null;
+  flushInFlight: Promise<void> | null;
+  retryTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const runtimeFeedbackStates = new Map<string, FeedbackRuntimeState>();
@@ -39,8 +53,17 @@ function createEmptyCounters(now = Date.now()): UpsellFeedbackCounters {
   };
 }
 
+function generateFeedbackEventId(): string {
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `fb_${Date.now().toString(36)}_${rand}`;
+}
+
 function getMirrorKey(shopId: string): string {
   return `${MIRROR_STORAGE_PREFIX}${shopId}`;
+}
+
+function getPendingKey(shopId: string): string {
+  return `${PENDING_QUEUE_PREFIX}${shopId}`;
 }
 
 function isValidSnapshot(raw: unknown, shopId: string): raw is UpsellFeedbackSnapshot {
@@ -54,6 +77,21 @@ function isValidSnapshot(raw: unknown, shopId: string): raw is UpsellFeedbackSna
     typeof cand.categoryPairStats === 'object' &&
     cand.categoryPairStats !== null
   );
+}
+
+function cloneSnapshot(snap: UpsellFeedbackSnapshot): UpsellFeedbackSnapshot {
+  return {
+    version: snap.version,
+    shopId: snap.shopId,
+    revision: snap.revision,
+    updatedAt: snap.updatedAt,
+    productStats: Object.fromEntries(
+      Object.entries(snap.productStats).map(([k, v]) => [k, { ...v }])
+    ),
+    categoryPairStats: Object.fromEntries(
+      Object.entries(snap.categoryPairStats).map(([k, v]) => [k, { ...v }])
+    ),
+  };
 }
 
 function loadMirror(shopId: string): UpsellFeedbackSnapshot {
@@ -81,50 +119,91 @@ function saveMirror(shopId: string, snapshot: UpsellFeedbackSnapshot): void {
   }
 }
 
+function loadPendingQueue(shopId: string): PendingFeedbackItem[] {
+  try {
+    if (typeof localStorage === 'undefined') return [];
+    const raw = localStorage.getItem(getPendingKey(shopId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (item): item is PendingFeedbackItem =>
+          Boolean(
+            item &&
+              typeof item === 'object' &&
+              item.event &&
+              typeof item.event.productId === 'string' &&
+              typeof item.event.eventType === 'string' &&
+              typeof item.event.eventId === 'string'
+          )
+      )
+      .slice(-MAX_PENDING_EVENTS);
+  } catch {
+    return [];
+  }
+}
+
+function savePendingQueue(shopId: string, queue: PendingFeedbackItem[]): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    if (queue.length === 0) {
+      localStorage.removeItem(getPendingKey(shopId));
+      return;
+    }
+    localStorage.setItem(getPendingKey(shopId), JSON.stringify(queue.slice(-MAX_PENDING_EVENTS)));
+  } catch {
+    // Never disrupt POS flows
+  }
+}
+
 function getOrCreateState(shopId: string): FeedbackRuntimeState {
   let state = runtimeFeedbackStates.get(shopId);
   if (!state) {
     state = {
       snapshot: loadMirror(shopId),
+      pendingQueue: loadPendingQueue(shopId),
       authoritativeLoaded: false,
       hydrationInFlight: null,
+      flushInFlight: null,
+      retryTimer: null,
     };
     runtimeFeedbackStates.set(shopId, state);
   }
   return state;
 }
 
-function applyEventLocally(
-  state: FeedbackRuntimeState,
-  event: UpsellFeedbackEventInput
+function applyEventToSnapshot(
+  snapshot: UpsellFeedbackSnapshot,
+  event: UpsellFeedbackEventInput,
+  now = Date.now()
 ): void {
-  const now = Date.now();
   const productId = (event.productId || '').trim();
   if (!productId) return;
 
-  if (!state.snapshot.productStats[productId]) {
-    state.snapshot.productStats[productId] = createEmptyCounters(now);
+  if (!snapshot.productStats[productId]) {
+    snapshot.productStats[productId] = createEmptyCounters(now);
   }
-  const pStats = state.snapshot.productStats[productId];
+  const pStats = snapshot.productStats[productId];
   if (event.eventType === 'shown') pStats.shown += 1;
   else if (event.eventType === 'accepted') pStats.accepted += 1;
   else if (event.eventType === 'dismissed') pStats.dismissed += 1;
   else if (event.eventType === 'removed_after_add') pStats.removedAfterAdd += 1;
   pStats.lastUpdatedAt = now;
 
-  const pKeys = Object.keys(state.snapshot.productStats);
+  const pKeys = Object.keys(snapshot.productStats);
   if (pKeys.length > MAX_FEEDBACK_PRODUCTS) {
     const keep = new Set(
       pKeys
         .sort(
           (a, b) =>
-            (state.snapshot.productStats[b]?.lastUpdatedAt || 0) -
-            (state.snapshot.productStats[a]?.lastUpdatedAt || 0)
+            (snapshot.productStats[b]?.lastUpdatedAt || 0) -
+            (snapshot.productStats[a]?.lastUpdatedAt || 0)
         )
         .slice(0, MAX_FEEDBACK_PRODUCTS)
     );
     for (const k of pKeys) {
-      if (!keep.has(k)) delete state.snapshot.productStats[k];
+      if (!keep.has(k)) delete snapshot.productStats[k];
     }
   }
 
@@ -134,43 +213,195 @@ function applyEventLocally(
       const anchorCat = (rawAnchor || '').trim().toLowerCase();
       if (!anchorCat) continue;
       const pairKey = `${anchorCat}::${candCat}`;
-      if (!state.snapshot.categoryPairStats[pairKey]) {
-        state.snapshot.categoryPairStats[pairKey] = createEmptyCounters(now);
+      if (!snapshot.categoryPairStats[pairKey]) {
+        snapshot.categoryPairStats[pairKey] = createEmptyCounters(now);
       }
-      const cStats = state.snapshot.categoryPairStats[pairKey];
+      const cStats = snapshot.categoryPairStats[pairKey];
       if (event.eventType === 'shown') cStats.shown += 1;
       else if (event.eventType === 'accepted') cStats.accepted += 1;
       else if (event.eventType === 'dismissed') cStats.dismissed += 1;
       else if (event.eventType === 'removed_after_add') cStats.removedAfterAdd += 1;
       cStats.lastUpdatedAt = now;
     }
-    const cKeys = Object.keys(state.snapshot.categoryPairStats);
+    const cKeys = Object.keys(snapshot.categoryPairStats);
     if (cKeys.length > MAX_FEEDBACK_PAIR_KEYS) {
       const keep = new Set(
         cKeys
           .sort(
             (a, b) =>
-              (state.snapshot.categoryPairStats[b]?.lastUpdatedAt || 0) -
-              (state.snapshot.categoryPairStats[a]?.lastUpdatedAt || 0)
+              (snapshot.categoryPairStats[b]?.lastUpdatedAt || 0) -
+              (snapshot.categoryPairStats[a]?.lastUpdatedAt || 0)
           )
           .slice(0, MAX_FEEDBACK_PAIR_KEYS)
       );
       for (const k of cKeys) {
-        if (!keep.has(k)) delete state.snapshot.categoryPairStats[k];
+        if (!keep.has(k)) delete snapshot.categoryPairStats[k];
       }
     }
   }
 
-  state.snapshot.updatedAt = now;
+  snapshot.updatedAt = now;
+}
+
+function enqueuePendingFeedback(
+  shopId: string,
+  state: FeedbackRuntimeState,
+  event: UpsellFeedbackEventInput & { eventId: string },
+  now = Date.now()
+): void {
+  if (state.pendingQueue.some((item) => item.event.eventId === event.eventId)) {
+    return;
+  }
+  state.pendingQueue.push({
+    event,
+    attempts: 0,
+    nextAttemptAt: 0,
+    queuedAt: now,
+  });
+  if (state.pendingQueue.length > MAX_PENDING_EVENTS) {
+    state.pendingQueue.splice(0, state.pendingQueue.length - MAX_PENDING_EVENTS);
+  }
+  savePendingQueue(shopId, state.pendingQueue);
+}
+
+function schedulePendingFlush(params: {
+  shopId: string;
+  getIdToken?: () => Promise<string | null>;
+  fetchImpl: typeof fetch;
+  delayMs: number;
+}): void {
+  const { shopId, getIdToken, fetchImpl, delayMs } = params;
+  if (!getIdToken) return;
+  const state = getOrCreateState(shopId);
+  if (state.retryTimer || state.pendingQueue.length === 0) return;
+  state.retryTimer = setTimeout(() => {
+    state.retryTimer = null;
+    void flushPendingFeedbackEvents({ shopId, getIdToken, fetchImpl });
+  }, Math.max(50, delayMs));
+}
+
+export async function flushPendingFeedbackEvents(params: {
+  shopId: string;
+  getIdToken: () => Promise<string | null>;
+  fetchImpl?: typeof fetch;
+  ignoreBackoff?: boolean;
+}): Promise<{ flushedCount: number; remainingCount: number }> {
+  const { shopId, getIdToken, fetchImpl = fetch, ignoreBackoff = false } = params;
+  if (!shopId || !getIdToken) {
+    return { flushedCount: 0, remainingCount: 0 };
+  }
+
+  const state = getOrCreateState(shopId);
+  if (state.flushInFlight) {
+    await state.flushInFlight;
+    return { flushedCount: 0, remainingCount: state.pendingQueue.length };
+  }
+
+  if (state.pendingQueue.length === 0) {
+    return { flushedCount: 0, remainingCount: 0 };
+  }
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return { flushedCount: 0, remainingCount: state.pendingQueue.length };
+  }
+  if (typeof fetchImpl !== 'function') {
+    return { flushedCount: 0, remainingCount: state.pendingQueue.length };
+  }
+
+  let flushedCount = 0;
+
+  const run = (async () => {
+    let token: string | null = null;
+    try {
+      token = await getIdToken();
+    } catch {
+      token = null;
+    }
+    if (!token) return;
+
+    let earliestNextDelayMs = 0;
+
+    while (state.pendingQueue.length > 0) {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        break;
+      }
+      const head = state.pendingQueue[0];
+      const now = Date.now();
+      if (!ignoreBackoff && head.nextAttemptAt > now) {
+        earliestNextDelayMs = Math.max(100, head.nextAttemptAt - now);
+        break;
+      }
+
+      try {
+        const res = await fetchImpl('/api/upsell/feedback', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(head.event),
+        });
+
+        // Remove on 2xx success or permanent payload/authorization rejection
+        if (res.ok || res.status === 400 || res.status === 403 || res.status === 404) {
+          state.pendingQueue.shift();
+          savePendingQueue(shopId, state.pendingQueue);
+          if (res.ok) flushedCount += 1;
+          continue;
+        }
+
+        // Transient error (401, 429, 5xx) -> keep in queue with backoff
+        head.attempts += 1;
+        const backoff = Math.min(MAX_RETRY_MS, BASE_RETRY_MS * Math.pow(2, head.attempts - 1));
+        head.nextAttemptAt = Date.now() + backoff;
+        savePendingQueue(shopId, state.pendingQueue);
+        earliestNextDelayMs = backoff;
+        break;
+      } catch {
+        head.attempts += 1;
+        const backoff = Math.min(MAX_RETRY_MS, BASE_RETRY_MS * Math.pow(2, head.attempts - 1));
+        head.nextAttemptAt = Date.now() + backoff;
+        savePendingQueue(shopId, state.pendingQueue);
+        earliestNextDelayMs = backoff;
+        break;
+      }
+    }
+
+    if (earliestNextDelayMs > 0 && state.pendingQueue.length > 0) {
+      schedulePendingFlush({
+        shopId,
+        getIdToken,
+        fetchImpl,
+        delayMs: earliestNextDelayMs,
+      });
+    }
+  })();
+
+  state.flushInFlight = run;
+  try {
+    await run;
+  } finally {
+    if (state.flushInFlight === run) {
+      state.flushInFlight = null;
+    }
+  }
+
+  return { flushedCount, remainingCount: state.pendingQueue.length };
+}
+
+export function getPendingFeedbackQueueCount(shopId: string): number {
+  if (!shopId) return 0;
+  return getOrCreateState(shopId).pendingQueue.length;
 }
 
 /**
- * Records POS upsell feedback signals asynchronously (never blocking Sales Entry or checkout).
+ * Records POS upsell feedback signals asynchronously (never blocking Sales Entry or checkout),
+ * persisting unsent events in a durable retry queue so offline/failed requests are never lost.
  */
 export function recordUpsellFeedbackEvent(params: {
   shopId: string;
   productId: string;
   eventType: UpsellFeedbackEventType;
+  eventId?: string;
   categoryKey?: string;
   anchorCategoryKeys?: string[];
   getIdToken?: () => Promise<string | null>;
@@ -180,6 +411,7 @@ export function recordUpsellFeedbackEvent(params: {
     shopId,
     productId,
     eventType,
+    eventId,
     categoryKey,
     anchorCategoryKeys,
     getIdToken,
@@ -187,7 +419,13 @@ export function recordUpsellFeedbackEvent(params: {
   } = params;
   if (!shopId || !productId) return;
 
-  const event: UpsellFeedbackEventInput = {
+  const resolvedEventId =
+    typeof eventId === 'string' && eventId.trim().length >= 8
+      ? eventId.trim()
+      : generateFeedbackEventId();
+
+  const event: UpsellFeedbackEventInput & { eventId: string } = {
+    eventId: resolvedEventId,
     productId,
     eventType,
     categoryKey,
@@ -197,28 +435,16 @@ export function recordUpsellFeedbackEvent(params: {
   setTimeout(() => {
     try {
       const state = getOrCreateState(shopId);
-      applyEventLocally(state, event);
+      applyEventToSnapshot(state.snapshot, event);
       saveMirror(shopId, state.snapshot);
+      enqueuePendingFeedback(shopId, state, event);
 
       if (!getIdToken) return;
-      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
-      if (typeof fetchImpl !== 'function') return;
-
-      void getIdToken()
-        .then((token) => {
-          if (!token) return;
-          return fetchImpl('/api/upsell/feedback', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify(event),
-          });
-        })
-        .catch(() => {
-          // Non-blocking best-effort background telemetry
-        });
+      void flushPendingFeedbackEvents({
+        shopId,
+        getIdToken,
+        fetchImpl,
+      });
     } catch {
       // Never block POS UI
     }
@@ -234,7 +460,7 @@ export function recordUpsellFeedbackSync(
 ): void {
   if (!shopId || !event.productId) return;
   const state = getOrCreateState(shopId);
-  applyEventLocally(state, event);
+  applyEventToSnapshot(state.snapshot, event);
   saveMirror(shopId, state.snapshot);
 }
 
@@ -252,6 +478,14 @@ export async function syncFeedbackWithBackend(params: {
 
   const run = (async () => {
     try {
+      // Attempt to flush any queued offline/retry events first
+      await flushPendingFeedbackEvents({
+        shopId,
+        getIdToken,
+        fetchImpl,
+        ignoreBackoff: true,
+      });
+
       const token = await getIdToken();
       if (!token) return;
       const sinceQuery =
@@ -269,7 +503,12 @@ export async function syncFeedbackWithBackend(params: {
         snapshot?: UpsellFeedbackSnapshot;
       };
       if (body?.ok && !body.unchanged && body.snapshot && isValidSnapshot(body.snapshot, shopId)) {
-        state.snapshot = body.snapshot;
+        const merged = cloneSnapshot(body.snapshot);
+        // Preserve any still-unflushed local events on top of backend snapshot
+        for (const pending of state.pendingQueue) {
+          applyEventToSnapshot(merged, pending.event, pending.queuedAt);
+        }
+        state.snapshot = merged;
         state.authoritativeLoaded = true;
         saveMirror(shopId, state.snapshot);
       } else if (body?.ok && body.unchanged) {
@@ -345,15 +584,25 @@ export function getUpsellFeedbackAdjustment(params: {
 
 export function resetUpsellFeedbackStore(shopId?: string): void {
   if (shopId) {
+    const existing = runtimeFeedbackStates.get(shopId);
+    if (existing?.retryTimer) {
+      clearTimeout(existing.retryTimer);
+    }
     runtimeFeedbackStates.delete(shopId);
     try {
       if (typeof localStorage !== 'undefined') {
         localStorage.removeItem(getMirrorKey(shopId));
+        localStorage.removeItem(getPendingKey(shopId));
       }
     } catch {
       // Ignore storage errors
     }
     return;
+  }
+  for (const existing of runtimeFeedbackStates.values()) {
+    if (existing.retryTimer) {
+      clearTimeout(existing.retryTimer);
+    }
   }
   runtimeFeedbackStates.clear();
 }

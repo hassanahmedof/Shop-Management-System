@@ -39,6 +39,7 @@ export interface UpsellFeedbackCounters {
 }
 
 export interface UpsellFeedbackEventInput {
+  eventId?: string;
   productId: string;
   eventType: UpsellFeedbackEventType;
   categoryKey?: string;

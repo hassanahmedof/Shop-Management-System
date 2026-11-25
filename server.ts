@@ -34,7 +34,7 @@ import {
 } from './server/upsellCooccurrenceStore.ts';
 import {
   getServerFeedbackSnapshot,
-  recordServerFeedbackEvent,
+  recordServerFeedbackEventWithStatus,
 } from './server/upsellFeedbackStore.ts';
 import {
   COOCCURRENCE_CACHE_VERSION,
@@ -353,8 +353,7 @@ async function firestoreGetDoc(
   const res = await fetch(url, { headers });
   if (res.status === 404) return null;
   if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Firestore read failed (${res.status}): ${errText}`);
+    throw new Error(`Firestore read failed (${res.status}).`);
   }
   const json = (await res.json()) as {
     name?: string;
@@ -372,13 +371,165 @@ async function firestoreListCollection(
     headers: { Authorization: `Bearer ${bearerToken}` },
   });
   if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Firestore list failed (${res.status}): ${errText}`);
+    throw new Error(`Firestore list failed (${res.status}).`);
   }
   const json = (await res.json()) as {
     documents?: Array<{ name?: string; fields?: Record<string, Record<string, unknown>> }>;
   };
   return (json.documents || []).map((d) => decodeFirestoreDoc(d));
+}
+
+async function firestoreQuerySaleItemsBySaleId(
+  shopId: string,
+  saleId: string,
+  bearerToken: string
+): Promise<Array<Record<string, unknown>>> {
+  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${FIRESTORE_DB_ID}/documents/shops/${encodeURIComponent(shopId)}:runQuery`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${bearerToken}`,
+    },
+    body: JSON.stringify({
+      structuredQuery: {
+        from: [{ collectionId: 'saleItems' }],
+        where: {
+          compositeFilter: {
+            op: 'AND',
+            filters: [
+              {
+                fieldFilter: {
+                  field: { fieldPath: 'ownerUid' },
+                  op: 'EQUAL',
+                  value: { stringValue: shopId },
+                },
+              },
+              {
+                fieldFilter: {
+                  field: { fieldPath: 'saleId' },
+                  op: 'EQUAL',
+                  value: { stringValue: saleId },
+                },
+              },
+            ],
+          },
+        },
+      },
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Firestore query failed (${res.status}).`);
+  }
+  const rows = (await res.json()) as Array<{
+    document?: { name?: string; fields?: Record<string, Record<string, unknown>> };
+  }>;
+  return rows.filter((r) => Boolean(r.document)).map((r) => decodeFirestoreDoc(r.document!));
+}
+
+async function firestoreBatchGetDocs(
+  docPaths: string[],
+  bearerToken: string
+): Promise<Map<string, Record<string, unknown>>> {
+  const out = new Map<string, Record<string, unknown>>();
+  if (docPaths.length === 0) return out;
+  const docPrefix = `projects/${firebaseConfig.projectId}/databases/${FIRESTORE_DB_ID}/documents/`;
+  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${FIRESTORE_DB_ID}/documents:batchGet`;
+
+  for (let i = 0; i < docPaths.length; i += 100) {
+    const chunk = docPaths.slice(i, i + 100);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${bearerToken}`,
+      },
+      body: JSON.stringify({
+        documents: chunk.map((p) => `${docPrefix}${p}`),
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`Firestore batch read failed (${res.status}).`);
+    }
+    const items = (await res.json()) as Array<{
+      found?: { name?: string; fields?: Record<string, Record<string, unknown>> };
+    }>;
+    for (const entry of items) {
+      if (entry.found?.name && entry.found.name.startsWith(docPrefix)) {
+        const relPath = entry.found.name.slice(docPrefix.length);
+        out.set(relPath, decodeFirestoreDoc(entry.found));
+      }
+    }
+  }
+  return out;
+}
+
+const VALID_DOC_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const VALID_FEEDBACK_EVENT_ID_RE = /^[a-zA-Z0-9_.:-]{8,128}$/;
+
+function isValidDocId(id: string): boolean {
+  return VALID_DOC_ID_RE.test(id);
+}
+
+class SlidingWindowRateLimiter {
+  private readonly buckets = new Map<string, number[]>();
+  private readonly maxRequests: number;
+  private readonly windowMs: number;
+  private readonly maxKeys: number;
+
+  constructor(maxRequests: number, windowMs: number, maxKeys = 5000) {
+    this.maxRequests = maxRequests;
+    this.windowMs = windowMs;
+    this.maxKeys = maxKeys;
+  }
+
+  consume(key: string, now = Date.now()): { allowed: boolean; retryAfterSec: number } {
+    const cutoff = now - this.windowMs;
+    const prev = this.buckets.get(key);
+    const recent = prev ? prev.filter((ts) => ts > cutoff) : [];
+
+    if (recent.length >= this.maxRequests) {
+      this.buckets.set(key, recent);
+      const oldest = recent[0] ?? now;
+      const retryAfterSec = Math.max(1, Math.ceil((oldest + this.windowMs - now) / 1000));
+      return { allowed: false, retryAfterSec };
+    }
+
+    recent.push(now);
+    this.buckets.set(key, recent);
+
+    if (this.buckets.size > this.maxKeys) {
+      for (const [k, list] of this.buckets.entries()) {
+        if (list.length === 0 || list[list.length - 1] <= cutoff) {
+          this.buckets.delete(k);
+        }
+        if (this.buckets.size <= this.maxKeys) break;
+      }
+    }
+
+    return { allowed: true, retryAfterSec: 0 };
+  }
+}
+
+export interface ServerDependencies {
+  verifyFirebaseIdToken: (idToken: string) => Promise<VerifiedFirebaseUser>;
+  firestoreGetDoc: (docPath: string, bearerToken?: string) => Promise<Record<string, unknown> | null>;
+  firestoreListCollection: (
+    collectionPath: string,
+    bearerToken: string
+  ) => Promise<Array<Record<string, unknown>>>;
+  firestoreQuerySaleItemsBySaleId: (
+    shopId: string,
+    saleId: string,
+    bearerToken: string
+  ) => Promise<Array<Record<string, unknown>>>;
+  firestoreBatchGetDocs: (
+    docPaths: string[],
+    bearerToken: string
+  ) => Promise<Map<string, Record<string, unknown>>>;
+  suggestUpsellWithGemini: typeof suggestUpsellWithGemini;
+  cooccurrenceCacheDir?: string;
+  feedbackCacheDir?: string;
 }
 
 function extractBearerToken(req: Request): string | null {
@@ -596,9 +747,169 @@ async function requireStaffMiddleware(
   }
 }
 
-async function startServer() {
+export function createCaremartApp(overrides: Partial<ServerDependencies> = {}) {
+  const deps: ServerDependencies = {
+    verifyFirebaseIdToken,
+    firestoreGetDoc,
+    firestoreListCollection,
+    firestoreQuerySaleItemsBySaleId,
+    firestoreBatchGetDocs,
+    suggestUpsellWithGemini,
+    ...overrides,
+  };
+
   const app = express();
-  app.use(express.json({ limit: '10mb' }));
+  app.disable('x-powered-by');
+
+  const lookupIpLimiter = new SlidingWindowRateLimiter(20, 60_000);
+  const lookupTargetLimiter = new SlidingWindowRateLimiter(8, 60_000);
+  const authVerifyLimiter = new SlidingWindowRateLimiter(30, 60_000);
+  const upsellWriteLimiter = new SlidingWindowRateLimiter(90, 60_000);
+  const geminiUserLimiter = new SlidingWindowRateLimiter(15, 60_000);
+  const geminiShopLimiter = new SlidingWindowRateLimiter(45, 60_000);
+
+  function getClientIp(req: Request): string {
+    const fwd = req.headers['x-forwarded-for'];
+    if (typeof fwd === 'string' && fwd.trim()) {
+      return fwd.split(',')[0].trim().slice(0, 64);
+    }
+    return (req.ip || req.socket?.remoteAddress || 'unknown').slice(0, 64);
+  }
+
+  function applyRateLimit(
+    limiter: SlidingWindowRateLimiter,
+    key: string,
+    res: Response,
+    message = 'Too many requests. Please wait a moment and try again.'
+  ): boolean {
+    const check = limiter.consume(key);
+    if (!check.allowed) {
+      res.setHeader('Retry-After', String(check.retryAfterSec));
+      res.status(429).json({ ok: false, error: message });
+      return false;
+    }
+    return true;
+  }
+
+  // Security headers (preserve iframe embedding compatibility for AI Studio preview)
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    next();
+  });
+
+  // Route-scoped JSON body size limits (10mb reserved strictly for Sheets workbook sync)
+  app.use('/api/admin/sheets/sync', express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '64kb' }));
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    const bodyErr = err as { type?: string; status?: number } | null;
+    if (bodyErr && (bodyErr.type === 'entity.too.large' || bodyErr.status === 413)) {
+      res.status(413).json({ ok: false, error: 'Request payload exceeds allowed size limit.' });
+      return;
+    }
+    if (bodyErr && bodyErr.type === 'entity.parse.failed') {
+      res.status(400).json({ ok: false, error: 'Malformed JSON request body.' });
+      return;
+    }
+    next(err);
+  });
+
+  // Scoped auth wrappers using injectable dependencies
+  async function verifyIdTokenDep(idToken: string): Promise<VerifiedFirebaseUser> {
+    return deps.verifyFirebaseIdToken(idToken);
+  }
+
+  async function requireOwner(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    if (deps.verifyFirebaseIdToken === verifyFirebaseIdToken && deps.firestoreGetDoc === firestoreGetDoc) {
+      await requireOwnerMiddleware(req, res, next);
+      return;
+    }
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token required.' });
+      return;
+    }
+    try {
+      const user = await verifyIdTokenDep(token);
+      if (user.provider !== 'password' && user.provider !== 'google.com') {
+        res.status(403).json({ error: 'Owner/Admin authentication required.' });
+        return;
+      }
+      const ownerSetup = await deps.firestoreGetDoc('appState/ownerSetup', token);
+      const primaryOwnerUid = ownerSetup?.ownerUid ? String(ownerSetup.ownerUid) : '';
+      if (primaryOwnerUid && primaryOwnerUid === user.uid) {
+        req.firebaseUser = user;
+        req.bearerToken = token;
+        req.shopId = primaryOwnerUid;
+        req.isPrimaryOwner = true;
+        next();
+        return;
+      }
+      const adminMap = await deps.firestoreGetDoc(`adminAuthMap/${user.uid}`, token);
+      if (adminMap && adminMap.isActive === true && adminMap.shopId) {
+        req.firebaseUser = user;
+        req.bearerToken = token;
+        req.shopId = String(adminMap.shopId);
+        req.isPrimaryOwner = false;
+        next();
+        return;
+      }
+      res.status(403).json({ error: 'Not authorized as Owner/Admin.' });
+    } catch (err) {
+      res.status(401).json({
+        error: err instanceof Error ? err.message : 'Invalid or expired authentication token.',
+      });
+    }
+  }
+
+  async function requireStaff(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    if (deps.verifyFirebaseIdToken === verifyFirebaseIdToken && deps.firestoreGetDoc === firestoreGetDoc) {
+      await requireStaffMiddleware(req, res, next);
+      return;
+    }
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token required.' });
+      return;
+    }
+    try {
+      const user = await verifyIdTokenDep(token);
+      if (user.provider !== 'password') {
+        res.status(403).json({ error: 'Sales staff must authenticate with password.' });
+        return;
+      }
+      const authMap = await deps.firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
+      const shopId = String(authMap?.shopId || '');
+      const staffId = String(authMap?.staffId || '');
+      if (!authMap || authMap.isActive !== true || !shopId || !staffId) {
+        res.status(403).json({ error: 'Staff account is inactive or revoked.' });
+        return;
+      }
+      const staff = await deps.firestoreGetDoc(`shops/${shopId}/staff/${staffId}`, token);
+      if (!staff || staff.isActive !== true || staff.authUid !== user.uid) {
+        res.status(403).json({ error: 'Staff session is inactive or revoked.' });
+        return;
+      }
+      req.firebaseUser = user;
+      req.bearerToken = token;
+      req.staffContext = { shopId, staffId, staff };
+      next();
+    } catch (err) {
+      res.status(401).json({
+        error: err instanceof Error ? err.message : 'Invalid staff authentication token.',
+      });
+    }
+  }
 
   // Health & config status (never exposes OWNER_EMAIL or DISCORD_WEBHOOK_URL values)
   app.get('/api/health', async (req, res) => {
@@ -641,6 +952,7 @@ async function startServer() {
 
   // Verify Owner/Admin Sign-In or Initial Admin Setup
   app.post('/api/auth/verify-owner', async (req, res) => {
+    if (!applyRateLimit(authVerifyLimiter, `verify-owner:${getClientIp(req)}`, res)) return;
     const token = extractBearerToken(req);
     if (!token) {
       res.status(401).json({ error: 'Authentication token required.' });
@@ -650,7 +962,7 @@ async function startServer() {
     const mode = req.body?.mode === 'setup' ? 'setup' : req.body?.mode === 'signin' ? 'signin' : undefined;
 
     try {
-      const user = await verifyFirebaseIdToken(token);
+      const user = await verifyIdTokenDep(token);
       const authCheck = await authorizeOwnerUser(user, token, { mode });
       if (!authCheck.ok) {
         clearSessionCookie(req, res);
@@ -685,7 +997,14 @@ async function startServer() {
   });
 
   // Verify Sales Staff Sign-In (Password provider only; Google OAuth forbidden)
-  app.post('/api/auth/verify-staff', requireStaffMiddleware, (req: AuthenticatedRequest, res) => {
+  app.post(
+    '/api/auth/verify-staff',
+    (req, res, next) => {
+      if (!applyRateLimit(authVerifyLimiter, `verify-staff:${getClientIp(req)}`, res)) return;
+      next();
+    },
+    requireStaff,
+    (req: AuthenticatedRequest, res) => {
     const user = req.firebaseUser!;
     const ctx = req.staffContext!;
     setSessionCookie(req, res, {
@@ -726,6 +1045,9 @@ async function startServer() {
 
   // Unauthenticated non-PII lookup for Sales Staff login (Username + optional Shop Code)
   app.post('/api/staff/lookup', async (req, res) => {
+    const clientIp = getClientIp(req);
+    if (!applyRateLimit(lookupIpLimiter, `staff-lookup-ip:${clientIp}`, res)) return;
+
     const usernameRaw = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
     const shopCodeRaw = typeof req.body?.shopCode === 'string' ? req.body.shopCode.trim() : '';
 
@@ -742,18 +1064,16 @@ async function startServer() {
     const lookupKey = shopCodeRaw
       ? `${shopCodeRaw.toLowerCase()}_${unameLower}`
       : `u_${unameLower}`;
+    if (!applyRateLimit(lookupTargetLimiter, `staff-lookup-target:${clientIp}:${lookupKey}`, res)) {
+      return;
+    }
 
     try {
-      const lookup = await firestoreGetDoc(`staffLookup/${lookupKey}`);
-      if (!lookup) {
+      const lookup = await deps.firestoreGetDoc(`staffLookup/${lookupKey}`);
+      // Uniform response for missing or inactive accounts prevents unauthenticated status enumeration
+      if (!lookup || lookup.isActive !== true) {
         res.status(404).json({
           error: 'Invalid username or password. Contact your shop owner if needed.',
-        });
-        return;
-      }
-      if (lookup.isActive !== true) {
-        res.status(403).json({
-          error: 'This staff account has been deactivated by the shop owner.',
         });
         return;
       }
@@ -769,15 +1089,18 @@ async function startServer() {
         isActive: true,
         syntheticEmail,
       });
-    } catch (err) {
+    } catch {
       res.status(500).json({
-        error: err instanceof Error ? err.message : 'Unable to look up staff credentials.',
+        error: 'Unable to look up staff credentials.',
       });
     }
   });
 
   // Unauthenticated non-PII lookup for Added Admin login (Username)
   app.post('/api/admin/lookup', async (req, res) => {
+    const clientIp = getClientIp(req);
+    if (!applyRateLimit(lookupIpLimiter, `admin-lookup-ip:${clientIp}`, res)) return;
+
     const usernameRaw = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
     const shopCodeRaw = typeof req.body?.shopCode === 'string' ? req.body.shopCode.trim() : '';
 
@@ -794,18 +1117,16 @@ async function startServer() {
     const lookupKey = shopCodeRaw
       ? `${shopCodeRaw.toLowerCase()}_${unameLower}`
       : `u_${unameLower}`;
+    if (!applyRateLimit(lookupTargetLimiter, `admin-lookup-target:${clientIp}:${lookupKey}`, res)) {
+      return;
+    }
 
     try {
-      const lookup = await firestoreGetDoc(`adminLookup/${lookupKey}`);
-      if (!lookup) {
+      const lookup = await deps.firestoreGetDoc(`adminLookup/${lookupKey}`);
+      // Uniform response for missing or inactive accounts prevents unauthenticated status enumeration
+      if (!lookup || lookup.isActive !== true) {
         res.status(404).json({
           error: 'Invalid admin username or password. Check your credentials and try again.',
-        });
-        return;
-      }
-      if (lookup.isActive !== true) {
-        res.status(403).json({
-          error: 'This admin account has been deactivated.',
         });
         return;
       }
@@ -821,9 +1142,9 @@ async function startServer() {
         isActive: true,
         syntheticEmail,
       });
-    } catch (err) {
+    } catch {
       res.status(500).json({
-        error: err instanceof Error ? err.message : 'Unable to look up admin credentials.',
+        error: 'Unable to look up admin credentials.',
       });
     }
   });
@@ -831,7 +1152,7 @@ async function startServer() {
   // ------------------------------------------------------------------
   // Protected Owner / Admin API Routes (Blocked for Sales Staff & Unauthorized Users)
   // ------------------------------------------------------------------
-  app.get('/api/admin/authorize', requireOwnerMiddleware, (req: AuthenticatedRequest, res) => {
+  app.get('/api/admin/authorize', requireOwner, (req: AuthenticatedRequest, res) => {
     res.json({
       authorized: true,
       role: 'owner',
@@ -841,9 +1162,9 @@ async function startServer() {
     });
   });
 
-  app.get('/api/admin/staff', requireOwnerMiddleware, async (req: AuthenticatedRequest, res) => {
+  app.get('/api/admin/staff', requireOwner, async (req: AuthenticatedRequest, res) => {
     try {
-      const staff = await firestoreListCollection(
+      const staff = await deps.firestoreListCollection(
         `shops/${req.shopId!}/staff`,
         req.bearerToken!
       );
@@ -857,7 +1178,7 @@ async function startServer() {
 
   app.post(
     '/api/admin/staff/authorize',
-    requireOwnerMiddleware,
+    requireOwner,
     async (req: AuthenticatedRequest, res) => {
       const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
       const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
@@ -1340,7 +1661,13 @@ async function startServer() {
     req: Request,
     res: Response,
     options: { allowStaff: boolean }
-  ): Promise<{ shopId: string; role: 'owner' | 'sales_staff'; token: string } | null> {
+  ): Promise<{
+    shopId: string;
+    role: 'owner' | 'sales_staff';
+    uid: string;
+    staffId?: string;
+    token: string;
+  } | null> {
     const token = extractBearerToken(req);
     if (!token) {
       res.status(401).json({ ok: false, error: 'Authentication token required.' });
@@ -1349,7 +1676,7 @@ async function startServer() {
 
     let user: VerifiedFirebaseUser;
     try {
-      user = await verifyFirebaseIdToken(token);
+      user = await verifyIdTokenDep(token);
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Invalid or expired authentication token.';
@@ -1357,23 +1684,49 @@ async function startServer() {
       return null;
     }
 
-    const ownerCheck = await authorizeOwnerUser(user, token, {
-      requireExistingAdminOrSetup: true,
-    });
+    let ownerCheck:
+      | { ok: true; shopId: string; isPrimaryOwner: boolean }
+      | { ok: false; status: number; error: string };
+
+    if (deps.firestoreGetDoc === firestoreGetDoc) {
+      ownerCheck = await authorizeOwnerUser(user, token, {
+        requireExistingAdminOrSetup: true,
+      });
+    } else if (user.provider === 'password' || user.provider === 'google.com') {
+      const staffMap = await deps.firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
+      if (staffMap) {
+        ownerCheck = { ok: false, status: 403, error: 'Sales staff cannot access owner routes.' };
+      } else {
+        const ownerSetup = await deps.firestoreGetDoc('appState/ownerSetup', token);
+        const primaryUid = ownerSetup?.ownerUid ? String(ownerSetup.ownerUid) : '';
+        if (primaryUid && primaryUid === user.uid) {
+          ownerCheck = { ok: true, shopId: primaryUid, isPrimaryOwner: true };
+        } else {
+          const adminMap = await deps.firestoreGetDoc(`adminAuthMap/${user.uid}`, token);
+          if (adminMap && adminMap.isActive === true && adminMap.shopId) {
+            ownerCheck = { ok: true, shopId: String(adminMap.shopId), isPrimaryOwner: false };
+          } else {
+            ownerCheck = { ok: false, status: 403, error: 'Unauthorized user.' };
+          }
+        }
+      }
+    } else {
+      ownerCheck = { ok: false, status: 403, error: 'Unsupported provider.' };
+    }
 
     if (ownerCheck.ok) {
-      return { shopId: ownerCheck.shopId, role: 'owner', token };
+      return { shopId: ownerCheck.shopId, role: 'owner', uid: user.uid, token };
     }
 
     if (options.allowStaff && user.provider === 'password') {
-      const authMap = await firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
+      const authMap = await deps.firestoreGetDoc(`staffAuthMap/${user.uid}`, token);
       const shopId = String(authMap?.shopId || '');
       const staffId = String(authMap?.staffId || '');
       if (!authMap || authMap.isActive !== true || !shopId || !staffId) {
         res.status(403).json({ ok: false, error: 'Staff account is inactive or unauthorized.' });
         return null;
       }
-      const staff = await firestoreGetDoc(`shops/${shopId}/staff/${staffId}`, token);
+      const staff = await deps.firestoreGetDoc(`shops/${shopId}/staff/${staffId}`, token);
       const permissions = (staff?.permissions || {}) as { canAddSales?: boolean };
       if (
         !staff ||
@@ -1387,7 +1740,7 @@ async function startServer() {
         });
         return null;
       }
-      return { shopId, role: 'sales_staff', token };
+      return { shopId, role: 'sales_staff', uid: user.uid, staffId, token };
     }
 
     res.status(ownerCheck.status).json({ ok: false, error: ownerCheck.error });
@@ -1397,17 +1750,167 @@ async function startServer() {
   function sanitizeCooccurrenceSaleInput(raw: unknown): CooccurrenceSaleInput | null {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const rec = raw as Record<string, unknown>;
-    const saleId = typeof rec.saleId === 'string' ? rec.saleId.trim().slice(0, 128) : '';
+    const saleId = typeof rec.saleId === 'string' ? rec.saleId.trim() : '';
     const status = typeof rec.status === 'string' ? rec.status.trim().toLowerCase() : 'completed';
-    if (!saleId || status === 'cancelled' || status !== 'completed') return null;
+    if (!saleId || !isValidDocId(saleId) || status === 'cancelled' || status !== 'completed') {
+      return null;
+    }
     if (!Array.isArray(rec.productIds) || rec.productIds.length === 0 || rec.productIds.length > 80) {
       return null;
     }
-    const productIds = rec.productIds
-      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
-      .map((id) => id.trim().slice(0, 128));
+    const productIds: string[] = [];
+    for (const id of rec.productIds) {
+      if (typeof id !== 'string') return null;
+      const trimmed = id.trim();
+      if (!trimmed || !isValidDocId(trimmed)) return null;
+      productIds.push(trimmed);
+    }
     if (productIds.length === 0) return null;
     return { saleId, status: 'completed', productIds };
+  }
+
+  function extractStaffSaleProductIds(staffSale: Record<string, unknown>): string[] {
+    const items = Array.isArray(staffSale.items) ? staffSale.items : [];
+    const ids = new Set<string>();
+    for (const item of items) {
+      if (item && typeof item === 'object') {
+        const pid = typeof (item as Record<string, unknown>).productId === 'string'
+          ? String((item as Record<string, unknown>).productId).trim()
+          : '';
+        if (pid && isValidDocId(pid)) ids.add(pid);
+      }
+    }
+    return Array.from(ids);
+  }
+
+  async function verifyCooccurrenceSaleAgainstFirestore(
+    authCtx: {
+      shopId: string;
+      role: 'owner' | 'sales_staff';
+      uid: string;
+      staffId?: string;
+      token: string;
+    },
+    submitted: CooccurrenceSaleInput
+  ): Promise<{ ok: true; verifiedSale: CooccurrenceSaleInput } | { ok: false; status: number; error: string }> {
+    if (authCtx.role === 'sales_staff') {
+      const staffSale = await deps.firestoreGetDoc(
+        `shops/${authCtx.shopId}/staffSales/${submitted.saleId}`,
+        authCtx.token
+      );
+      if (
+        !staffSale ||
+        String(staffSale.ownerUid || '') !== authCtx.shopId ||
+        String(staffSale.staffAuthUid || '') !== authCtx.uid ||
+        (authCtx.staffId && String(staffSale.staffId || '') !== authCtx.staffId)
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          error: 'Submitted sale does not exist or does not belong to this staff account.',
+        };
+      }
+      if (String(staffSale.status || '') !== 'completed') {
+        return {
+          ok: false,
+          status: 409,
+          error: 'Only completed sales are eligible for recommendation learning.',
+        };
+      }
+      const authoritativeIds = extractStaffSaleProductIds(staffSale);
+      const authSet = new Set(authoritativeIds);
+      if (authoritativeIds.length === 0 || submitted.productIds.some((pid) => !authSet.has(pid))) {
+        return {
+          ok: false,
+          status: 403,
+          error: 'Submitted product IDs do not match the verified sale.',
+        };
+      }
+      return {
+        ok: true,
+        verifiedSale: {
+          saleId: submitted.saleId,
+          status: 'completed',
+          productIds: authoritativeIds,
+        },
+      };
+    }
+
+    // Owner/admin: verify against shops/{shopId}/sales/{saleId} or unsynced staffSales/{saleId}
+    const ownerSale = await deps.firestoreGetDoc(
+      `shops/${authCtx.shopId}/sales/${submitted.saleId}`,
+      authCtx.token
+    );
+    if (ownerSale) {
+      if (String(ownerSale.ownerUid || '') !== authCtx.shopId) {
+        return { ok: false, status: 403, error: 'Sale does not belong to this shop.' };
+      }
+      if (String(ownerSale.status || '') !== 'completed') {
+        return {
+          ok: false,
+          status: 409,
+          error: 'Only completed sales are eligible for recommendation learning.',
+        };
+      }
+      const saleItems = await deps.firestoreQuerySaleItemsBySaleId(
+        authCtx.shopId,
+        submitted.saleId,
+        authCtx.token
+      );
+      const authIds = new Set<string>();
+      for (const item of saleItems) {
+        if (String(item.status || 'completed') === 'cancelled') continue;
+        const pid = typeof item.productId === 'string' ? item.productId.trim() : '';
+        if (pid && isValidDocId(pid)) authIds.add(pid);
+      }
+      if (authIds.size === 0 || submitted.productIds.some((pid) => !authIds.has(pid))) {
+        return {
+          ok: false,
+          status: 403,
+          error: 'Submitted product IDs do not match verified sale line items.',
+        };
+      }
+      return {
+        ok: true,
+        verifiedSale: {
+          saleId: submitted.saleId,
+          status: 'completed',
+          productIds: Array.from(authIds),
+        },
+      };
+    }
+
+    const staffSale = await deps.firestoreGetDoc(
+      `shops/${authCtx.shopId}/staffSales/${submitted.saleId}`,
+      authCtx.token
+    );
+    if (!staffSale || String(staffSale.ownerUid || '') !== authCtx.shopId) {
+      return { ok: false, status: 404, error: 'Completed sale record not found for this shop.' };
+    }
+    if (String(staffSale.status || '') !== 'completed') {
+      return {
+        ok: false,
+        status: 409,
+        error: 'Only completed sales are eligible for recommendation learning.',
+      };
+    }
+    const staffProdIds = extractStaffSaleProductIds(staffSale);
+    const staffProdSet = new Set(staffProdIds);
+    if (staffProdIds.length === 0 || submitted.productIds.some((pid) => !staffProdSet.has(pid))) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'Submitted product IDs do not match verified sale line items.',
+      };
+    }
+    return {
+      ok: true,
+      verifiedSale: {
+        saleId: submitted.saleId,
+        status: 'completed',
+        productIds: staffProdIds,
+      },
+    };
   }
 
   app.get('/api/upsell/cooccurrence', async (req, res) => {
@@ -1415,7 +1918,10 @@ async function startServer() {
       const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
       if (!authCtx) return;
 
-      let { snapshot, recovered } = getServerCooccurrenceSnapshot(authCtx.shopId);
+      let { snapshot, recovered } = getServerCooccurrenceSnapshot(
+        authCtx.shopId,
+        deps.cooccurrenceCacheDir
+      );
       if (
         snapshot.totalCompletedSales === 0 &&
         snapshot.revision === 0 &&
@@ -1423,21 +1929,25 @@ async function startServer() {
       ) {
         cooccurrenceFirestoreCheckedShops.add(authCtx.shopId);
         try {
-          const fsDoc = await firestoreGetDoc(
+          const fsDoc = await deps.firestoreGetDoc(
             `shops/${authCtx.shopId}/upsellCache/cooccurrence_v${COOCCURRENCE_CACHE_VERSION}`,
             authCtx.token
           );
           if (fsDoc && Number(fsDoc.version) === COOCCURRENCE_CACHE_VERSION) {
-            const hydrated = hydrateServerCooccurrenceFromExternalSnapshot(authCtx.shopId, {
-              version: Number(fsDoc.version),
-              shopId: authCtx.shopId,
-              revision: Number(fsDoc.revision) || 0,
-              totalCompletedSales: Number(fsDoc.totalCompletedSales) || 0,
-              saleCountsByProduct: fsDoc.saleCountsByProduct,
-              pairCounts: fsDoc.pairCounts,
-              processedSaleIds: fsDoc.processedSaleIds,
-              updatedAt: Date.now(),
-            });
+            const hydrated = hydrateServerCooccurrenceFromExternalSnapshot(
+              authCtx.shopId,
+              {
+                version: Number(fsDoc.version),
+                shopId: authCtx.shopId,
+                revision: Number(fsDoc.revision) || 0,
+                totalCompletedSales: Number(fsDoc.totalCompletedSales) || 0,
+                saleCountsByProduct: fsDoc.saleCountsByProduct,
+                pairCounts: fsDoc.pairCounts,
+                processedSaleIds: fsDoc.processedSaleIds,
+                updatedAt: Date.now(),
+              },
+              deps.cooccurrenceCacheDir
+            );
             if (hydrated) {
               snapshot = hydrated;
               recovered = false;
@@ -1488,7 +1998,21 @@ async function startServer() {
       const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
       if (!authCtx) return;
 
-      const result = recordServerCooccurrenceBatch(authCtx.shopId, [sale]);
+      if (!applyRateLimit(upsellWriteLimiter, `upsell-write:${authCtx.shopId}:${authCtx.uid}`, res)) {
+        return;
+      }
+
+      const verified = await verifyCooccurrenceSaleAgainstFirestore(authCtx, sale);
+      if (!verified.ok) {
+        res.status(verified.status).json({ ok: false, error: verified.error });
+        return;
+      }
+
+      const result = recordServerCooccurrenceBatch(
+        authCtx.shopId,
+        [verified.verifiedSale],
+        { cacheDir: deps.cooccurrenceCacheDir }
+      );
       res.json({
         ok: true,
         version: result.snapshot.version,
@@ -1529,15 +2053,58 @@ async function startServer() {
     const sanitizedSales: CooccurrenceSaleInput[] = [];
     for (const rawSale of body.sales) {
       const clean = sanitizeCooccurrenceSaleInput(rawSale);
-      if (clean) sanitizedSales.push(clean);
+      if (!clean) {
+        res.status(400).json({ ok: false, error: 'Invalid sale entry in rebuild payload.' });
+        return;
+      }
+      sanitizedSales.push(clean);
     }
 
     try {
       const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: false });
       if (!authCtx) return;
 
+      if (!applyRateLimit(upsellWriteLimiter, `upsell-write:${authCtx.shopId}:${authCtx.uid}`, res)) {
+        return;
+      }
+
+      if (sanitizedSales.length > 0) {
+        const docPaths = sanitizedSales.flatMap((s) => [
+          `shops/${authCtx.shopId}/sales/${s.saleId}`,
+          `shops/${authCtx.shopId}/staffSales/${s.saleId}`,
+        ]);
+        const foundDocs = await deps.firestoreBatchGetDocs(docPaths, authCtx.token);
+        for (const s of sanitizedSales) {
+          const ownerDoc = foundDocs.get(`shops/${authCtx.shopId}/sales/${s.saleId}`);
+          const staffDoc = foundDocs.get(`shops/${authCtx.shopId}/staffSales/${s.saleId}`);
+          const matchedDoc = ownerDoc || staffDoc;
+          if (
+            !matchedDoc ||
+            String(matchedDoc.ownerUid || '') !== authCtx.shopId ||
+            String(matchedDoc.status || '') !== 'completed'
+          ) {
+            res.status(403).json({
+              ok: false,
+              error: 'One or more submitted sales are not verified completed sales for this shop.',
+            });
+            return;
+          }
+          if (staffDoc && !ownerDoc) {
+            const staffAuthIds = new Set(extractStaffSaleProductIds(staffDoc));
+            if (staffAuthIds.size === 0 || s.productIds.some((pid) => !staffAuthIds.has(pid))) {
+              res.status(403).json({
+                ok: false,
+                error: 'Submitted product IDs do not match verified staff sale.',
+              });
+              return;
+            }
+          }
+        }
+      }
+
       const result = recordServerCooccurrenceBatch(authCtx.shopId, sanitizedSales, {
         resetFirst: body.resetFirst === true,
+        cacheDir: deps.cooccurrenceCacheDir,
       });
       res.json({
         ok: true,
@@ -1565,7 +2132,22 @@ async function startServer() {
       const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
       if (!authCtx) return;
 
-      const result = await suggestUpsellWithGemini(authCtx.shopId, sanitized);
+      const userLimit = geminiUserLimiter.consume(`${authCtx.shopId}:${authCtx.uid}`);
+      const shopLimit = geminiShopLimiter.consume(authCtx.shopId);
+      if (!userLimit.allowed || !shopLimit.allowed) {
+        const retryAfter = Math.max(userLimit.retryAfterSec, shopLimit.retryAfterSec, 1);
+        res.setHeader('Retry-After', String(retryAfter));
+        res.status(429).json({
+          ok: false,
+          available: false,
+          reason: 'GEMINI_RATE_LIMITED',
+          suggestion: null,
+          error: 'Upsell AI quota exceeded. Please try again shortly.',
+        });
+        return;
+      }
+
+      const result = await deps.suggestUpsellWithGemini(authCtx.shopId, sanitized);
       if (!result.available) {
         res.json({
           ok: true,
@@ -1599,7 +2181,10 @@ async function startServer() {
       const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
       if (!authCtx) return;
 
-      const { snapshot, recovered } = getServerFeedbackSnapshot(authCtx.shopId);
+      const { snapshot, recovered } = getServerFeedbackSnapshot(
+        authCtx.shopId,
+        deps.feedbackCacheDir
+      );
       const sinceRevision = Number(req.query?.sinceRevision);
       if (
         !recovered &&
@@ -1637,17 +2222,24 @@ async function startServer() {
       'removed_after_add',
     ]);
     const productId =
-      body && typeof body.productId === 'string' ? body.productId.trim().slice(0, 128) : '';
+      body && typeof body.productId === 'string' ? body.productId.trim() : '';
     const eventType =
       body && typeof body.eventType === 'string'
         ? (body.eventType.trim() as UpsellFeedbackEventType)
         : null;
-    if (!productId || !eventType || !validEventTypes.has(eventType)) {
+    const rawEventId =
+      body && typeof body.eventId === 'string' ? body.eventId.trim() : '';
+    if (!productId || !isValidDocId(productId) || !eventType || !validEventTypes.has(eventType)) {
       res.status(400).json({ ok: false, error: 'Valid upsell feedback event payload is required.' });
+      return;
+    }
+    if (rawEventId && !VALID_FEEDBACK_EVENT_ID_RE.test(rawEventId)) {
+      res.status(400).json({ ok: false, error: 'Invalid feedback eventId format.' });
       return;
     }
 
     const sanitized: UpsellFeedbackEventInput = {
+      ...(rawEventId ? { eventId: rawEventId } : {}),
       productId,
       eventType,
       categoryKey:
@@ -1664,9 +2256,45 @@ async function startServer() {
       const authCtx = await resolveShopIdForUpsellRoute(req, res, { allowStaff: true });
       if (!authCtx) return;
 
-      const snapshot = recordServerFeedbackEvent(authCtx.shopId, sanitized);
+      if (!applyRateLimit(upsellWriteLimiter, `upsell-write:${authCtx.shopId}:${authCtx.uid}`, res)) {
+        return;
+      }
+
+      // Verify product belongs to this shop before mutating feedback counters
+      let productDoc: Record<string, unknown> | null = null;
+      if (authCtx.role === 'owner') {
+        productDoc = await deps.firestoreGetDoc(
+          `shops/${authCtx.shopId}/products/${productId}`,
+          authCtx.token
+        );
+        if (!productDoc) {
+          productDoc = await deps.firestoreGetDoc(
+            `shops/${authCtx.shopId}/staffCatalog/${productId}`,
+            authCtx.token
+          );
+        }
+      } else {
+        productDoc = await deps.firestoreGetDoc(
+          `shops/${authCtx.shopId}/staffCatalog/${productId}`,
+          authCtx.token
+        );
+      }
+      if (!productDoc || String(productDoc.ownerUid || '') !== authCtx.shopId) {
+        res.status(403).json({
+          ok: false,
+          error: 'Product does not belong to the authorized shop catalog.',
+        });
+        return;
+      }
+
+      const { snapshot, duplicate } = recordServerFeedbackEventWithStatus(
+        authCtx.shopId,
+        sanitized,
+        deps.feedbackCacheDir
+      );
       res.json({
         ok: true,
+        duplicate,
         version: snapshot.version,
         revision: snapshot.revision,
       });
@@ -1680,6 +2308,12 @@ async function startServer() {
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'API endpoint not found.' });
   });
+
+  return app;
+}
+
+async function startServer() {
+  const app = createCaremartApp();
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -1702,4 +2336,6 @@ async function startServer() {
   });
 }
 
-void startServer();
+if (!process.env.VITEST) {
+  void startServer();
+}

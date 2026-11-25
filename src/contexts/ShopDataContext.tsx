@@ -123,6 +123,21 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   const autoBackupAttemptedRef = useRef<string>('');
   const defaultCatsCheckedRef = useRef<string>('');
   const catalogSyncSigRef = useRef<string>('');
+  const catalogSyncPartsRef = useRef<{
+    staffMembers: StaffMember[] | null;
+    allowedUidsKey: string;
+    products: Product[] | null;
+    prodSig: string;
+    staffCatalog: StaffCatalogItem[] | null;
+    catSig: string;
+  }>({
+    staffMembers: null,
+    allowedUidsKey: '',
+    products: null,
+    prodSig: '',
+    staffCatalog: null,
+    catSig: '',
+  });
   const lookupBackfillSigRef = useRef<string>('');
   const reconcilingIdsRef = useRef<Set<string>>(new Set());
   const cooccurrenceBackfillSigRef = useRef<string>('');
@@ -509,19 +524,37 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     if (sessionRole !== 'owner' || !shopId || !liveListenersSettled) return;
     if (staffMembers.length === 0 && staffCatalog.length === 0) return;
 
-    const allowedUidsKey = getCatalogAllowedUids(staffMembers).sort().join(',');
-    const prodSig = products
-      .map(
-        (p) =>
-          `${p.id}:${p.name}:${p.categoryName}:${p.brandName}:${p.salePrice}:${p.wholesalePrice}:${p.currentStock}:${p.baseUnit || p.unit}:${JSON.stringify(p.packagingUnits || [])}:${p.originType || ''}:${p.bottleSize || ''}:${p.storageLocation || ''}:${Boolean(p.isReturnable)}:${p.returnableUnitName || ''}:${p.depositPerReturnable ?? 0}:${p.isActive}`
-      )
-      .join('|');
-    const catSig = staffCatalog
-      .map(
-        (c) =>
-          `${c.productId}:${c.name}:${c.categoryName}:${c.brandName}:${c.salePrice}:${c.wholesalePrice ?? 0}:${c.currentStock}:${c.baseUnit || c.unit}:${JSON.stringify(c.packagingUnits || [])}:${c.originType || ''}:${c.bottleSize || ''}:${c.storageLocation || ''}:${Boolean(c.isReturnable)}:${c.returnableUnitName || ''}:${c.depositPerReturnable ?? 0}:${c.isActive}:${(c.allowedStaffUids || []).slice().sort().join(',')}`
-      )
-      .join('|');
+    const parts = catalogSyncPartsRef.current;
+    const allowedUidsKey =
+      parts.staffMembers === staffMembers
+        ? parts.allowedUidsKey
+        : getCatalogAllowedUids(staffMembers).sort().join(',');
+    const prodSig =
+      parts.products === products
+        ? parts.prodSig
+        : products
+            .map(
+              (p) =>
+                `${p.id}:${p.name}:${p.categoryName}:${p.brandName}:${p.salePrice}:${p.wholesalePrice}:${p.currentStock}:${p.baseUnit || p.unit}:${JSON.stringify(p.packagingUnits || [])}:${p.originType || ''}:${p.bottleSize || ''}:${p.storageLocation || ''}:${Boolean(p.isReturnable)}:${p.returnableUnitName || ''}:${p.depositPerReturnable ?? 0}:${p.isActive}`
+            )
+            .join('|');
+    const catSig =
+      parts.staffCatalog === staffCatalog
+        ? parts.catSig
+        : staffCatalog
+            .map(
+              (c) =>
+                `${c.productId}:${c.name}:${c.categoryName}:${c.brandName}:${c.salePrice}:${c.wholesalePrice ?? 0}:${c.currentStock}:${c.baseUnit || c.unit}:${JSON.stringify(c.packagingUnits || [])}:${c.originType || ''}:${c.bottleSize || ''}:${c.storageLocation || ''}:${Boolean(c.isReturnable)}:${c.returnableUnitName || ''}:${c.depositPerReturnable ?? 0}:${c.isActive}:${(c.allowedStaffUids || []).slice().sort().join(',')}`
+            )
+            .join('|');
+
+    parts.staffMembers = staffMembers;
+    parts.allowedUidsKey = allowedUidsKey;
+    parts.products = products;
+    parts.prodSig = prodSig;
+    parts.staffCatalog = staffCatalog;
+    parts.catSig = catSig;
+
     const combinedSig = `${allowedUidsKey}::${prodSig}::${catSig}`;
 
     if (catalogSyncSigRef.current === combinedSig) return;

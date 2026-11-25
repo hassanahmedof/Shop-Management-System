@@ -1,4 +1,3 @@
-import * as XLSX from 'xlsx';
 import { SHEET_TABS, type SheetSyncPayload } from '../../shared/googleSheetsSchema';
 import { buildSheetSyncPayload, type ShopSnapshotData } from '../services/googleSheetsMapper';
 import { getKarachiDateIso } from './formatters';
@@ -9,11 +8,12 @@ function formatKarachiFilenameDate(): string {
   return d && m && y ? `${d}-${m}-${y}` : iso;
 }
 
-export function exportAllTabsWorkbook(data: ShopSnapshotData): {
+export async function exportAllTabsWorkbook(data: ShopSnapshotData): Promise<{
   filename: string;
   totalRows: number;
   tabCount: number;
-} {
+}> {
+  const XLSX = await import('xlsx');
   const allTabNames = SHEET_TABS.map((t) => t.name);
   const payload: SheetSyncPayload = buildSheetSyncPayload(data, allTabNames);
   const workbook = XLSX.utils.book_new();

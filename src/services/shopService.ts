@@ -6,6 +6,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  limit,
   query,
   runTransaction,
   serverTimestamp,
@@ -68,10 +69,9 @@ import {
   resolveBrandCategoryIds,
 } from '../utils/brands';
 import {
-  DEFAULT_PRODUCT_TEMPLATES,
   normalizeTemplateKey,
   resolveTemplateCategoryAndBrand,
-} from '../utils/productTemplates';
+} from '../utils/productTemplateHelpers';
 import { recordPerfMetric, startPerfTimer } from '../utils/perfMonitor';
 import { formatOwnerAdminLabel, OWNER_PRIMARY_ID } from '../utils/sellerAttribution';
 
@@ -337,7 +337,8 @@ export async function ensureShopInitialized(
       }
 
       // Seed default product suggestion catalog right after base workspace entities
-      const templateChunks: typeof DEFAULT_PRODUCT_TEMPLATES[] = [];
+      const { DEFAULT_PRODUCT_TEMPLATES } = await import('../utils/productTemplates');
+      const templateChunks: (typeof DEFAULT_PRODUCT_TEMPLATES)[] = [];
       for (let i = 0; i < DEFAULT_PRODUCT_TEMPLATES.length; i += 350) {
         templateChunks.push(DEFAULT_PRODUCT_TEMPLATES.slice(i, i + 350));
       }
@@ -1149,11 +1150,51 @@ export async function updateSupplier(
   }
 }
 
-export async function deleteSupplier(uid: string, id: string): Promise<void> {
+export async function deleteSupplier(
+  uid: string,
+  id: string,
+  options?: { hasLinkedRecords?: boolean }
+): Promise<void> {
   const ref = shopDoc(uid, 'suppliers', id);
   try {
+    const supSnap = await getDoc(ref);
+    if (!supSnap.exists()) return;
+    const sup = supSnap.data() as Supplier;
+    if (
+      roundMoney(sup.outstandingBalance || 0) > 0 ||
+      roundMoney(sup.totalPurchased || 0) > 0 ||
+      roundMoney(sup.totalPaid || 0) > 0
+    ) {
+      throw new Error(
+        `Cannot delete supplier "${sup.name || 'Supplier'}" with recorded purchase history or outstanding balance.`
+      );
+    }
+
+    if (options?.hasLinkedRecords === true) {
+      throw new Error(
+        `Cannot delete supplier "${sup.name || 'Supplier'}" because existing products or purchases reference it.`
+      );
+    }
+
+    if (options?.hasLinkedRecords === undefined) {
+      const [prodSnap, purchSnap] = await Promise.all([
+        getDocs(query(shopCol(uid, 'products'), where('ownerUid', '==', uid))),
+        getDocs(query(shopCol(uid, 'purchases'), where('ownerUid', '==', uid))),
+      ]);
+      const linkedProduct = prodSnap.docs.some((d) => (d.data() as Product).supplierId === id);
+      const linkedPurchase = purchSnap.docs.some((d) => (d.data() as Purchase).supplierId === id);
+      if (linkedProduct || linkedPurchase) {
+        throw new Error(
+          `Cannot delete supplier "${sup.name || 'Supplier'}" because existing products or purchases reference it.`
+        );
+      }
+    }
+
     await deleteDoc(ref);
   } catch (err) {
+    if (err instanceof Error && err.message.startsWith('Cannot delete supplier')) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.DELETE, `shops/${uid}/suppliers/${id}`);
   }
 }
@@ -1398,18 +1439,87 @@ export async function updateProduct(
   }
 }
 
-export async function deleteProduct(uid: string, product: Product): Promise<void> {
+export async function deleteProduct(
+  uid: string,
+  product: Product,
+  options?: { hasHistoricalTransactions?: boolean }
+): Promise<void> {
   const prodRef = shopDoc(uid, 'products', product.id);
+  const staffCatRef = shopDoc(uid, 'staffCatalog', product.id);
   try {
+    const [prodSnap, staffCatSnap, activeBatchSnap, exhaustedBatchSnap] = await Promise.all([
+      getDoc(prodRef),
+      getDoc(staffCatRef),
+      getDocs(
+        query(
+          shopCol(uid, 'inventoryBatches'),
+          where('ownerUid', '==', uid),
+          where('productId', '==', product.id),
+          where('status', '==', 'active'),
+          limit(1)
+        )
+      ),
+      getDocs(
+        query(
+          shopCol(uid, 'inventoryBatches'),
+          where('ownerUid', '==', uid),
+          where('productId', '==', product.id),
+          where('status', '==', 'exhausted'),
+          limit(1)
+        )
+      ),
+    ]);
+
+    if (!prodSnap.exists()) return;
+    const freshProd = prodSnap.data() as Product;
+    const displayName = freshProd.name || product.name;
+
+    if (roundStockQty(freshProd.currentStock || 0) > 0) {
+      throw new Error(
+        `Cannot delete "${displayName}" while stock remains (${freshProd.currentStock}). Adjust stock to 0 or edit the product to Archive/Deactivate it instead.`
+      );
+    }
+
+    if (!activeBatchSnap.empty || !exhaustedBatchSnap.empty) {
+      throw new Error(
+        `Cannot delete "${displayName}" because it has linked inventory batches. Edit the product and set it Inactive (Archive) instead.`
+      );
+    }
+
+    if (options?.hasHistoricalTransactions === true) {
+      throw new Error(
+        `Cannot delete "${displayName}" because it appears in historical sales or purchases. Edit the product and set it Inactive (Archive) instead.`
+      );
+    }
+
+    if (options?.hasHistoricalTransactions === undefined) {
+      const [saleItemSnap, purchaseItemSnap] = await Promise.all([
+        getDocs(query(shopCol(uid, 'saleItems'), where('ownerUid', '==', uid))),
+        getDocs(query(shopCol(uid, 'purchaseItems'), where('ownerUid', '==', uid))),
+      ]);
+      const hasSales = saleItemSnap.docs.some((d) => (d.data() as SaleItem).productId === product.id);
+      const hasPurchases = purchaseItemSnap.docs.some(
+        (d) => (d.data() as PurchaseItem).productId === product.id
+      );
+      if (hasSales || hasPurchases) {
+        throw new Error(
+          `Cannot delete "${displayName}" because it appears in historical sales or purchases. Edit the product and set it Inactive (Archive) instead.`
+        );
+      }
+    }
+
     const batch = writeBatch(db);
     batch.delete(prodRef);
+    if (staffCatSnap.exists()) {
+      batch.delete(staffCatRef);
+    }
     const logRef = doc(shopCol(uid, 'auditLogs'));
     batch.set(logRef, {
       ownerUid: uid,
       action: 'DELETE_PRODUCT',
       entityType: 'product',
       entityId: product.id,
-      summary: clip(`Deleted product ${product.name}`, 400),
+      summary: clip(`Deleted product ${displayName}`, 400),
       createdAt: serverTimestamp(),
     });
     await batch.commit();
@@ -1419,10 +1529,13 @@ export async function deleteProduct(uid: string, product: Product): Promise<void
       entityType: 'product',
       entityId: product.id,
       action: 'DELETE_PRODUCT',
-      summary: clip(`Deleted product "${product.name}"`, 180),
+      summary: clip(`Deleted product "${displayName}"`, 180),
       targetSheets: ['Products', 'Inventory', 'Daily Summary'],
     });
   } catch (err) {
+    if (err instanceof Error && err.message.startsWith('Cannot delete ')) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.DELETE, `shops/${uid}/products/${product.id}`);
   }
 }
@@ -1673,6 +1786,7 @@ async function runDefaultProductTemplatesSync(
     liveTemplates.map((t) => normalizeTemplateKey(t.categoryId, t.brandId, t.name, t.variant))
   );
 
+  const { DEFAULT_PRODUCT_TEMPLATES } = await import('../utils/productTemplates');
   const toInsert: Array<{ id: string; data: Record<string, unknown> }> = [];
   for (const def of DEFAULT_PRODUCT_TEMPLATES) {
     const resolved = resolveTemplateCategoryAndBrand(def, liveCategories, liveBrands);
@@ -1863,6 +1977,7 @@ export async function runLiveCatalogAuditAndSync(
     const existingKeys = new Set(
       liveTemplates.map((t) => normalizeTemplateKey(t.categoryId, t.brandId, t.name, t.variant))
     );
+    const { DEFAULT_PRODUCT_TEMPLATES } = await import('../utils/productTemplates');
     for (const def of DEFAULT_PRODUCT_TEMPLATES) {
       const resolved = resolveTemplateCategoryAndBrand(def, liveCats, liveBrands);
       const key = normalizeTemplateKey(resolved.categoryId, resolved.brandId, def.name, def.variant);
@@ -2203,29 +2318,34 @@ export async function createSale(
     }
   }
 
-  // Reuse caller's live activeBatchIds when available to avoid a full inventoryBatches scan per sale
-  let candidateBatchIds: string[] = [];
-  if (options?.activeBatchIds !== undefined) {
-    candidateBatchIds = options.activeBatchIds;
-  } else {
-    try {
-      const batchSnap = await getDocs(
-        query(shopCol(uid, 'inventoryBatches'), where('ownerUid', '==', uid))
-      );
-      candidateBatchIds = batchSnap.docs
-        .filter((d) => {
-          const data = d.data() as InventoryBatch;
-          return (
-            involvedProductIds.has(data.productId) &&
-            data.status === 'active' &&
-            Number(data.remainingBaseQty) > 0
-          );
-        })
-        .map((d) => d.id);
-    } catch (err) {
-      handleFirestoreError(err, OperationType.LIST, `shops/${uid}/inventoryBatches`);
+  // Merge caller hints with authoritative per-product indexed batch queries so concurrent purchases are never missed
+  const batchIdSet = new Set<string>(options?.activeBatchIds || []);
+  try {
+    const involvedPids = Array.from(involvedProductIds);
+    const batchSnaps = await Promise.all(
+      involvedPids.map((pid) =>
+        getDocs(
+          query(
+            shopCol(uid, 'inventoryBatches'),
+            where('ownerUid', '==', uid),
+            where('productId', '==', pid),
+            where('status', '==', 'active')
+          )
+        )
+      )
+    );
+    for (const batchSnap of batchSnaps) {
+      for (const d of batchSnap.docs) {
+        const data = d.data() as InventoryBatch;
+        if (Number(data.remainingBaseQty) > 0) {
+          batchIdSet.add(d.id);
+        }
+      }
     }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/inventoryBatches`);
   }
+  const candidateBatchIds = Array.from(batchIdSet);
 
   const saleRef = doc(shopCol(uid, 'sales'));
   const saleNumber = generateTxnNumber('SL');
@@ -2490,7 +2610,7 @@ export async function createSale(
     enqueueSaleCooccurrenceUpdate(
       uid,
       saleRef.id,
-      Array.from(merged.keys()),
+      Array.from(involvedProductIds),
       () => (auth.currentUser ? auth.currentUser.getIdToken() : Promise.resolve(null)),
       { isOwner: true }
     );
@@ -2953,7 +3073,11 @@ export async function editSale(
 export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by owner'): Promise<void> {
   if (sale.status === 'cancelled') return;
 
-  const itemsQuery = query(shopCol(uid, 'saleItems'), where('ownerUid', '==', uid));
+  const itemsQuery = query(
+    shopCol(uid, 'saleItems'),
+    where('ownerUid', '==', uid),
+    where('saleId', '==', sale.id)
+  );
   let items: SaleItem[] = [];
   try {
     const snap = await getDocs(itemsQuery);
@@ -3446,9 +3570,11 @@ export async function settlePurchaseBalance(
 ): Promise<void> {
   if (purchase.status === 'cancelled') throw new Error('Cannot pay a cancelled purchase.');
   const pay = roundMoney(paymentAmount);
-  if (pay <= 0 || pay > purchase.balanceDue) {
-    throw new Error('Payment amount must be between 1 and the remaining balance due.');
+  if (!Number.isFinite(pay) || pay <= 0) {
+    throw new Error('Payment amount must be greater than zero.');
   }
+
+  let settledSummary = `Settled balance for ${purchase.purchaseNumber}`;
 
   try {
     await runTransaction(db, async (tx) => {
@@ -3458,8 +3584,27 @@ export async function settlePurchaseBalance(
       if (!pSnap.exists()) throw new Error('Purchase not found.');
 
       const curP = pSnap.data() as Purchase;
-      const newPaid = roundMoney(curP.amountPaid + pay);
-      const newDue = Math.max(0, roundMoney(curP.totalAmount - newPaid));
+      if (curP.status === 'cancelled') {
+        throw new Error('Cannot pay a cancelled purchase.');
+      }
+
+      const currentDue = roundMoney(
+        curP.balanceDue ?? Math.max(0, (curP.totalAmount || 0) - (curP.amountPaid || 0))
+      );
+      if (currentDue <= 0) {
+        throw new Error('Purchase balance is already fully paid.');
+      }
+      if (pay > currentDue) {
+        throw new Error(
+          `Payment amount must be between 1 and the remaining balance due (PKR ${currentDue}).`
+        );
+      }
+
+      const newPaid = roundMoney((curP.amountPaid || 0) + pay);
+      const newDue = Math.max(0, roundMoney((curP.totalAmount || 0) - newPaid));
+      const purchaseNum = curP.purchaseNumber || purchase.purchaseNumber;
+      const supplierName = curP.supplierName || purchase.supplierName;
+      settledSummary = `Settled balance for ${purchaseNum}`;
 
       tx.update(pRef, {
         amountPaid: newPaid,
@@ -3487,7 +3632,7 @@ export async function settlePurchaseBalance(
         action: 'SETTLE_SUPPLIER_BALANCE',
         entityType: 'purchase',
         entityId: purchase.id,
-        summary: clip(`Paid PKR ${pay} toward ${purchase.purchaseNumber} (${purchase.supplierName})`, 400),
+        summary: clip(`Paid PKR ${pay} toward ${purchaseNum} (${supplierName})`, 400),
         createdAt: serverTimestamp(),
       });
     });
@@ -3498,11 +3643,19 @@ export async function settlePurchaseBalance(
       entityType: 'purchase',
       entityId: purchase.id,
       action: 'SETTLE_SUPPLIER_BALANCE',
-      summary: `Settled balance for ${purchase.purchaseNumber}`,
+      summary: settledSummary,
       targetSheets: ['Purchases', 'Suppliers', 'Daily Summary', 'Monthly Summary'],
     });
   } catch (err) {
-    if (err instanceof Error && (err.message.includes('Payment') || err.message.includes('cancelled'))) throw err;
+    if (
+      err instanceof Error &&
+      (err.message.includes('Payment') ||
+        err.message.includes('cancelled') ||
+        err.message.includes('already fully paid') ||
+        err.message.includes('Purchase not found'))
+    ) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/purchases/${purchase.id}`);
   }
 }
@@ -3510,20 +3663,49 @@ export async function settlePurchaseBalance(
 export async function cancelPurchase(uid: string, purchase: Purchase, reason = 'Cancelled by owner'): Promise<void> {
   if (purchase.status === 'cancelled') return;
 
-  const itemsQuery = query(shopCol(uid, 'purchaseItems'), where('ownerUid', '==', uid));
+  const itemsQuery = query(
+    shopCol(uid, 'purchaseItems'),
+    where('ownerUid', '==', uid),
+    where('purchaseId', '==', purchase.id)
+  );
   let items: PurchaseItem[] = [];
   let linkedBatchIds: string[] = [];
   try {
-    const [itemsSnap, batchesSnap] = await Promise.all([
-      getDocs(itemsQuery),
-      getDocs(query(shopCol(uid, 'inventoryBatches'), where('ownerUid', '==', uid))),
-    ]);
-    items = itemsSnap.docs
-      .map((d) => ({ id: d.id, ...(d.data() as Omit<PurchaseItem, 'id'>) }))
-      .filter((item) => item.purchaseId === purchase.id);
-    linkedBatchIds = batchesSnap.docs
-      .filter((d) => (d.data() as InventoryBatch).purchaseId === purchase.id)
-      .map((d) => d.id);
+    const itemsSnap = await getDocs(itemsQuery);
+    items = itemsSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<PurchaseItem, 'id'>) }));
+
+    const uniqueProdIdsForLookup = Array.from(new Set(items.map((item) => item.productId)));
+    const batchIdSet = new Set<string>();
+    if (uniqueProdIdsForLookup.length > 0) {
+      const batchSnaps = await Promise.all(
+        uniqueProdIdsForLookup.flatMap((pid) => [
+          getDocs(
+            query(
+              shopCol(uid, 'inventoryBatches'),
+              where('ownerUid', '==', uid),
+              where('productId', '==', pid),
+              where('status', '==', 'active')
+            )
+          ),
+          getDocs(
+            query(
+              shopCol(uid, 'inventoryBatches'),
+              where('ownerUid', '==', uid),
+              where('productId', '==', pid),
+              where('status', '==', 'exhausted')
+            )
+          ),
+        ])
+      );
+      for (const bSnap of batchSnaps) {
+        for (const d of bSnap.docs) {
+          if ((d.data() as InventoryBatch).purchaseId === purchase.id) {
+            batchIdSet.add(d.id);
+          }
+        }
+      }
+    }
+    linkedBatchIds = Array.from(batchIdSet);
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, `shops/${uid}/purchaseItems`);
   }
@@ -3531,6 +3713,7 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
   const todayIso = getKarachiDateIso();
 
   try {
+    let cancelledPurchaseNumber = purchase.purchaseNumber;
     await runTransaction(db, async (tx) => {
       const pRef = shopDoc(uid, 'purchases', purchase.id);
       const supRef = shopDoc(uid, 'suppliers', purchase.supplierId);
@@ -3542,9 +3725,15 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
         Promise.all(uniqueProdIds.map((pid) => tx.get(shopDoc(uid, 'products', pid)))),
         Promise.all(linkedBatchIds.map((bId) => tx.get(shopDoc(uid, 'inventoryBatches', bId)))),
       ]);
-      if (!pSnap.exists() || pSnap.data()?.status === 'cancelled') {
+      if (!pSnap.exists()) {
+        throw new Error('Purchase not found.');
+      }
+      const curP = pSnap.data() as Purchase;
+      if (curP.status === 'cancelled') {
         throw new Error('Purchase is already cancelled.');
       }
+      const purchaseNumber = curP.purchaseNumber || purchase.purchaseNumber;
+      cancelledPurchaseNumber = purchaseNumber;
 
       const prodMap = new Map<string, Product>();
       for (let i = 0; i < uniqueProdIds.length; i += 1) {
@@ -3561,7 +3750,7 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
           if (bData.status !== 'cancelled') {
             if (roundStockQty(bData.remainingBaseQty) < roundStockQty(bData.initialBaseQty)) {
               throw new Error(
-                `Cannot cancel purchase: some units from "${bData.productName}" (${purchase.purchaseNumber}) have already been sold or adjusted.`
+                `Cannot cancel purchase: some units from "${bData.productName}" (${purchaseNumber}) have already been sold or adjusted.`
               );
             }
             batchDocs.push(bData);
@@ -3602,7 +3791,7 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
             conversionFactor: item.conversionFactor ?? 1,
             baseQuantity: baseQty,
             referenceId: purchase.id,
-            notes: clip(`Reversed from cancelled purchase ${purchase.purchaseNumber}`, 500),
+            notes: clip(`Reversed from cancelled purchase ${purchaseNumber}`, 500),
             createdAt: serverTimestamp(),
           });
         }
@@ -3629,15 +3818,18 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
 
       if (supSnap.exists()) {
         const sup = supSnap.data() as Supplier;
+        const revTotal = roundMoney(curP.totalAmount || 0);
+        const revPaid = roundMoney(curP.amountPaid || 0);
+        const revDue = roundMoney(curP.balanceDue ?? Math.max(0, revTotal - revPaid));
         tx.update(supRef, {
-          totalPurchased: Math.max(0, roundMoney((sup.totalPurchased || 0) - purchase.totalAmount)),
-          totalPaid: Math.max(0, roundMoney((sup.totalPaid || 0) - purchase.amountPaid)),
-          outstandingBalance: Math.max(0, roundMoney((sup.outstandingBalance || 0) - purchase.balanceDue)),
+          totalPurchased: Math.max(0, roundMoney((sup.totalPurchased || 0) - revTotal)),
+          totalPaid: Math.max(0, roundMoney((sup.totalPaid || 0) - revPaid)),
+          outstandingBalance: Math.max(0, roundMoney((sup.outstandingBalance || 0) - revDue)),
           updatedAt: serverTimestamp(),
         });
       }
 
-      const notes = purchase.notes ? `${purchase.notes} | Cancelled: ${reason}` : `Cancelled: ${reason}`;
+      const notes = curP.notes ? `${curP.notes} | Cancelled: ${reason}` : `Cancelled: ${reason}`;
       tx.update(pRef, {
         status: 'cancelled',
         notes: clip(notes, 500),
@@ -3650,7 +3842,7 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
         action: 'CANCEL_PURCHASE',
         entityType: 'purchase',
         entityId: purchase.id,
-        summary: clip(`Cancelled purchase ${purchase.purchaseNumber} and reversed stock`, 400),
+        summary: clip(`Cancelled purchase ${purchaseNumber} and reversed stock`, 400),
         createdAt: serverTimestamp(),
       });
     });
@@ -3661,7 +3853,7 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
       entityType: 'purchase',
       entityId: purchase.id,
       action: 'CANCEL_PURCHASE',
-      summary: `Cancelled purchase ${purchase.purchaseNumber}`,
+      summary: `Cancelled purchase ${cancelledPurchaseNumber}`,
       targetSheets: [
         'Purchases',
         'Purchase Details',
@@ -3674,7 +3866,12 @@ export async function cancelPurchase(uid: string, purchase: Purchase, reason = '
       ],
     });
   } catch (err) {
-    if (err instanceof Error && (err.message.includes('Cannot cancel') || err.message.includes('already cancelled'))) {
+    if (
+      err instanceof Error &&
+      (err.message.includes('Cannot cancel') ||
+        err.message.includes('already cancelled') ||
+        err.message.includes('Purchase not found'))
+    ) {
       throw err;
     }
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/purchases/${purchase.id}`);

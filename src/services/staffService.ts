@@ -1,4 +1,4 @@
-import { createUserWithEmailAndPassword, signOut } from 'firebase/auth';
+import { createUserWithEmailAndPassword, deleteUser, signOut, type User } from 'firebase/auth';
 import {
   collection,
   doc,
@@ -105,8 +105,15 @@ function generateStaffSaleNumber(): string {
   const y = now.getFullYear().toString().slice(-2);
   const m = String(now.getMonth() + 1).padStart(2, '0');
   const d = String(now.getDate()).padStart(2, '0');
-  const rand = Math.floor(1000 + Math.random() * 9000);
-  return `SL-${y}${m}${d}-${rand}`;
+  const suffix = Math.random().toString(36).slice(2, 8).toUpperCase().padEnd(6, '0');
+  return `SL-${y}${m}${d}-${suffix}`;
+}
+
+export function toDeterministicStaffSaleId(clientRequestId?: string): string | null {
+  if (!clientRequestId) return null;
+  const cleaned = clientRequestId.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!cleaned) return null;
+  return `req_${cleaned}`.slice(0, 128);
 }
 
 export function getCatalogAllowedUids(staffList: StaffMember[]): string[] {
@@ -292,81 +299,104 @@ export async function createStaffMember(
 
   const syntheticEmail = buildStaffSyntheticEmail(usernameLower, 1, shopCode);
   const provisionAuth = getStaffProvisionAuth();
-  let staffAuthUid = '';
+  let createdAuthUser: User | null = null;
 
   try {
     const cred = await createUserWithEmailAndPassword(provisionAuth, syntheticEmail, input.password);
-    staffAuthUid = cred.user.uid;
-    await signOut(provisionAuth);
+    createdAuthUser = cred.user;
   } catch (err) {
     throw mapProvisionAuthError(err);
   }
 
+  const staffAuthUid = createdAuthUser.uid;
   const staffRef = doc(collection(db, 'shops', ownerUid, 'staff'));
+  const newStaffRecord: Omit<StaffMember, 'id'> = {
+    ownerUid,
+    shopId: ownerUid,
+    shopCode,
+    name,
+    phone,
+    username,
+    usernameLower,
+    authUid: staffAuthUid,
+    loginVersion: 1,
+    role: 'sales_staff',
+    isActive: true,
+    permissions: input.permissions,
+  };
 
   try {
-    const batch = writeBatch(db);
-    const newStaffRecord: Omit<StaffMember, 'id'> = {
-      ownerUid,
-      shopId: ownerUid,
-      shopCode,
-      name,
-      phone,
-      username,
-      usernameLower,
-      authUid: staffAuthUid,
-      loginVersion: 1,
-      role: 'sales_staff',
-      isActive: true,
-      permissions: input.permissions,
-    };
+    await runTransaction(db, async (tx) => {
+      const staffLookupRef = doc(db, 'staffLookup', lookupKey);
+      const staffUserLookupRef = doc(db, 'staffLookup', usernameLookupKey);
+      const adminLookupRef = doc(db, 'adminLookup', lookupKey);
+      const adminUserLookupRef = doc(db, 'adminLookup', usernameLookupKey);
 
-    batch.set(staffRef, {
-      ...newStaffRecord,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+      const [l1, l2, l3, l4] = await Promise.all([
+        tx.get(staffLookupRef),
+        tx.get(staffUserLookupRef),
+        tx.get(adminLookupRef),
+        tx.get(adminUserLookupRef),
+      ]);
+      if (l1.exists() || l2.exists() || l3.exists() || l4.exists()) {
+        throw new Error(`Username "${username}" is already registered. Choose a different username.`);
+      }
+
+      tx.set(staffRef, {
+        ...newStaffRecord,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      const lookupDocPayload = {
+        ownerUid,
+        shopId: ownerUid,
+        staffId: staffRef.id,
+        loginVersion: 1,
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      tx.set(staffLookupRef, lookupDocPayload);
+      tx.set(staffUserLookupRef, lookupDocPayload);
+
+      tx.set(doc(db, 'staffAuthMap', staffAuthUid), {
+        ownerUid,
+        shopId: ownerUid,
+        staffId: staffRef.id,
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(collection(db, 'shops', ownerUid, 'auditLogs')), {
+        ownerUid,
+        action: 'CREATE_STAFF',
+        entityType: 'staff',
+        entityId: staffRef.id,
+        summary: clip(`Added sales staff "${name}" (@${username})`, 400),
+        createdAt: serverTimestamp(),
+      });
     });
-
-    const lookupDocPayload = {
-      ownerUid,
-      shopId: ownerUid,
-      staffId: staffRef.id,
-      loginVersion: 1,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    };
-
-    batch.set(doc(db, 'staffLookup', lookupKey), lookupDocPayload);
-    batch.set(doc(db, 'staffLookup', usernameLookupKey), lookupDocPayload);
-
-    batch.set(doc(db, 'staffAuthMap', staffAuthUid), {
-      ownerUid,
-      shopId: ownerUid,
-      staffId: staffRef.id,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-
-    batch.set(doc(collection(db, 'shops', ownerUid, 'auditLogs')), {
-      ownerUid,
-      action: 'CREATE_STAFF',
-      entityType: 'staff',
-      entityId: staffRef.id,
-      summary: clip(`Added sales staff "${name}" (@${username})`, 400),
-      createdAt: serverTimestamp(),
-    });
-
-    await batch.commit();
-
-    const updatedStaffList: StaffMember[] = [...existingStaff, { id: staffRef.id, ...newStaffRecord }];
-    await syncStaffCatalogDocuments(ownerUid, products, updatedStaffList, existingCatalog);
-
-    return staffRef.id;
   } catch (err) {
+    try {
+      await deleteUser(createdAuthUser);
+    } catch {
+      // Best-effort rollback of provisioned auth account on Firestore failure
+    }
+    if (err instanceof Error && err.message.includes('already registered')) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.CREATE, `shops/${ownerUid}/staff/${staffRef.id}`);
+  } finally {
+    await signOut(provisionAuth).catch(() => {});
   }
+
+  const updatedStaffList: StaffMember[] = [...existingStaff, { id: staffRef.id, ...newStaffRecord }];
+  await syncStaffCatalogDocuments(ownerUid, products, updatedStaffList, existingCatalog);
+
+  return staffRef.id;
 }
 
 export async function updateStaffMember(
@@ -713,7 +743,10 @@ export async function createStaffSale(
   }
 
   const distinctProductIds = Array.from(new Set(Array.from(merged.values()).map((m) => m.productId)));
-  const saleRef = doc(collection(db, 'shops', shopId, 'staffSales'));
+  const deterministicId = toDeterministicStaffSaleId(input.clientRequestId);
+  const saleRef = deterministicId
+    ? doc(db, 'shops', shopId, 'staffSales', deterministicId)
+    : doc(collection(db, 'shops', shopId, 'staffSales'));
   const saleNumber = input.saleNumber?.trim() || generateStaffSaleNumber();
   const saleDateTime = input.saleDateTime?.trim() || formatDateTimeKarachi(new Date());
 
@@ -891,6 +924,21 @@ export async function createStaffSale(
 
     return saleRef.id;
   } catch (err) {
+    if (deterministicId) {
+      try {
+        const existingSnap = await getDoc(saleRef);
+        const existingData = existingSnap.exists() ? (existingSnap.data() as Partial<StaffSale>) : null;
+        if (
+          existingData &&
+          existingData.ownerUid === shopId &&
+          existingData.staffAuthUid === staff.authUid
+        ) {
+          return saleRef.id;
+        }
+      } catch {
+        // Fall through to normal error handling when duplicate check is not applicable
+      }
+    }
     if (
       err instanceof Error &&
       (err.message.includes('Insufficient stock') ||

@@ -76,7 +76,7 @@ export function CompactSaleItemsList({
   }
 
   return (
-    <div className="border border-[var(--cm-border)] rounded-xl bg-[var(--cm-bg-surface)] overflow-hidden">
+    <div className="border border-[var(--cm-border)] rounded-xl bg-[var(--cm-bg-surface)] overflow-x-clip touch-pan-y">
       {/* Sticky Compact Column Header (Desktop) */}
       <div className="hidden sm:grid sm:grid-cols-12 items-center gap-2 px-3.5 py-2 bg-[var(--cm-bg-subtle)] border-b border-[var(--cm-border)] text-[11px] font-semibold text-[var(--cm-text-muted)]">
         <div className="col-span-5">Product ({formatNumber(items.length)})</div>

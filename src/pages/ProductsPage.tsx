@@ -66,7 +66,7 @@ import {
   normalizeTemplateKey,
   queryTemplateIndex,
   suggestCategoryAndBrandFromName,
-} from '../utils/productTemplates';
+} from '../utils/productTemplateHelpers';
 
 interface PackagingFormRow {
   key: string;
@@ -224,7 +224,8 @@ interface ProductsPageProps {
 export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) {
   const { user, shopId } = useAuth();
   const activeShopId = shopId || user?.uid || '';
-  const { products, categories, brands, productTemplates, suppliers, settings } = useShopData();
+  const { products, categories, brands, productTemplates, suppliers, settings, saleItems, purchaseItems } =
+    useShopData();
   const { showToast } = useToast();
 
   const [search, setSearch] = useState('');
@@ -1362,10 +1363,24 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
                           </button>
                           <button
                             type="button"
-                            onClick={() => {
-                              if (activeShopId) {
-                                void deleteProduct(activeShopId, p);
+                            onClick={async () => {
+                              if (!activeShopId) return;
+                              const hasHistoricalTransactions =
+                                saleItems.some((item) => item.productId === p.id) ||
+                                purchaseItems.some((item) => item.productId === p.id);
+                              try {
+                                await deleteProduct(activeShopId, p, { hasHistoricalTransactions });
                                 showToast({ title: 'Product deleted', message: p.name, tone: 'info' });
+                              } catch (err) {
+                                showToast({
+                                  title: 'Cannot delete product',
+                                  message:
+                                    err instanceof Error
+                                      ? err.message
+                                      : 'Archive the product instead to preserve history.',
+                                  tone: 'warning',
+                                  durationMs: 5000,
+                                });
                               }
                             }}
                             className="min-h-[36px] px-3 py-1.5 text-xs font-medium text-[var(--cm-danger)] bg-[var(--cm-danger-soft)] border border-[var(--cm-danger-border)] rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
@@ -1528,7 +1543,26 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
                               </button>
                               <button
                                 type="button"
-                                onClick={() => activeShopId && void deleteProduct(activeShopId, p)}
+                                onClick={async () => {
+                                  if (!activeShopId) return;
+                                  const hasHistoricalTransactions =
+                                    saleItems.some((item) => item.productId === p.id) ||
+                                    purchaseItems.some((item) => item.productId === p.id);
+                                  try {
+                                    await deleteProduct(activeShopId, p, { hasHistoricalTransactions });
+                                    showToast({ title: 'Product deleted', message: p.name, tone: 'info' });
+                                  } catch (err) {
+                                    showToast({
+                                      title: 'Cannot delete product',
+                                      message:
+                                        err instanceof Error
+                                          ? err.message
+                                          : 'Archive the product instead to preserve history.',
+                                      tone: 'warning',
+                                      durationMs: 5000,
+                                    });
+                                  }
+                                }}
                                 className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] rounded cursor-pointer"
                                 title="Delete product"
                               >

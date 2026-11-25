@@ -4,6 +4,7 @@ import { CompactExpandableRow, CompactSection } from '../components/CompactSecti
 import { SearchableSelect, type SearchableSelectOption } from '../components/SearchableSelect';
 import { useAuth } from '../contexts/AuthContext';
 import { useShopData } from '../contexts/ShopDataContext';
+import { useToast } from '../contexts/ToastContext';
 import { computeTopActivityValues } from '../services/recordSearchService';
 import type { PaymentMethod } from '../types/shop';
 import { addDaysToIso, getKarachiDateIso } from '../utils/formatters';
@@ -36,6 +37,8 @@ const REPORT_TYPES: Array<{ id: ReportType; label: string; description: string }
 export function ReportsPage() {
   const { user, shopId } = useAuth();
   const activeShopId = shopId || user?.uid || '';
+  const { showToast } = useToast();
+  const [exportingFormat, setExportingFormat] = useState<'pdf' | 'excel' | null>(null);
   const {
     products,
     categories,
@@ -348,19 +351,43 @@ export function ReportsPage() {
             )}
             <button
               type="button"
-              onClick={() => exportReportPDF(report, shopName)}
-              className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs sm:text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg transition-colors cursor-pointer"
+              disabled={exportingFormat !== null}
+              onClick={() => {
+                setExportingFormat('pdf');
+                void exportReportPDF(report, shopName)
+                  .catch((err) => {
+                    showToast({
+                      title: 'PDF export failed',
+                      message: err instanceof Error ? err.message : 'Unable to generate PDF report.',
+                      tone: 'error',
+                    });
+                  })
+                  .finally(() => setExportingFormat(null));
+              }}
+              className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs sm:text-sm font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] disabled:opacity-60 rounded-lg transition-colors cursor-pointer"
             >
               <FileText className="w-4 h-4" />
-              PDF
+              {exportingFormat === 'pdf' ? 'Exporting...' : 'PDF'}
             </button>
             <button
               type="button"
-              onClick={() => exportReportExcel(report, shopName)}
-              className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs sm:text-sm font-semibold text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] rounded-lg transition-colors cursor-pointer"
+              disabled={exportingFormat !== null}
+              onClick={() => {
+                setExportingFormat('excel');
+                void exportReportExcel(report, shopName)
+                  .catch((err) => {
+                    showToast({
+                      title: 'Excel export failed',
+                      message: err instanceof Error ? err.message : 'Unable to generate Excel report.',
+                      tone: 'error',
+                    });
+                  })
+                  .finally(() => setExportingFormat(null));
+              }}
+              className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] sm:min-h-[36px] text-xs sm:text-sm font-semibold text-[var(--cm-text-secondary)] bg-[var(--cm-bg-surface)] border border-[var(--cm-border)] hover:bg-[var(--cm-bg-hover)] disabled:opacity-60 rounded-lg transition-colors cursor-pointer"
             >
               <FileSpreadsheet className="w-4 h-4 text-[var(--cm-success)]" />
-              Excel
+              {exportingFormat === 'excel' ? 'Exporting...' : 'Excel'}
             </button>
           </div>
         </div>

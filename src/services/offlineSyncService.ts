@@ -11,7 +11,7 @@ import type {
 } from '../types/shop';
 import { formatDateTimeKarachi, normalizeCustomerWhatsapp, roundMoney } from '../utils/formatters';
 import { getAllowedSaleUnits, getEffectiveBaseUnit, roundStockQty } from '../utils/packaging';
-import { createStaffSale } from './staffService';
+import { createStaffSale, toDeterministicStaffSaleId } from './staffService';
 
 const SESSION_CACHE_PREFIX = 'cm_offline_staff_session_';
 const CATALOG_CACHE_PREFIX = 'cm_offline_staff_catalog_';
@@ -429,8 +429,8 @@ export function generateOfflineSaleNumber(): string {
   const y = now.getFullYear().toString().slice(-2);
   const m = String(now.getMonth() + 1).padStart(2, '0');
   const d = String(now.getDate()).padStart(2, '0');
-  const rand = Math.floor(1000 + Math.random() * 9000);
-  return `SL-${y}${m}${d}-${rand}`;
+  const suffix = Math.random().toString(36).slice(2, 8).toUpperCase().padEnd(6, '0');
+  return `SL-${y}${m}${d}-${suffix}`;
 }
 
 export function getQueuedOfflineSales(
@@ -708,7 +708,7 @@ export async function syncQueuedOfflineSales(
       };
     }
 
-    const remoteSaleNumbers = new Set(existingRemoteSales.map((s) => s.saleNumber));
+    const remoteSaleIds = new Set(existingRemoteSales.map((s) => s.id));
     let queue = getQueuedOfflineSales(shopId, staff.authUid);
     const targets = queue.filter((q) => {
       if (options?.onlyLocalId) return q.localId === options.onlyLocalId;
@@ -726,8 +726,9 @@ export async function syncQueuedOfflineSales(
         break;
       }
 
-      // Deduplication check: if this offline sale number already committed on Firestore
-      if (remoteSaleNumbers.has(item.saleNumber)) {
+      const deterministicId = toDeterministicStaffSaleId(item.localId);
+      // Deduplication check: ONLY skip if this exact clientRequestId document already exists in Firestore
+      if (deterministicId && remoteSaleIds.has(deterministicId)) {
         queue = removeQueuedOfflineSale(shopId, staff.authUid, item.localId);
         options?.onQueueUpdated?.(queue);
         syncedCount += 1;
@@ -741,7 +742,7 @@ export async function syncQueuedOfflineSales(
       options?.onQueueUpdated?.(queue);
 
       try {
-        await createStaffSale(shopId, staff, {
+        const committedId = await createStaffSale(shopId, staff, {
           saleDate: item.saleDate,
           paymentMethod: item.paymentMethod,
           customerWhatsapp: item.customerWhatsapp,
@@ -757,7 +758,7 @@ export async function syncQueuedOfflineSales(
           })),
         });
 
-        remoteSaleNumbers.add(item.saleNumber);
+        remoteSaleIds.add(committedId);
         queue = removeQueuedOfflineSale(shopId, staff.authUid, item.localId);
         options?.onQueueUpdated?.(queue);
         syncedCount += 1;

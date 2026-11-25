@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Layout } from './components/Layout';
 import { LoginScreen } from './components/LoginScreen';
@@ -8,21 +8,56 @@ import { OfflineSyncProvider } from './contexts/OfflineSyncContext';
 import { ShopDataProvider, useShopData } from './contexts/ShopDataContext';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ToastProvider, useToast } from './contexts/ToastContext';
-import { ActivityLogsPage } from './pages/ActivityLogsPage';
-import { AnalyticsPage } from './pages/AnalyticsPage';
-import { DashboardPage } from './pages/DashboardPage';
-import { ExpensesPage } from './pages/ExpensesPage';
-import { InventoryPage } from './pages/InventoryPage';
-import { ProductsPage } from './pages/ProductsPage';
-import { PurchasesPage } from './pages/PurchasesPage';
-import { ReportsPage } from './pages/ReportsPage';
-import { SalesPage } from './pages/SalesPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { StaffManagementPage } from './pages/StaffManagementPage';
-import { StaffPortalView } from './pages/StaffPortalView';
-import { StockAdjustmentsPage } from './pages/StockAdjustmentsPage';
 import { initializeDiscordQueueWorker } from './services/discordNotificationService';
 import type { NavSection, StaffPortalSection } from './types/shop';
+
+const ActivityLogsPage = lazy(() =>
+  import('./pages/ActivityLogsPage').then((m) => ({ default: m.ActivityLogsPage }))
+);
+const AnalyticsPage = lazy(() =>
+  import('./pages/AnalyticsPage').then((m) => ({ default: m.AnalyticsPage }))
+);
+const DashboardPage = lazy(() =>
+  import('./pages/DashboardPage').then((m) => ({ default: m.DashboardPage }))
+);
+const ExpensesPage = lazy(() =>
+  import('./pages/ExpensesPage').then((m) => ({ default: m.ExpensesPage }))
+);
+const InventoryPage = lazy(() =>
+  import('./pages/InventoryPage').then((m) => ({ default: m.InventoryPage }))
+);
+const ProductsPage = lazy(() =>
+  import('./pages/ProductsPage').then((m) => ({ default: m.ProductsPage }))
+);
+const PurchasesPage = lazy(() =>
+  import('./pages/PurchasesPage').then((m) => ({ default: m.PurchasesPage }))
+);
+const ReportsPage = lazy(() =>
+  import('./pages/ReportsPage').then((m) => ({ default: m.ReportsPage }))
+);
+const SalesPage = lazy(() =>
+  import('./pages/SalesPage').then((m) => ({ default: m.SalesPage }))
+);
+const SettingsPage = lazy(() =>
+  import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage }))
+);
+const StaffManagementPage = lazy(() =>
+  import('./pages/StaffManagementPage').then((m) => ({ default: m.StaffManagementPage }))
+);
+const StaffPortalView = lazy(() =>
+  import('./pages/StaffPortalView').then((m) => ({ default: m.StaffPortalView }))
+);
+const StockAdjustmentsPage = lazy(() =>
+  import('./pages/StockAdjustmentsPage').then((m) => ({ default: m.StockAdjustmentsPage }))
+);
+
+function PageSuspenseFallback() {
+  return (
+    <div className="cm-surface border rounded-xl p-6 text-sm text-[var(--cm-text-secondary)]">
+      Loading view...
+    </div>
+  );
+}
 
 const RESTRICTED_STAFF_PREFIXES = [
   '/admin',
@@ -194,7 +229,9 @@ function MainApp() {
             activeSection={staffSection}
             onNavigate={(s) => setStaffSection(s as StaffPortalSection)}
           >
-            <StaffPortalView activeSection={staffSection} onNavigate={setStaffSection} />
+            <Suspense fallback={<PageSuspenseFallback />}>
+              <StaffPortalView activeSection={staffSection} onNavigate={setStaffSection} />
+            </Suspense>
           </Layout>
         </OfflineSyncProvider>
       </ShopDataProvider>
@@ -260,7 +297,7 @@ function MainApp() {
             activeSection={activeSection}
             onNavigate={(s) => setActiveSection(s as NavSection)}
           >
-            {renderOwnerPage()}
+            <Suspense fallback={<PageSuspenseFallback />}>{renderOwnerPage()}</Suspense>
           </Layout>
         </GoogleSheetsSyncProvider>
       </OfflineSyncProvider>

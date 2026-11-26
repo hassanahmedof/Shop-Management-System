@@ -11,10 +11,18 @@ import {
   type SheetTabDefinition,
   type SheetTabName,
 } from '../shared/googleSheetsSchema.ts';
+import {
+  backupAndUpgradeVaultFileToV2,
+  getRequiredSecret,
+  readAndDecryptVaultFile,
+  writeVaultFileAtomic,
+} from './vaultCrypto.ts';
 
 const SHEETS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
 const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 const VAULT_DIR = path.resolve(process.cwd(), '.caremart-secrets');
+const SA_VAULT_HKDF_INFO = 'caremart:service-account-vault:v2';
+const SA_VAULT_V1_PREFIX = 'caremart-service-account-vault:v1';
 
 interface ParsedServiceAccount {
   clientEmail: string;
@@ -35,17 +43,6 @@ let cachedServiceAccountToken: {
   clientEmail: string;
   ownerKey: string;
 } | null = null;
-
-function getVaultEncryptionKey(): Buffer {
-  const secretSeed =
-    (process.env.SERVICE_ACCOUNT_ENCRYPTION_KEY || '').trim() ||
-    (process.env.OWNER_GATE_SECRET || '').trim() ||
-    'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301';
-  return crypto
-    .createHash('sha256')
-    .update(`caremart-service-account-vault:v1:${secretSeed}`)
-    .digest();
-}
 
 function getVaultFilePath(ownerUid: string): string {
   const uidHash = crypto.createHash('sha256').update(ownerUid).digest('hex').slice(0, 24);
@@ -170,37 +167,20 @@ function readServiceAccountFromVault(ownerUid?: string): ServiceAccountParseResu
     return { account: null, status: 'not_configured', diagnostic: null };
   }
   const filePath = getVaultFilePath(ownerUid);
-  if (!fs.existsSync(filePath)) {
-    return { account: null, status: 'not_configured', diagnostic: null };
+  const decryptedRes = readAndDecryptVaultFile(filePath, SA_VAULT_HKDF_INFO, SA_VAULT_V1_PREFIX);
+  if (!decryptedRes.ok) {
+    if (decryptedRes.reason === 'not_found') {
+      return { account: null, status: 'not_configured', diagnostic: null };
+    }
+    return {
+      account: null,
+      status: 'invalid_format',
+      diagnostic: decryptedRes.diagnostic,
+    };
   }
 
   try {
-    const envelope = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
-      v?: number;
-      iv?: string;
-      tag?: string;
-      data?: string;
-    };
-    if (!envelope.iv || !envelope.tag || !envelope.data) {
-      return {
-        account: null,
-        status: 'invalid_format',
-        diagnostic: 'Saved server Service Account vault file is incomplete. Please re-save it in Settings.',
-      };
-    }
-    const key = getVaultEncryptionKey();
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      key,
-      Buffer.from(envelope.iv, 'base64')
-    );
-    decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
-    const decrypted = Buffer.concat([
-      decipher.update(Buffer.from(envelope.data, 'base64')),
-      decipher.final(),
-    ]).toString('utf8');
-
-    const payload = JSON.parse(decrypted) as ParsedServiceAccount;
+    const payload = JSON.parse(decryptedRes.plaintext) as ParsedServiceAccount;
     if (!payload.clientEmail || !payload.privateKey) {
       return {
         account: null,
@@ -208,13 +188,20 @@ function readServiceAccountFromVault(ownerUid?: string): ServiceAccountParseResu
         diagnostic: 'Saved server Service Account credentials are incomplete.',
       };
     }
+
+    const account: ParsedServiceAccount = {
+      clientEmail: payload.clientEmail,
+      privateKey: payload.privateKey,
+      tokenUri: payload.tokenUri || 'https://oauth2.googleapis.com/token',
+      projectId: payload.projectId || null,
+    };
+
+    if (decryptedRes.formatVersion === 1 || decryptedRes.usedLegacyKey) {
+      backupAndUpgradeVaultFileToV2(filePath, JSON.stringify(account), SA_VAULT_HKDF_INFO);
+    }
+
     return {
-      account: {
-        clientEmail: payload.clientEmail,
-        privateKey: payload.privateKey,
-        tokenUri: payload.tokenUri || 'https://oauth2.googleapis.com/token',
-        projectId: payload.projectId || null,
-      },
+      account,
       status: 'active',
       diagnostic: null,
     };
@@ -222,7 +209,7 @@ function readServiceAccountFromVault(ownerUid?: string): ServiceAccountParseResu
     return {
       account: null,
       status: 'invalid_format',
-      diagnostic: 'Saved server Service Account credentials could not be decrypted. Please re-save in Settings.',
+      diagnostic: 'Saved server Service Account credentials are malformed. Original file was preserved untouched.',
     };
   }
 }
@@ -333,6 +320,18 @@ export async function saveServiceAccountForOwner(
   if (!ownerUid) {
     throw new GoogleSheetsApiError('Owner UID is required.', 401, 'GOOGLE_PERMISSION_DENIED');
   }
+  try {
+    getRequiredSecret('SERVICE_ACCOUNT_ENCRYPTION_KEY');
+  } catch (err) {
+    throw new GoogleSheetsApiError(
+      err instanceof Error
+        ? err.message
+        : 'SERVICE_ACCOUNT_ENCRYPTION_KEY is missing or invalid on the server.',
+      503,
+      'GOOGLE_API_ERROR'
+    );
+  }
+
   const parsed = parseServiceAccountInput(rawJsonInput, 'Google Service Account JSON');
   if (!parsed.account) {
     throw new GoogleSheetsApiError(
@@ -345,36 +344,21 @@ export async function saveServiceAccountForOwner(
   // Verify credentials live against Google OAuth token endpoint before encrypting and saving
   await mintServiceAccountAccessToken(parsed.account, ownerUid, true);
 
-  fs.mkdirSync(VAULT_DIR, { recursive: true, mode: 0o700 });
-  const key = getVaultEncryptionKey();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const plaintext = JSON.stringify({
     clientEmail: parsed.account.clientEmail,
     privateKey: parsed.account.privateKey,
     tokenUri: parsed.account.tokenUri,
     projectId: parsed.account.projectId,
   });
-  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  const authTag = cipher.getAuthTag();
 
   const filePath = getVaultFilePath(ownerUid);
-  fs.writeFileSync(
-    filePath,
-    JSON.stringify({
-      v: 1,
-      iv: iv.toString('base64'),
-      tag: authTag.toString('base64'),
-      data: encrypted.toString('base64'),
-      updatedAt: new Date().toISOString(),
-    }),
-    { encoding: 'utf8', mode: 0o600 }
-  );
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-    // Ignore chmod error on platforms without POSIX mode support
-  }
+  const existingUnreadable =
+    fs.existsSync(filePath) &&
+    !readAndDecryptVaultFile(filePath, SA_VAULT_HKDF_INFO, SA_VAULT_V1_PREFIX).ok;
+
+  writeVaultFileAtomic(filePath, plaintext, SA_VAULT_HKDF_INFO, {
+    preserveUnreadableBackup: existingUnreadable,
+  });
 
   return {
     serviceAccountConfigured: true,

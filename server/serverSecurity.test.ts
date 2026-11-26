@@ -39,8 +39,25 @@ describe('server HTTP security & verification gates', () => {
   let docMap: Map<string, Record<string, unknown>>;
   let saleItemsMap: Map<string, Array<Record<string, unknown>>>;
   let suggestSpy: ReturnType<typeof vi.fn>;
+  let prevEnv: {
+    OWNER_GATE_SECRET?: string;
+    SESSION_SECRET?: string;
+    SERVICE_ACCOUNT_ENCRYPTION_KEY?: string;
+  };
 
   beforeEach(() => {
+    prevEnv = {
+      OWNER_GATE_SECRET: process.env.OWNER_GATE_SECRET,
+      SESSION_SECRET: process.env.SESSION_SECRET,
+      SERVICE_ACCOUNT_ENCRYPTION_KEY: process.env.SERVICE_ACCOUNT_ENCRYPTION_KEY,
+    };
+    process.env.OWNER_GATE_SECRET =
+      'test-owner-gate-secret-0123456789abcdef0123456789abcdef01234567';
+    process.env.SESSION_SECRET =
+      'test-session-secret-0123456789abcdef0123456789abcdef0123456789abcd';
+    process.env.SERVICE_ACCOUNT_ENCRYPTION_KEY =
+      'test-vault-enc-key-0123456789abcdef0123456789abcdef0123456789abcd';
+
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'caremart-server-sec-'));
     docMap = new Map<string, Record<string, unknown>>([
       ['appState/ownerSetup', { ownerUid: OWNER_UID, initialized: true }],
@@ -98,6 +115,14 @@ describe('server HTTP security & verification gates', () => {
       await activeServer.close();
       activeServer = null;
     }
+    if (prevEnv.OWNER_GATE_SECRET === undefined) delete process.env.OWNER_GATE_SECRET;
+    else process.env.OWNER_GATE_SECRET = prevEnv.OWNER_GATE_SECRET;
+    if (prevEnv.SESSION_SECRET === undefined) delete process.env.SESSION_SECRET;
+    else process.env.SESSION_SECRET = prevEnv.SESSION_SECRET;
+    if (prevEnv.SERVICE_ACCOUNT_ENCRYPTION_KEY === undefined)
+      delete process.env.SERVICE_ACCOUNT_ENCRYPTION_KEY;
+    else process.env.SERVICE_ACCOUNT_ENCRYPTION_KEY = prevEnv.SERVICE_ACCOUNT_ENCRYPTION_KEY;
+
     resetServerCooccurrenceStore(OWNER_UID, tempDir);
     resetServerFeedbackStore(OWNER_UID, tempDir);
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -451,5 +476,59 @@ describe('server HTTP security & verification gates', () => {
     }
     expect(limitedStatus).toBe(429);
     expect(suggestSpy).toHaveBeenCalledTimes(15);
+  });
+
+  it('refuses to start server app when OWNER_GATE_SECRET, SESSION_SECRET, or SERVICE_ACCOUNT_ENCRYPTION_KEY is missing', () => {
+    delete process.env.OWNER_GATE_SECRET;
+    expect(() => createCaremartApp(makeDeps())).toThrow(/OWNER_GATE_SECRET/);
+
+    process.env.OWNER_GATE_SECRET =
+      'test-owner-gate-secret-0123456789abcdef0123456789abcdef01234567';
+    delete process.env.SESSION_SECRET;
+    expect(() => createCaremartApp(makeDeps())).toThrow(/SESSION_SECRET/);
+
+    process.env.SESSION_SECRET =
+      'test-session-secret-0123456789abcdef0123456789abcdef0123456789abcd';
+    delete process.env.SERVICE_ACCOUNT_ENCRYPTION_KEY;
+    expect(() => createCaremartApp(makeDeps())).toThrow(/SERVICE_ACCOUNT_ENCRYPTION_KEY/);
+  });
+
+  it('issues and verifies staff session cookies using explicit SESSION_SECRET and rejects after rotation', async () => {
+    activeServer = await startTestServer(makeDeps());
+
+    const verifyRes = await fetch(`${activeServer.baseUrl}/api/auth/verify-staff`, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer staff-token',
+      },
+    });
+    expect(verifyRes.status).toBe(200);
+    const setCookie = verifyRes.headers.get('set-cookie') || '';
+    expect(setCookie).toContain('caremart_session=');
+    const cookiePair = setCookie.split(';')[0];
+
+    const sessionOk = await fetch(`${activeServer.baseUrl}/api/auth/session`, {
+      headers: { Cookie: cookiePair },
+    });
+    expect(sessionOk.status).toBe(200);
+    const sessionBody = (await sessionOk.json()) as {
+      authenticated: boolean;
+      uid: string;
+      role: string;
+      shopId: string;
+    };
+    expect(sessionBody).toEqual({
+      authenticated: true,
+      uid: STAFF_UID,
+      role: 'sales_staff',
+      shopId: OWNER_UID,
+    });
+
+    process.env.SESSION_SECRET =
+      'rotated-session-secret-9999999999abcdef9999999999abcdef99999999';
+    const sessionAfterRotate = await fetch(`${activeServer.baseUrl}/api/auth/session`, {
+      headers: { Cookie: cookiePair },
+    });
+    expect(sessionAfterRotate.status).toBe(401);
   });
 });

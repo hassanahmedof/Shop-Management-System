@@ -8,8 +8,16 @@ import type {
   DiscordSaleNotificationPayload,
   DiscordTransactionNotificationPayload,
 } from '../shared/discordSchema.ts';
+import {
+  backupAndUpgradeVaultFileToV2,
+  getRequiredSecret,
+  readAndDecryptVaultFile,
+  writeVaultFileAtomic,
+} from './vaultCrypto.ts';
 
 const VAULT_DIR = path.resolve(process.cwd(), '.caremart-secrets');
+const DISCORD_VAULT_HKDF_INFO = 'caremart:discord-webhook-vault:v2';
+const DISCORD_VAULT_V1_PREFIX = 'caremart-discord-webhook-vault:v1';
 const DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const DEDUPE_MAX_ENTRIES = 5000;
 const DISCORD_REQUEST_TIMEOUT_MS = 8500;
@@ -49,17 +57,6 @@ interface WebhookParseResult {
   url: string | null;
   status: DiscordConfigStatus;
   diagnostic: string | null;
-}
-
-function getVaultEncryptionKey(): Buffer {
-  const secretSeed =
-    (process.env.SERVICE_ACCOUNT_ENCRYPTION_KEY || '').trim() ||
-    (process.env.OWNER_GATE_SECRET || '').trim() ||
-    'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301';
-  return crypto
-    .createHash('sha256')
-    .update(`caremart-discord-webhook-vault:v1:${secretSeed}`)
-    .digest();
 }
 
 function getDiscordVaultFilePath(shopId: string): string {
@@ -158,45 +155,41 @@ function readWebhookFromVault(shopId?: string): WebhookParseResult {
     return { url: null, status: 'not_configured', diagnostic: null };
   }
   const filePath = getDiscordVaultFilePath(shopId);
-  if (!fs.existsSync(filePath)) {
-    return { url: null, status: 'not_configured', diagnostic: null };
+  const decryptedRes = readAndDecryptVaultFile(
+    filePath,
+    DISCORD_VAULT_HKDF_INFO,
+    DISCORD_VAULT_V1_PREFIX
+  );
+  if (!decryptedRes.ok) {
+    if (decryptedRes.reason === 'not_found') {
+      return { url: null, status: 'not_configured', diagnostic: null };
+    }
+    return {
+      url: null,
+      status: 'invalid_format',
+      diagnostic: decryptedRes.diagnostic,
+    };
   }
 
   try {
-    const envelope = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
-      v?: number;
-      iv?: string;
-      tag?: string;
-      data?: string;
-    };
-    if (!envelope.iv || !envelope.tag || !envelope.data) {
-      return {
-        url: null,
-        status: 'invalid_format',
-        diagnostic: 'Saved Discord webhook vault file is incomplete. Please re-save it in Settings.',
-      };
+    const payload = JSON.parse(decryptedRes.plaintext) as { webhookUrl?: unknown };
+    const urlStr = typeof payload?.webhookUrl === 'string' ? payload.webhookUrl : '';
+    const parsed = parseDiscordWebhookUrl(urlStr, 'Saved Discord Webhook');
+
+    if (parsed.url && (decryptedRes.formatVersion === 1 || decryptedRes.usedLegacyKey)) {
+      backupAndUpgradeVaultFileToV2(
+        filePath,
+        JSON.stringify({ webhookUrl: parsed.url }),
+        DISCORD_VAULT_HKDF_INFO
+      );
     }
 
-    const key = getVaultEncryptionKey();
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      key,
-      Buffer.from(envelope.iv, 'base64')
-    );
-    decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
-    const decrypted = Buffer.concat([
-      decipher.update(Buffer.from(envelope.data, 'base64')),
-      decipher.final(),
-    ]).toString('utf8');
-
-    const payload = JSON.parse(decrypted) as { webhookUrl?: unknown };
-    const urlStr = typeof payload?.webhookUrl === 'string' ? payload.webhookUrl : '';
-    return parseDiscordWebhookUrl(urlStr, 'Saved Discord Webhook');
+    return parsed;
   } catch {
     return {
       url: null,
       status: 'invalid_format',
-      diagnostic: 'Saved Discord webhook could not be decrypted. Please re-save it in Settings.',
+      diagnostic: 'Saved Discord webhook payload is malformed. Original file was preserved untouched.',
     };
   }
 }
@@ -369,6 +362,8 @@ export async function saveDiscordWebhookForOwner(
     throw new Error('Shop ID is required.');
   }
 
+  getRequiredSecret('SERVICE_ACCOUNT_ENCRYPTION_KEY');
+
   const parsed = parseDiscordWebhookUrl(rawWebhookUrl, 'Discord Webhook URL');
   if (!parsed.url) {
     throw new Error(parsed.diagnostic || 'Invalid Discord webhook URL.');
@@ -397,31 +392,17 @@ export async function saveDiscordWebhookForOwner(
     );
   }
 
-  fs.mkdirSync(VAULT_DIR, { recursive: true, mode: 0o700 });
-  const key = getVaultEncryptionKey();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const plaintext = JSON.stringify({ webhookUrl: parsed.url });
-  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-
   const filePath = getDiscordVaultFilePath(shopId);
-  fs.writeFileSync(
+  const existingUnreadable =
+    fs.existsSync(filePath) &&
+    !readAndDecryptVaultFile(filePath, DISCORD_VAULT_HKDF_INFO, DISCORD_VAULT_V1_PREFIX).ok;
+
+  writeVaultFileAtomic(
     filePath,
-    JSON.stringify({
-      v: 1,
-      iv: iv.toString('base64'),
-      tag: authTag.toString('base64'),
-      data: encrypted.toString('base64'),
-      updatedAt: new Date().toISOString(),
-    }),
-    { encoding: 'utf8', mode: 0o600 }
+    JSON.stringify({ webhookUrl: parsed.url }),
+    DISCORD_VAULT_HKDF_INFO,
+    { preserveUnreadableBackup: existingUnreadable }
   );
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-    // Ignore chmod error on platforms without POSIX mode support
-  }
 
   return getDiscordCapabilities(shopId);
 }

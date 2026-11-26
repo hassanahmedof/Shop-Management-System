@@ -23,6 +23,7 @@ import {
   saveServiceAccountForOwner,
   syncSpreadsheetTabs,
 } from './server/googleSheetsService.ts';
+import { getRequiredSecret, validateRequiredSecrets } from './server/vaultCrypto.ts';
 import {
   sanitizeUpsellRequestInput,
   suggestUpsellWithGemini,
@@ -83,15 +84,6 @@ const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
 const firebaseConfig: FirebaseAppletConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 const FIRESTORE_DB_ID = firebaseConfig.firestoreDatabaseId || '(default)';
 
-const OWNER_GATE_SECRET =
-  (process.env.OWNER_GATE_SECRET || '').trim() || 'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301';
-const SESSION_SECRET =
-  (process.env.SESSION_SECRET || '').trim() ||
-  crypto
-    .createHash('sha256')
-    .update(`${OWNER_GATE_SECRET}:${firebaseConfig.projectId}:session`)
-    .digest('hex');
-
 const SESSION_COOKIE_NAME = 'caremart_session';
 const JWKS_URL =
   'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
@@ -111,9 +103,10 @@ function getConfiguredOwnerEmail(): string {
 }
 
 function computeOwnerProof(uid: string, email: string): string {
+  const gateSecret = getRequiredSecret('OWNER_GATE_SECRET');
   return crypto
     .createHash('sha256')
-    .update(`${uid}:${email.toLowerCase()}:${OWNER_GATE_SECRET}`)
+    .update(`${uid}:${email.toLowerCase()}:${gateSecret}`)
     .digest('hex')
     .toLowerCase();
 }
@@ -242,8 +235,9 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
 }
 
 function signSessionToken(payload: SessionPayload): string {
+  const sessionSecret = getRequiredSecret('SESSION_SECRET');
   const data = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
+  const sig = crypto.createHmac('sha256', sessionSecret).update(data).digest('base64url');
   return `${data}.${sig}`;
 }
 
@@ -252,7 +246,8 @@ function verifySessionToken(token: string | undefined): SessionPayload | null {
   const parts = token.split('.');
   if (parts.length !== 2) return null;
   const [data, sig] = parts;
-  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
+  const sessionSecret = getRequiredSecret('SESSION_SECRET');
+  const expectedSig = crypto.createHmac('sha256', sessionSecret).update(data).digest('base64url');
   const sigBuf = Buffer.from(sig);
   const expectedBuf = Buffer.from(expectedSig);
   if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
@@ -748,6 +743,7 @@ async function requireStaffMiddleware(
 }
 
 export function createCaremartApp(overrides: Partial<ServerDependencies> = {}) {
+  validateRequiredSecrets();
   const deps: ServerDependencies = {
     verifyFirebaseIdToken,
     firestoreGetDoc,
@@ -2313,6 +2309,7 @@ export function createCaremartApp(overrides: Partial<ServerDependencies> = {}) {
 }
 
 async function startServer() {
+  validateRequiredSecrets();
   const app = createCaremartApp();
 
   if (process.env.NODE_ENV !== 'production') {
@@ -2337,5 +2334,8 @@ async function startServer() {
 }
 
 if (!process.env.VITEST) {
-  void startServer();
+  void startServer().catch((err) => {
+    console.error('[Startup Error]', err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
 }

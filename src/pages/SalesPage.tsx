@@ -1,5 +1,5 @@
 import { Ban, CheckCircle2, Download, Edit3, Filter, Grid3X3, Search, Trash2, X } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { CompactSaleItemsList, type CompactSaleRowItem } from '../components/CompactSaleItemsList';
 import { CompactExpandableRow, CompactSection } from '../components/CompactSection';
 import { NumericKeypadOverlay } from '../components/NumericKeypadOverlay';
@@ -169,6 +169,13 @@ export function SalesPage() {
   );
 
   const productMap = useMemo(() => new Map(products.map((p) => [p.id, p])), [products]);
+  const allowedUnitsByProductId = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof getAllowedSaleUnits>>();
+    for (const p of products) {
+      map.set(p.id, getAllowedSaleUnits(p));
+    }
+    return map;
+  }, [products]);
 
   const searchableItems = useMemo(() => {
     if (products.length > 0) {
@@ -258,10 +265,10 @@ export function SalesPage() {
     }, 1600);
   };
 
-  const removeRow = (key: string) => {
+  const removeRow = useCallback((key: string) => {
     setRows((prev) => prev.filter((r) => r.key !== key));
     setExpandedRowKey((cur) => (cur === key ? null : cur));
-  };
+  }, []);
 
   const getProductUsedBaseExcludingRow = (
     targetRows: LineFormRow[],
@@ -339,60 +346,109 @@ export function SalesPage() {
     triggerAddedConfirmation(newKey, item.name, 1, defUnit.unitName, defUnit.salePrice);
   };
 
+  const stepCreateRowQuantity = useCallback(
+    (key: string, delta: number) => {
+      setRows((prev) => {
+        const row = prev.find((r) => r.key === key);
+        if (!row) return prev;
+        const prod = productMap.get(row.productId);
+        const fractional = isFractionalUnit(row.unitName);
+        const cur = Math.max(0, roundStockQty(Number(row.quantity) || 0));
+        const next = fractional
+          ? Math.max(0.25, roundStockQty((cur || 1) + delta))
+          : Math.max(1, Math.floor(cur || 1) + delta);
+
+        if (prod && !allowStockOverride) {
+          let otherBase = 0;
+          for (const r of prev) {
+            if (r.productId !== prod.id || r.key === row.key) continue;
+            const q = Math.max(0, Number(r.quantity) || 0);
+            otherBase = roundStockQty(otherBase + q * (roundStockQty(r.conversionFactor) || 1));
+          }
+          const totalBaseRequested = roundStockQty(otherBase + next * row.conversionFactor);
+          if (totalBaseRequested > prod.currentStock) {
+            setFormError(
+              `Cannot exceed available stock for "${prod.name}" (${formatNumber(prod.currentStock)} ${getEffectiveBaseUnit(prod)}).`
+            );
+            return prev;
+          }
+        }
+        setFormError(null);
+        return prev.map((r) => (r.key === key ? { ...r, quantity: String(next) } : r));
+      });
+    },
+    [productMap, allowStockOverride]
+  );
+
   const stepRowQuantity = (scope: 'create' | 'edit', key: string, delta: number) => {
-    const setter = scope === 'create' ? setRows : setEditRows;
-    const targetRows = scope === 'create' ? rows : editRows;
-    const row = targetRows.find((r) => r.key === key);
+    if (scope === 'create') {
+      stepCreateRowQuantity(key, delta);
+      return;
+    }
+    const row = editRows.find((r) => r.key === key);
     if (!row) return;
-    const prod = productMap.get(row.productId);
     const fractional = isFractionalUnit(row.unitName);
     const cur = Math.max(0, roundStockQty(Number(row.quantity) || 0));
     const next = fractional
       ? Math.max(0.25, roundStockQty((cur || 1) + delta))
       : Math.max(1, Math.floor(cur || 1) + delta);
-
-    if (scope === 'create' && prod && !allowStockOverride) {
-      const otherBase = getProductUsedBaseExcludingRow(rows, prod.id, row.key);
-      const totalBaseRequested = roundStockQty(otherBase + next * row.conversionFactor);
-      if (totalBaseRequested > prod.currentStock) {
-        setFormError(
-          `Cannot exceed available stock for "${prod.name}" (${formatNumber(prod.currentStock)} ${getEffectiveBaseUnit(prod)}).`
-        );
-        return;
-      }
-    }
-    setFormError(null);
-    setter((prev) => prev.map((r) => (r.key === key ? { ...r, quantity: String(next) } : r)));
+    setEditRows((prev) => prev.map((r) => (r.key === key ? { ...r, quantity: String(next) } : r)));
   };
 
-  const updateRowField = (key: string, field: 'quantity' | 'salePricePerUnit', value: string) => {
+  const updateRowField = useCallback((key: string, field: 'quantity' | 'salePricePerUnit', value: string) => {
     setFormError(null);
     setRows((prev) => prev.map((r) => (r.key === key ? { ...r, [field]: value } : r)));
-  };
+  }, []);
 
-  const handleChangeRowUnit = (scope: 'create' | 'edit', key: string, nextUnitName: string) => {
-    const setter = scope === 'create' ? setRows : setEditRows;
-    if (scope === 'create') setFormError(null);
-    else setEditError(null);
+  const handleToggleCreateExpand = useCallback((key: string) => {
+    setExpandedRowKey((cur) => (cur === key ? null : key));
+  }, []);
 
-    setter((prev) =>
-      prev.map((r) => {
-        if (r.key !== key) return r;
-        const prod = productMap.get(r.productId);
-        if (!prod) return { ...r, unitName: nextUnitName };
-        const allowed = getAllowedSaleUnits(prod);
-        const matched =
-          allowed.find((u) => u.unitName.toLowerCase() === nextUnitName.toLowerCase()) ||
-          allowed[0];
-        return {
-          ...r,
-          unitName: matched.unitName,
-          conversionFactor: matched.conversionQty,
-          salePricePerUnit: String(matched.salePrice),
-        };
-      })
-    );
-  };
+  const handleChangeCreateQuantity = useCallback(
+    (key: string, val: string) => updateRowField(key, 'quantity', val),
+    [updateRowField]
+  );
+
+  const handleChangeCreatePrice = useCallback(
+    (key: string, val: string) => updateRowField(key, 'salePricePerUnit', val),
+    [updateRowField]
+  );
+
+  const handleOpenCreateKeypad = useCallback((key: string) => {
+    setKeypadTarget({ scope: 'create', rowKey: key });
+  }, []);
+
+  const handleChangeRowUnit = useCallback(
+    (scope: 'create' | 'edit', key: string, nextUnitName: string) => {
+      const setter = scope === 'create' ? setRows : setEditRows;
+      if (scope === 'create') setFormError(null);
+      else setEditError(null);
+
+      setter((prev) =>
+        prev.map((r) => {
+          if (r.key !== key) return r;
+          const prod = productMap.get(r.productId);
+          if (!prod) return { ...r, unitName: nextUnitName };
+          const allowed = allowedUnitsByProductId.get(prod.id) || getAllowedSaleUnits(prod);
+          const matched =
+            allowed.find((u) => u.unitName.toLowerCase() === nextUnitName.toLowerCase()) ||
+            allowed[0];
+          return {
+            ...r,
+            unitName: matched.unitName,
+            conversionFactor: matched.conversionQty,
+            salePricePerUnit: String(matched.salePrice),
+          };
+        })
+      );
+    },
+    [productMap, allowedUnitsByProductId]
+  );
+
+  const handleChangeCreateUnit = useCallback(
+    (key: string, unitName: string) => handleChangeRowUnit('create', key, unitName),
+    [handleChangeRowUnit]
+  );
 
   const draftTotals = useMemo(() => {
     let totalAmount = 0;
@@ -434,7 +490,7 @@ export function SalesPage() {
           unit: getEffectiveBaseUnit(prod),
           unitName: r.unitName || getEffectiveBaseUnit(prod),
           conversionFactor: r.conversionFactor || 1,
-          allowedUnits: getAllowedSaleUnits(prod),
+          allowedUnits: allowedUnitsByProductId.get(prod.id) || getAllowedSaleUnits(prod),
           currentStock: prod.currentStock,
           quantity: r.quantity,
           salePricePerUnit: r.salePricePerUnit,
@@ -444,7 +500,7 @@ export function SalesPage() {
       }
       return acc;
     }, []);
-  }, [rows, productMap]);
+  }, [rows, productMap, allowedUnitsByProductId]);
 
   const handleSaveSale = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -995,12 +1051,12 @@ export function SalesPage() {
           <CompactSaleItemsList
             items={compactSaleItems}
             expandedKey={expandedRowKey}
-            onToggleExpand={(key) => setExpandedRowKey((cur) => (cur === key ? null : key))}
-            onStepQuantity={(key, delta) => stepRowQuantity('create', key, delta)}
-            onChangeQuantity={(key, val) => updateRowField(key, 'quantity', val)}
-            onChangeUnit={(key, unitName) => handleChangeRowUnit('create', key, unitName)}
-            onOpenKeypad={(key) => setKeypadTarget({ scope: 'create', rowKey: key })}
-            onChangePrice={(key, val) => updateRowField(key, 'salePricePerUnit', val)}
+            onToggleExpand={handleToggleCreateExpand}
+            onStepQuantity={stepCreateRowQuantity}
+            onChangeQuantity={handleChangeCreateQuantity}
+            onChangeUnit={handleChangeCreateUnit}
+            onOpenKeypad={handleOpenCreateKeypad}
+            onChangePrice={handleChangeCreatePrice}
             onRemove={removeRow}
             priceEditable={true}
             allowStockOverride={allowStockOverride}

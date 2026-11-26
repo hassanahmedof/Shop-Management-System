@@ -14,6 +14,7 @@ import {
   getDefaultSaleUnit,
   normalizeCategoryKey,
   roundStockQty,
+  type SelectableSaleUnit,
 } from './packaging';
 
 export interface CartAssistantItem {
@@ -211,6 +212,45 @@ export function normalizeCartItemsForAssistant(params: {
   return [];
 }
 
+interface CatalogPrecompute {
+  byId: Map<string, SearchableProductItem>;
+  defaultUnitById: Map<string, SelectableSaleUnit>;
+  inLiveStockIds: Set<string>;
+  eligibleCache: Map<string, EligibleCandidatesFilterResult>;
+}
+
+const catalogPrecomputeCache = new WeakMap<SearchableProductItem[], CatalogPrecompute>();
+
+function getCatalogPrecompute(catalog: SearchableProductItem[]): CatalogPrecompute {
+  let cached = catalogPrecomputeCache.get(catalog);
+  if (cached) return cached;
+
+  const byId = new Map<string, SearchableProductItem>();
+  const defaultUnitById = new Map<string, SelectableSaleUnit>();
+  const inLiveStockIds = new Set<string>();
+
+  for (const item of catalog) {
+    byId.set(item.id, item);
+    const defUnit = getDefaultSaleUnit(item);
+    defaultUnitById.set(item.id, defUnit);
+    if (item.isActive !== false) {
+      const availableBaseStock = roundStockQty(Math.max(0, Number(item.currentStock) || 0));
+      if (availableBaseStock > 0 && availableBaseStock >= defUnit.conversionQty) {
+        inLiveStockIds.add(item.id);
+      }
+    }
+  }
+
+  cached = {
+    byId,
+    defaultUnitById,
+    inLiveStockIds,
+    eligibleCache: new Map(),
+  };
+  catalogPrecomputeCache.set(catalog, cached);
+  return cached;
+}
+
 export function isCandidateInLiveStock(candidate: SearchableProductItem): boolean {
   if (candidate.isActive === false) return false;
   const availableBaseStock = roundStockQty(Math.max(0, Number(candidate.currentStock) || 0));
@@ -252,25 +292,23 @@ export function filterEligibleUpsellCandidates(params: {
   } = params;
 
   const normalizedCart = normalizeCartItemsForAssistant({ cartItems, cartProductIds });
-  const catalogById = new Map<string, SearchableProductItem>();
 
   if (!Array.isArray(catalog) || catalog.length === 0 || normalizedCart.length === 0) {
     return {
       normalizedCart,
       cartCatalogItems: [],
       eligibleCandidates: [],
-      catalogById,
+      catalogById: new Map(),
     };
   }
 
-  for (const item of catalog) {
-    catalogById.set(item.id, item);
-  }
+  const pre = getCatalogPrecompute(catalog);
+  const catalogById = pre.byId;
 
   const cartIdSet = new Set<string>();
   const cartCatalogItems: SearchableProductItem[] = [];
   for (const line of normalizedCart) {
-    if (!line.productId) continue;
+    if (!line.productId || cartIdSet.has(line.productId)) continue;
     cartIdSet.add(line.productId);
     const matched = catalogById.get(line.productId);
     if (matched) {
@@ -282,33 +320,79 @@ export function filterEligibleUpsellCandidates(params: {
     [...dismissedProductIds, ...removedProductIds].filter(Boolean)
   );
 
+  // Cache key relies only on unique cart IDs + excluded IDs (quantities/prices do not affect eligibility)
+  const cacheKey = `${Array.from(cartIdSet).sort().join(',')}||${Array.from(excludedSet).sort().join(',')}`;
+  const cachedEligible = pre.eligibleCache.get(cacheKey);
+  if (cachedEligible) {
+    return {
+      normalizedCart,
+      cartCatalogItems: cachedEligible.cartCatalogItems,
+      eligibleCandidates: cachedEligible.eligibleCandidates,
+      catalogById,
+    };
+  }
+
+  // Pre-bucket cart items by categoryKey to avoid O(C * K) checks on unrelated categories
+  const cartByCategoryKey = new Map<string, SearchableProductItem[]>();
+  const cartMissingCat: SearchableProductItem[] = [];
+  for (const cartProd of cartCatalogItems) {
+    const ext = extractsById?.get(cartProd.id) || extractProductFeatures(cartProd);
+    if (!ext.categoryId && !ext.categoryKey) {
+      cartMissingCat.push(cartProd);
+    } else {
+      const catBucketKey = ext.categoryId || ext.categoryKey;
+      const bucket = cartByCategoryKey.get(catBucketKey);
+      if (bucket) bucket.push(cartProd);
+      else cartByCategoryKey.set(catBucketKey, [cartProd]);
+    }
+  }
+
   const eligibleCandidates: SearchableProductItem[] = [];
   for (const candidate of catalog) {
     if (cartIdSet.has(candidate.id)) continue;
     if (excludedSet.has(candidate.id)) continue;
-    if (!isCandidateInLiveStock(candidate)) continue;
-    const candExt = extractsById?.get(candidate.id);
-    if (
-      cartCatalogItems.some((cartProd) =>
-        areSameProductOrVariant(
-          cartProd,
-          candidate,
-          extractsById?.get(cartProd.id),
-          candExt
-        )
-      )
-    ) {
-      continue;
+    if (!pre.inLiveStockIds.has(candidate.id)) continue;
+
+    const candExt = extractsById?.get(candidate.id) || extractProductFeatures(candidate);
+    let isVariant = false;
+    if (!candExt.categoryId && !candExt.categoryKey) {
+      isVariant = cartCatalogItems.some((cartProd) =>
+        areSameProductOrVariant(cartProd, candidate, extractsById?.get(cartProd.id), candExt)
+      );
+    } else {
+      const sameCatBucket = cartByCategoryKey.get(candExt.categoryId || candExt.categoryKey);
+      if (sameCatBucket) {
+        for (const cartProd of sameCatBucket) {
+          if (areSameProductOrVariant(cartProd, candidate, extractsById?.get(cartProd.id), candExt)) {
+            isVariant = true;
+            break;
+          }
+        }
+      }
+      if (!isVariant && cartMissingCat.length > 0) {
+        for (const cartProd of cartMissingCat) {
+          if (areSameProductOrVariant(cartProd, candidate, extractsById?.get(cartProd.id), candExt)) {
+            isVariant = true;
+            break;
+          }
+        }
+      }
     }
+    if (isVariant) continue;
     eligibleCandidates.push(candidate);
   }
 
-  return {
+  const result: EligibleCandidatesFilterResult = {
     normalizedCart,
     cartCatalogItems,
     eligibleCandidates,
     catalogById,
   };
+  if (pre.eligibleCache.size >= 16) {
+    pre.eligibleCache.clear();
+  }
+  pre.eligibleCache.set(cacheKey, result);
+  return result;
 }
 
 function buildShortProductLabel(name: string): string {
@@ -398,6 +482,7 @@ export function evaluateHybridUpsellCandidates(params: {
   }
 
   const intel = getOrUpdateCatalogIntelligenceSync(shopId, catalog);
+  const pre = getCatalogPrecompute(catalog);
   const extractsById = new Map<string, ProductFeatureExtract>();
   for (const [pid, prof] of intel.profilesById.entries()) {
     extractsById.set(pid, prof.extract);
@@ -494,6 +579,28 @@ export function evaluateHybridUpsellCandidates(params: {
   const histByProductId = new Map(histRanks.map((r) => [r.productId, r]));
   const historyActiveForCart = histRanks.length > 0;
 
+  const anchorMeta = cartCatalogItems.map((cartProd) => {
+    const anchorProf = intel.profilesById.get(cartProd.id);
+    const anchorExt = anchorProf?.extract || extractProductFeatures(cartProd);
+    const qtyWeight = anchorWeightById.get(cartProd.id) || 1;
+    const anchorCatValid =
+      Boolean(anchorExt.categoryKey) && !CATCHALL_CATEGORY_KEYS.has(anchorExt.categoryKey);
+    const anchorHasBrand = Boolean(
+      anchorExt.brandId || (anchorExt.brandKey && !GENERIC_BRAND_KEYS.has(anchorExt.brandKey))
+    );
+    const anchorHasCat = Boolean(anchorExt.categoryId || anchorExt.categoryKey);
+    return {
+      id: cartProd.id,
+      prof: anchorProf,
+      ext: anchorExt,
+      qtyWeight,
+      catValid: anchorCatValid,
+      hasBrand: anchorHasBrand,
+      hasCat: anchorHasCat,
+      affinities: anchorCatValid ? intel.categoryAffinities.get(anchorExt.categoryKey) : undefined,
+    };
+  });
+
   const evaluated: EvaluatedHybridCandidate[] = [];
 
   for (const candidate of eligibleCandidates) {
@@ -529,11 +636,15 @@ export function evaluateHybridUpsellCandidates(params: {
 
     const candCatValid =
       Boolean(candExt.categoryKey) && !CATCHALL_CATEGORY_KEYS.has(candExt.categoryKey);
+    const candHasBrand = Boolean(
+      candExt.brandId || (candExt.brandKey && !GENERIC_BRAND_KEYS.has(candExt.brandKey))
+    );
+    const candHasCat = Boolean(candExt.categoryId || candExt.categoryKey);
 
-    for (const cartProd of cartCatalogItems) {
-      const anchorProf = intel.profilesById.get(cartProd.id);
-      const anchorExt = anchorProf?.extract || extractProductFeatures(cartProd);
-      const qtyWeight = anchorWeightById.get(cartProd.id) || 1;
+    for (let aIdx = 0; aIdx < anchorMeta.length; aIdx += 1) {
+      const anchor = anchorMeta[aIdx];
+      const anchorExt = anchor.ext;
+      const qtyWeight = anchor.qtyWeight;
 
       const coreOverlap = jaccardSet(anchorExt.coreTitleTokens, candExt.coreTitleTokens);
       if (coreOverlap > maxCoreTokenOverlap) {
@@ -541,28 +652,25 @@ export function evaluateHybridUpsellCandidates(params: {
       }
 
       // Pairwise semantic similarity
-      if (anchorProf && candProf) {
-        const pairSem = cosineSimilaritySparse(anchorProf.tfidfVector, candProf.tfidfVector);
+      if (anchor.prof && candProf) {
+        const pairSem = cosineSimilaritySparse(anchor.prof.tfidfVector, candProf.tfidfVector);
         if (pairSem >= 0.16) {
           semanticMatchAnchors += 1;
         }
         if (pairSem * qtyWeight > bestSemanticAnchorScore) {
           bestSemanticAnchorScore = pairSem * qtyWeight;
           if (!hist) {
-            bestAnchorId = cartProd.id;
+            bestAnchorId = anchor.id;
           }
         }
       }
 
       // Category complementarity
-      const anchorCatValid =
-        Boolean(anchorExt.categoryKey) && !CATCHALL_CATEGORY_KEYS.has(anchorExt.categoryKey);
-      if (candCatValid && anchorCatValid) {
+      if (candCatValid && anchor.catValid) {
         catWeightDenom += qtyWeight;
         let pairCatScore = 0;
 
         if (anchorExt.categoryKey === candExt.categoryKey) {
-          // Same category: reward clearly distinct complementary lines; reject near-duplicate titles
           if (coreOverlap < 0.35) {
             pairCatScore = 0.56 * (1 - coreOverlap);
             catMatches += 1;
@@ -570,8 +678,7 @@ export function evaluateHybridUpsellCandidates(params: {
             pairCatScore = 0.24 * (1 - coreOverlap);
           }
         } else {
-          const aff =
-            intel.categoryAffinities.get(anchorExt.categoryKey)?.get(candExt.categoryKey) || 0;
+          const aff = anchor.affinities?.get(candExt.categoryKey) || 0;
           if (aff >= 0.10) {
             pairCatScore = Math.min(1, aff * 1.25 + 0.08);
             catMatches += 1;
@@ -582,21 +689,38 @@ export function evaluateHybridUpsellCandidates(params: {
         if (pairCatScore > bestAnchorCatScore) {
           bestAnchorCatScore = pairCatScore;
           if (!hist && pairCatScore >= 0.25) {
-            bestAnchorId = cartProd.id;
+            bestAnchorId = anchor.id;
           }
         }
       }
 
-      // Brand portfolio affinity: same known brand, distinct line / cross-category
-      const brandInfo = fromExtractToBrandMatch(anchorExt, candExt);
-      const catInfo = fromExtractToCategoryMatch(anchorExt, candExt);
-      if (brandInfo.same && (!catInfo.same || coreOverlap < 0.35)) {
-        const lineStrength = !catInfo.same ? 0.78 : 0.62;
+      // Inline brand & category match without object allocation
+      const sameBrand =
+        anchor.hasBrand &&
+        candHasBrand &&
+        (anchorExt.brandId && candExt.brandId
+          ? anchorExt.brandId === candExt.brandId
+          : Boolean(
+              anchorExt.brandKey &&
+                candExt.brandKey &&
+                !GENERIC_BRAND_KEYS.has(anchorExt.brandKey) &&
+                !GENERIC_BRAND_KEYS.has(candExt.brandKey) &&
+                anchorExt.brandKey === candExt.brandKey
+            ));
+      const sameCat =
+        anchor.hasCat &&
+        candHasCat &&
+        (anchorExt.categoryId && candExt.categoryId
+          ? anchorExt.categoryId === candExt.categoryId
+          : Boolean(anchorExt.categoryKey && candExt.categoryKey && anchorExt.categoryKey === candExt.categoryKey));
+
+      if (sameBrand && (!sameCat || coreOverlap < 0.35)) {
+        const lineStrength = !sameCat ? 0.78 : 0.62;
         const boosted = clamp01(lineStrength * Math.min(1.2, qtyWeight * 0.95));
         if (boosted > bestSameBrandCrossScore) {
           bestSameBrandCrossScore = boosted;
           if (!hist) {
-            bestAnchorId = cartProd.id;
+            bestAnchorId = anchor.id;
           }
         }
       }
@@ -615,7 +739,7 @@ export function evaluateHybridUpsellCandidates(params: {
       ) {
         sharedOriginMatch = true;
       }
-      if (anchorExt.isReturnable && candExt.isReturnable && !catInfo.same) {
+      if (anchorExt.isReturnable && candExt.isReturnable && !sameCat) {
         sharedReturnableMatch = true;
       }
     }
@@ -638,7 +762,7 @@ export function evaluateHybridUpsellCandidates(params: {
     const Sem = clamp01((rawCartCosine * 1.65 + multiSemBonus) * substituteDampen);
 
     // 4) Brand portfolio & POS context [0..1]
-    const defUnit = getDefaultSaleUnit(candidate);
+    const defUnit = pre.defaultUnitById.get(candidate.id) || getDefaultSaleUnit(candidate);
     const candPrice = defUnit.salePrice || candExt.unitSalePrice || 0;
     let priceAdjust = 0;
     if (avgCartUnitPrice > 0 && candPrice > 0) {

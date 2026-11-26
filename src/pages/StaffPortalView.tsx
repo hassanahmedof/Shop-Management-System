@@ -1,5 +1,5 @@
 import { CheckCircle2, ChevronDown, ChevronRight, Filter, RefreshCw, Search, ShoppingBag } from 'lucide-react';
-import { Fragment, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useMemo, useRef, useState } from 'react';
 import {
   Bar,
   BarChart,
@@ -122,6 +122,13 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
     () => new Map(effectiveCatalog.map((c) => [c.productId, c])),
     [effectiveCatalog]
   );
+  const allowedUnitsByProductId = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof getAllowedSaleUnits>>();
+    for (const c of effectiveCatalog) {
+      map.set(c.productId, getAllowedSaleUnits(c));
+    }
+    return map;
+  }, [effectiveCatalog]);
 
   const activeCatalog = useMemo(
     () => effectiveCatalog.filter((c) => c.isActive),
@@ -272,7 +279,9 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
       if (prod) {
         const baseUnit = getEffectiveBaseUnit(prod);
         const unitLabel = r.unitName || baseUnit;
-        const unitPrice = resolveUnitSalePrice(prod, unitLabel);
+        const allowed = allowedUnitsByProductId.get(prod.productId) || getAllowedSaleUnits(prod);
+        const matched =
+          allowed.find((u) => u.unitName.toLowerCase() === unitLabel.toLowerCase()) || allowed[0];
         acc.push({
           key: r.key,
           productId: r.productId,
@@ -281,15 +290,15 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
           unit: baseUnit,
           unitName: unitLabel,
           conversionFactor: r.conversionFactor || 1,
-          allowedUnits: getAllowedSaleUnits(prod),
+          allowedUnits: allowed,
           currentStock: prod.currentStock,
           quantity: r.quantity,
-          salePricePerUnit: String(unitPrice),
+          salePricePerUnit: String(matched.salePrice),
         });
       }
       return acc;
     }, []);
-  }, [rows, catalogMap]);
+  }, [rows, catalogMap, allowedUnitsByProductId]);
 
   const filteredOwnSales = useMemo(() => {
     const q = searchTerm.trim().toLowerCase();
@@ -368,10 +377,10 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
     return total;
   };
 
-  const removeRow = (key: string) => {
+  const removeRow = useCallback((key: string) => {
     setRows((prev) => prev.filter((r) => r.key !== key));
     setExpandedRowKey((cur) => (cur === key ? null : cur));
-  };
+  }, []);
 
   const handleQuickAddStaffProduct = (item: SearchableProductItem) => {
     setSaleError(null);
@@ -429,53 +438,74 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
     triggerAddedConfirmation(newKey, item.name, 1, defUnit.unitName, defUnit.salePrice);
   };
 
-  const stepStaffRowQuantity = (key: string, delta: number) => {
-    const row = rows.find((r) => r.key === key);
-    if (!row) return;
-    const prod = catalogMap.get(row.productId);
-    const fractional = isFractionalUnit(row.unitName);
-    const cur = Math.max(0, roundStockQty(Number(row.quantity) || 0));
-    const next = fractional
-      ? Math.max(0.25, roundStockQty((cur || 1) + delta))
-      : Math.max(1, Math.floor(cur || 1) + delta);
+  const stepStaffRowQuantity = useCallback(
+    (key: string, delta: number) => {
+      setRows((prev) => {
+        const row = prev.find((r) => r.key === key);
+        if (!row) return prev;
+        const prod = catalogMap.get(row.productId);
+        const fractional = isFractionalUnit(row.unitName);
+        const cur = Math.max(0, roundStockQty(Number(row.quantity) || 0));
+        const next = fractional
+          ? Math.max(0.25, roundStockQty((cur || 1) + delta))
+          : Math.max(1, Math.floor(cur || 1) + delta);
 
-    if (prod) {
-      const otherBase = getUsedBaseExcludingRow(prod.productId, row.key);
-      if (roundStockQty(otherBase + next * row.conversionFactor) > prod.currentStock) {
-        setSaleError(
-          `Cannot exceed available stock for "${prod.name}" (${formatNumber(prod.currentStock)} ${getEffectiveBaseUnit(prod)}).`
-        );
-        return;
-      }
-    }
-    setSaleError(null);
-    setRows((prev) => prev.map((r) => (r.key === key ? { ...r, quantity: String(next) } : r)));
-  };
+        if (prod) {
+          let otherBase = 0;
+          for (const r of prev) {
+            if (r.productId !== prod.productId || r.key === row.key) continue;
+            const q = Math.max(0, Number(r.quantity) || 0);
+            otherBase = roundStockQty(otherBase + q * (r.conversionFactor || 1));
+          }
+          if (roundStockQty(otherBase + next * row.conversionFactor) > prod.currentStock) {
+            setSaleError(
+              `Cannot exceed available stock for "${prod.name}" (${formatNumber(prod.currentStock)} ${getEffectiveBaseUnit(prod)}).`
+            );
+            return prev;
+          }
+        }
+        setSaleError(null);
+        return prev.map((r) => (r.key === key ? { ...r, quantity: String(next) } : r));
+      });
+    },
+    [catalogMap]
+  );
 
-  const changeStaffRowQuantity = (key: string, value: string) => {
+  const changeStaffRowQuantity = useCallback((key: string, value: string) => {
     setSaleError(null);
     setRows((prev) => prev.map((r) => (r.key === key ? { ...r, quantity: value } : r)));
-  };
+  }, []);
 
-  const handleChangeStaffUnit = (key: string, nextUnitName: string) => {
-    setSaleError(null);
-    setRows((prev) =>
-      prev.map((r) => {
-        if (r.key !== key) return r;
-        const prod = catalogMap.get(r.productId);
-        if (!prod) return { ...r, unitName: nextUnitName };
-        const allowed = getAllowedSaleUnits(prod);
-        const matched =
-          allowed.find((u) => u.unitName.toLowerCase() === nextUnitName.toLowerCase()) ||
-          allowed[0];
-        return {
-          ...r,
-          unitName: matched.unitName,
-          conversionFactor: matched.conversionQty,
-        };
-      })
-    );
-  };
+  const handleChangeStaffUnit = useCallback(
+    (key: string, nextUnitName: string) => {
+      setSaleError(null);
+      setRows((prev) =>
+        prev.map((r) => {
+          if (r.key !== key) return r;
+          const prod = catalogMap.get(r.productId);
+          if (!prod) return { ...r, unitName: nextUnitName };
+          const allowed = allowedUnitsByProductId.get(prod.productId) || getAllowedSaleUnits(prod);
+          const matched =
+            allowed.find((u) => u.unitName.toLowerCase() === nextUnitName.toLowerCase()) ||
+            allowed[0];
+          return {
+            ...r,
+            unitName: matched.unitName,
+            conversionFactor: matched.conversionQty,
+          };
+        })
+      );
+    },
+    [catalogMap, allowedUnitsByProductId]
+  );
+
+  const handleToggleStaffExpand = useCallback((key: string) => {
+    setExpandedRowKey((cur) => (cur === key ? null : key));
+  }, []);
+
+  const handleOpenStaffKeypad = useCallback((key: string) => {
+    setKeypadRowKey(key);
+  }, []);
 
   const handleSaveStaffSale = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -922,11 +952,11 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
             <CompactSaleItemsList
               items={compactSaleItems}
               expandedKey={expandedRowKey}
-              onToggleExpand={(key) => setExpandedRowKey((cur) => (cur === key ? null : key))}
+              onToggleExpand={handleToggleStaffExpand}
               onStepQuantity={stepStaffRowQuantity}
               onChangeQuantity={changeStaffRowQuantity}
               onChangeUnit={handleChangeStaffUnit}
-              onOpenKeypad={(key) => setKeypadRowKey(key)}
+              onOpenKeypad={handleOpenStaffKeypad}
               onRemove={removeRow}
               priceEditable={false}
               allowStockOverride={false}

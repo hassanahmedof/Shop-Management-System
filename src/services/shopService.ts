@@ -2318,17 +2318,29 @@ export async function createSale(
     }
   }
 
-  // Merge caller hints with authoritative per-product indexed batch queries so concurrent purchases are never missed
+  const FIRESTORE_IN_CHUNK_SIZE = 30;
+  const involvedPids = Array.from(involvedProductIds);
+  const minimumTxWrites = 2 * merged.size + involvedPids.length + 2;
+  if (minimumTxWrites > 500) {
+    throw new Error(
+      `This sale has ${merged.size} distinct line items requiring at least ${minimumTxWrites} database writes, which exceeds Firestore's 500-write atomic transaction limit. Please split it into bills of up to ~120 items.`
+    );
+  }
+
+  // Merge caller hints with chunked indexed batch queries (30 products per query) so concurrent purchases are never missed
   const batchIdSet = new Set<string>(options?.activeBatchIds || []);
   try {
-    const involvedPids = Array.from(involvedProductIds);
+    const pidChunks: string[][] = [];
+    for (let i = 0; i < involvedPids.length; i += FIRESTORE_IN_CHUNK_SIZE) {
+      pidChunks.push(involvedPids.slice(i, i + FIRESTORE_IN_CHUNK_SIZE));
+    }
     const batchSnaps = await Promise.all(
-      involvedPids.map((pid) =>
+      pidChunks.map((chunk) =>
         getDocs(
           query(
             shopCol(uid, 'inventoryBatches'),
             where('ownerUid', '==', uid),
-            where('productId', '==', pid),
+            where('productId', 'in', chunk),
             where('status', '==', 'active')
           )
         )
@@ -2511,6 +2523,13 @@ export async function createSale(
         });
       }
 
+      const plannedTxWrites = 2 * merged.size + runningStock.size + batchMutations.size + 2;
+      if (plannedTxWrites > 500) {
+        throw new Error(
+          `This sale requires ${plannedTxWrites} database writes (including ${batchMutations.size} FIFO batch updates), exceeding Firestore's 500-write atomic transaction limit. Please split it into smaller bills.`
+        );
+      }
+
       for (const [pid, nextStock] of runningStock.entries()) {
         tx.update(shopDoc(uid, 'products', pid), {
           currentStock: nextStock,
@@ -2617,7 +2636,12 @@ export async function createSale(
 
     return saleRef.id;
   } catch (err) {
-    if (err instanceof Error && (err.message.includes('Insufficient stock') || err.message.includes('Selected product'))) {
+    if (
+      err instanceof Error &&
+      (err.message.includes('Insufficient stock') ||
+        err.message.includes('Selected product') ||
+        err.message.includes('500-write atomic transaction limit'))
+    ) {
       throw err;
     }
     handleFirestoreError(err, OperationType.WRITE, `shops/${uid}/sales/${saleRef.id}`);
@@ -2710,25 +2734,34 @@ export async function editSale(
 
   const allProductIds = Array.from(new Set([...oldProductIds, ...newProductIds]));
 
-  // Pre-query batches for involved products + referenced batch IDs
-  let candidateBatchIds: string[] = [];
+  // Pre-query active batches for involved products (chunked by 30) + any referenced batch IDs (may be exhausted)
+  const batchIdSet = new Set<string>(referencedBatchIds);
   try {
-    const batchSnap = await getDocs(
-      query(shopCol(uid, 'inventoryBatches'), where('ownerUid', '==', uid))
+    const pidChunks: string[][] = [];
+    for (let i = 0; i < allProductIds.length; i += 30) {
+      pidChunks.push(allProductIds.slice(i, i + 30));
+    }
+    const batchSnaps = await Promise.all(
+      pidChunks.map((chunk) =>
+        getDocs(
+          query(
+            shopCol(uid, 'inventoryBatches'),
+            where('ownerUid', '==', uid),
+            where('productId', 'in', chunk),
+            where('status', '==', 'active')
+          )
+        )
+      )
     );
-    const allPidSet = new Set(allProductIds);
-    candidateBatchIds = batchSnap.docs
-      .filter((d) => {
-        const b = d.data() as InventoryBatch;
-        return (
-          referencedBatchIds.has(d.id) ||
-          (allPidSet.has(b.productId) && b.status !== 'cancelled')
-        );
-      })
-      .map((d) => d.id);
+    for (const snap of batchSnaps) {
+      for (const d of snap.docs) {
+        batchIdSet.add(d.id);
+      }
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, `shops/${uid}/inventoryBatches`);
   }
+  const candidateBatchIds = Array.from(batchIdSet);
 
   try {
     await runTransaction(db, async (tx) => {

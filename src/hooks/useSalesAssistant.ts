@@ -266,15 +266,18 @@ export function useSalesAssistant({
   // 1) Primary multi-layer hybrid engine: synchronous sub-ms evaluation using
   //    co-occurrence history + dynamic category/cross-category affinity + TF-IDF semantic vectors
   //    + brand/context portfolio + Bayesian self-learning feedback.
-  const hybridSuggestion = useMemo<UpsellSuggestion | null>(() => {
-    if (isHiddenForUnchangedCart || normalizedCartItems.length === 0) return null;
-    return getHybridUpsellSuggestion({
+  const hybridResult = useMemo(() => {
+    if (isHiddenForUnchangedCart || normalizedCartItems.length === 0) {
+      return { suggestion: null as UpsellSuggestion | null, eligibleCandidateCount: 0 };
+    }
+    const res = getHybridUpsellSuggestion({
       shopId: effectiveShopId,
       cartItems: normalizedCartItems,
       catalog: effectiveCatalog,
       dismissedProductIds: dismissedUpsellIds,
       removedProductIds: effectiveRemovedProductIds,
-    }).suggestion;
+    });
+    return { suggestion: res.suggestion, eligibleCandidateCount: res.eligibleCandidateCount };
   }, [
     isHiddenForUnchangedCart,
     effectiveShopId,
@@ -283,6 +286,7 @@ export function useSalesAssistant({
     dismissedUpsellIds,
     effectiveRemovedProductIds,
   ]);
+  const hybridSuggestion = hybridResult.suggestion;
 
   // 2) Async Gemini intelligence layer: debounced & cached fallback ONLY when local hybrid yields nothing
   useEffect(() => {
@@ -298,14 +302,7 @@ export function useSalesAssistant({
       return;
     }
 
-    const { eligibleCandidates } = filterEligibleUpsellCandidates({
-      cartItems: normalizedCartItems,
-      catalog: effectiveCatalog,
-      dismissedProductIds: dismissedUpsellIds,
-      removedProductIds: effectiveRemovedProductIds,
-    });
-
-    if (eligibleCandidates.length === 0) {
+    if (hybridResult.eligibleCandidateCount === 0) {
       setAiSuggestionState(null);
       return;
     }

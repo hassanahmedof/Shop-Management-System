@@ -114,8 +114,12 @@ vi.mock('firebase/firestore', () => {
 
       let ok = true;
       for (const c of q.constraints || []) {
-        if (c.__type === 'where' && c.op === '==' && c.field) {
-          if (raw[c.field] !== c.value) {
+        if (c.__type === 'where' && c.field) {
+          if (c.op === '==' && raw[c.field] !== c.value) {
+            ok = false;
+            break;
+          }
+          if (c.op === 'in' && Array.isArray(c.value) && !c.value.includes(raw[c.field])) {
             ok = false;
             break;
           }

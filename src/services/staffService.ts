@@ -958,25 +958,44 @@ export async function reconcileStaffSaleToOwnerLedger(
 ): Promise<void> {
   if (staffSale.syncedToLedger) return;
 
-  const involvedProductIds = new Set(staffSale.items.map((i) => i.productId));
-  let candidateBatchIds: string[] = [];
-  try {
-    const batchSnap = await getDocs(
-      query(collection(db, 'shops', ownerUid, 'inventoryBatches'), where('ownerUid', '==', ownerUid))
+  const involvedProductIds = Array.from(new Set(staffSale.items.map((i) => i.productId)));
+  const minimumTxWrites = 2 * staffSale.items.length + involvedProductIds.length + 3;
+  if (minimumTxWrites > 500) {
+    throw new Error(
+      `Staff sale ${staffSale.saleNumber} requires at least ${minimumTxWrites} database writes to reconcile, exceeding Firestore's 500-write atomic transaction limit.`
     );
-    candidateBatchIds = batchSnap.docs
-      .filter((d) => {
+  }
+
+  const batchIdSet = new Set<string>();
+  try {
+    const pidChunks: string[][] = [];
+    for (let i = 0; i < involvedProductIds.length; i += 30) {
+      pidChunks.push(involvedProductIds.slice(i, i + 30));
+    }
+    const batchSnaps = await Promise.all(
+      pidChunks.map((chunk) =>
+        getDocs(
+          query(
+            collection(db, 'shops', ownerUid, 'inventoryBatches'),
+            where('ownerUid', '==', ownerUid),
+            where('productId', 'in', chunk),
+            where('status', '==', 'active')
+          )
+        )
+      )
+    );
+    for (const batchSnap of batchSnaps) {
+      for (const d of batchSnap.docs) {
         const data = d.data() as InventoryBatch;
-        return (
-          involvedProductIds.has(data.productId) &&
-          data.status === 'active' &&
-          Number(data.remainingBaseQty) > 0
-        );
-      })
-      .map((d) => d.id);
+        if (Number(data.remainingBaseQty) > 0) {
+          batchIdSet.add(d.id);
+        }
+      }
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, `shops/${ownerUid}/inventoryBatches`);
   }
+  const candidateBatchIds = Array.from(batchIdSet);
 
   let reconciledDiscordPayload: Parameters<typeof notifyDiscordTransaction>[1] | null = null;
 
@@ -984,7 +1003,7 @@ export async function reconcileStaffSaleToOwnerLedger(
     await runTransaction(db, async (tx) => {
       const ssRef = doc(db, 'shops', ownerUid, 'staffSales', staffSale.id);
       const saleRef = doc(db, 'shops', ownerUid, 'sales', staffSale.id);
-      const uniqueProdIds = Array.from(involvedProductIds);
+      const uniqueProdIds = involvedProductIds;
 
       const [ssSnap, saleSnap, prodSnaps, batchSnaps] = await Promise.all([
         tx.get(ssRef),
@@ -1034,6 +1053,7 @@ export async function reconcileStaffSaleToOwnerLedger(
       let totalAmount = 0;
       let totalCost = 0;
       let totalQuantity = 0;
+      let stockMovementWrites = 0;
 
       for (const line of currentSS.items) {
         const prod = prodMap.get(line.productId);
@@ -1065,6 +1085,7 @@ export async function reconcileStaffSaleToOwnerLedger(
         totalQuantity = roundStockQty(totalQuantity + baseQty);
 
         if (prod) {
+          stockMovementWrites += 1;
           const prevStock = runningStock.get(line.productId) ?? prod.currentStock;
           const nextStock = roundStockQty(Math.max(0, prevStock - baseQty));
           runningStock.set(line.productId, nextStock);
@@ -1118,6 +1139,18 @@ export async function reconcileStaffSaleToOwnerLedger(
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
+      }
+
+      const plannedTxWrites =
+        currentSS.items.length +
+        stockMovementWrites +
+        runningStock.size +
+        batchMutations.size +
+        3;
+      if (plannedTxWrites > 500) {
+        throw new Error(
+          `Staff sale ${currentSS.saleNumber} requires ${plannedTxWrites} database writes to reconcile, exceeding Firestore's 500-write atomic transaction limit.`
+        );
       }
 
       for (const [pid, nextStock] of runningStock.entries()) {
@@ -1238,6 +1271,9 @@ export async function reconcileStaffSaleToOwnerLedger(
       ],
     });
   } catch (err) {
+    if (err instanceof Error && err.message.includes('500-write atomic transaction limit')) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.WRITE, `shops/${ownerUid}/staffSales/${staffSale.id}`);
   }
 }

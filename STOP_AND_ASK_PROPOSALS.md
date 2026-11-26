@@ -1,889 +1,461 @@
-# CareMart Shop Management System — Revised Technical Proposals (v2) for Deferred STOP-AND-ASK Architecture Changes
+# CareMart Shop Management System — Final Technical Proposals (v3) for Deferred STOP-AND-ASK Architecture Changes
 
-**Document Version:** `2.0` (Revised per Architectural Review)  
-**Previous Version Archive:** `/STOP_AND_ASK_PROPOSALS.v1.md` *(Note: This AI Studio container workspace does not have a `.git` repository initialized — `git status` fails with `not a git repository` — so v1 is preserved intact at `/STOP_AND_ASK_PROPOSALS.v1.md` on disk rather than a local Git commit.)*  
-**Status:** Proposal Only (Awaiting Explicit Individual Item Approval — **No Code, Rules, Credentials, Migrations, or Deployments Executed**)  
+**Document Version:** `3.0` (Final Pre-Approval Revision)  
+**Original v1 Archive:** `/STOP_AND_ASK_PROPOSALS.v1.md` *(Preserved unchanged on disk. Note: This AI Studio workspace container has no `.git` repository initialized — `git status` fails with `fatal: not a git repository` — so v1 is preserved directly as `/STOP_AND_ASK_PROPOSALS.v1.md`.)*  
+**Status:** Proposal Only (Awaiting Individual Item Approval — **No Code, Firestore Rules, Schemas, Indexes, Credentials, Production Data, or Deployments Modified**)  
 **Firebase Project Database:** `ai-studio-36596f53-ce10-4ba0-aae2-9d7f9051d6fe` (`(default)`)  
 **Companion Downloadable Word Document:** `/public/CareMart_STOP_AND_ASK_Technical_Proposals.docx`
 
 ---
 
-## Revision Summary (v1 → v2)
+## Revision History & Summary of v3 Hardening
 
-This revision directly addresses every architectural and security concern raised during review:
-
-| Item | Key v2 Strengthening Over v1 |
+| Proposal | Key v3 Additions & Corrections |
 | :--- | :--- |
-| **§4.1 Owner Setup Security** | Option B now strictly enforces the **actual configured `OWNER_EMAIL`** (never merely `email_verified`) in `firestore.rules` AND blocks unauthorized direct Firestore SDK writes to `appState/ownerSetup` and `admins/{uid}` (`Option A` locks `allow create: if false;` with server-side Firestore REST/Admin provisioning; `Option B` binds `OWNER_EMAIL` + `email_verified` + single-use atomic pair check in rules without any public `gateSecret()` literal). |
-| **§4.3 Encryption & Migration** | Explicitly drops any assumption of silent recovery: explains Cloud Run ephemeral container disk behavior (`.caremart-secrets/` does not exist locally and is wiped on cold container restarts unless persisted), mandates backup-before-reencrypt (`*.v1.bak`), details explicit `VAULT_DECRYPT_KEY_MISMATCH` diagnostics without overwriting ciphertext, and provides a Cloud Run–durable persistence path. |
-| **§5.3 FIFO > 50 Batches** | Proves mathematically against the actual `createSale`, `editSale`, `cancelSale`, and `reconcileStaffSaleToOwnerLedger` code paths that **100% of deducted batches** are recorded (zero `.slice(0, 50)`) and restored, accounting for **every** write inside Firestore's **500-write transaction limit** (including `saleItems`, `stockMovements`, `products`, `inventoryBatches`, `sales`, `staffSales`, `auditLogs`, and overflow chunk docs). |
-| **§7.1 Co-Occurrence > 2,000 Sales** | Eliminates the 5,000-ID array cap completely. Replaces capped hash arrays with **1-document-per-sale idempotency records (`upsellProcessedSales/{saleId}`)** (or unbounded linked overflow pages as an alternative), preventing silent history loss, guaranteeing serialized concurrency via `runTransaction`, handling `epoch`-versioned rebuilds, and enabling exact `cancelSale`/`editSale` pair subtraction. |
-| **§8 Feedback Migration to Firestore** | Replaces full-map read-modify-write overwrites with **atomic + idempotent** persistence: create-only `upsellFeedbackEvents/{eventId}` deduplication paired with either atomic Firestore `:commit` `FieldValue.increment(1)` transforms + strict delta rules (Pattern A) or staff append-only event docs + owner/server transactional folding (Pattern B). |
-| **§5.5 Deletion Rules** | Upgrades from field-only checks to **deterministic referential protection in `firestore.rules`** (`hasTransactionHistory` monotonic lock flag + `entityLocks/{lockId}` + `currentStock == 0` / `outstandingBalance == 0` / `totalPurchased == 0` / `totalPaid == 0` + pre-deployment historical backfill) so direct Firestore SDK/REST calls cannot delete historical products or suppliers and damage financial reports. |
+| **§4.1 Owner Setup Gate** | Preserves Approach A (`allow create: if false;` + server-side transaction) and Approach B (deploy-time `OWNER_EMAIL` SHA-256 hash + `email_verified == true` + dual-doc atomic batch), explicitly separating verified token verification from unverified Cloud Run IAM eligibility. |
+| **§4.3 Encryption & `SESSION_SECRET`** | Explicitly separates (1) Env/Secret-Manager credentials, (2) Persistent-volume vaults, and (3) Ephemeral Cloud Run container disk. Proves from `server.ts` exact `SESSION_SECRET` behavior (`caremart_session` cookie vs Firebase Bearer ID tokens). Enforces strict non-destructive handling on decryption failure (never overwrite/discard failed ciphertext). |
+| **§5.3 FIFO > 50 Batches** | Verifies **exact read-before-write phase order** in `createSale`, `editSale`, `cancelSale`, and `reconcileStaffSaleToOwnerLedger`; corrects `reconcileStaffSaleToOwnerLedger` write budget to include `auditLogs` (`+1` at `staffService.ts:1167`); documents 2-round Phase-1 `tx.get` before any write; proves every created sale (`W_create <= 480`) can ALWAYS be cancelled (`W_cancel <= 481 < 500`) and specifies exact regression tests. |
+| **§7.1 Co-Occurrence > 2,000 Sales** | Designs a **race-free staging + epoch cutover + catch-up + durable retry** rebuild (`cooccurrence_staging` → atomic cutover to `cooccurrence_v3`), replacing the broken in-place `resetFirst` partial-wipe bug (`upsellCooccurrenceService.ts:976`). Explicitly details atomic `editSale` old-pair reversal + new-pair application and `cancelSale` pair subtraction. |
+| **§8 Feedback Migration** | Eliminates any staff-writable shared aggregate; adds **rule-enforced two-condition retention & cleanup** (`folded == true && foldedAt < request.time - 7d/30d`) that can never delete unprocessed `folded == false` events even during extended owner absence. |
+| **§5.5 Deletion Locks** | Establishes a **strict 4-phase safe migration & deployment sequence**: never activates strict `allow delete` rules while legacy historical items lack locks (or denies all hard deletes during the migration window), verifies `missingLocks === 0` via manifest before Phase 3, and provides an exact per-phase rollback sequence. |
 
 ---
 
 ## Table of Contents
 
 1. [§4.1 Owner Setup Gate and Firestore Security Rules](#41-owner-setup-gate-and-firestore-security-rules)
-2. [§4.3 Encryption Secret Enforcement and Legacy Credential Migration](#43-encryption-secret-enforcement-and-legacy-credential-migration)
-3. [§5.3 FIFO Allocation Recording, Restoration, and 500-Write Budget Proof](#53-fifo-allocation-recording-restoration-and-500-write-budget-proof)
-4. [§7.1 Co-Occurrence Cache Scaling Beyond 2,000 Processed Sales](#71-co-occurrence-cache-scaling-beyond-2000-processed-sales)
-5. [§8 Atomic and Idempotent Feedback Storage Migration to Firestore](#8-atomic-and-idempotent-feedback-storage-migration-to-firestore)
-6. [§5.5 Product and Supplier Referential Deletion Rules](#55-product-and-supplier-referential-deletion-rules)
-7. [Unverified Assumptions & Pre-Implementation Verification Matrix](#unverified-assumptions--pre-implementation-verification-matrix)
+2. [§4.3 Encryption Secret Enforcement, Storage Tiers, Session Impact & Safe Recovery](#43-encryption-secret-enforcement-storage-tiers-session-impact--safe-recovery)
+3. [§5.3 FIFO Allocation Read-Before-Write Verification, Exact Write Budgets & Cancellation Proof](#53-fifo-allocation-read-before-write-verification-exact-write-budgets--cancellation-proof)
+4. [§7.1 Co-Occurrence Cache Scaling, Race-Free Staging Rebuild & Edit/Cancel Reversal](#71-co-occurrence-cache-scaling-race-free-staging-rebuild--editcancel-reversal)
+5. [§8 Atomic, Idempotent Feedback Migration & Safe Folded-Event Retention](#8-atomic-idempotent-feedback-migration--safe-folded-event-retention)
+6. [§5.5 Product and Supplier Referential Deletion Locks & Phased Migration Order](#55-product-and-supplier-referential-deletion-locks--phased-migration-order)
+7. [Verified Facts vs. Theoretical / Unverified Claims](#verified-facts-vs-theoretical--unverified-claims)
 
 ---
 
 <a id="41-owner-setup-gate-and-firestore-security-rules"></a>
 ## 1. §4.1 Owner Setup Gate and Firestore Security Rules
 
-### 1.1 Exact Implementation Approach and Affected Files
+### 1.1 Exact Files and Functions That Will Change
+- **`server.ts`**: `OWNER_GATE_SECRET` (`86–87`), `getConfiguredOwnerEmail()` (`101–111`), `computeOwnerProof()` (`113–118`), `getPrimaryOwnerUidCached()` (`544–552`), `authorizeOwnerUser()` (`554–656`), `GET /api/auth/owner-setup-status` (`938–951`), `POST /api/auth/verify-owner` (`954–997`)
+- **`firestore.rules`**: `isOwnerAuthUser()` (`29–35`), `isOwnerSetupAuthorizedFor()` (`45–54`), remove `gateSecret()` (`56–58`), `match /appState/{stateId}` (`857–867`), `match /admins/{adminUid}` (`872–888`)
+- **`src/services/shopService.ts`**: `ensureShopInitialized()` (`160–223`)
+- **`src/contexts/AuthContext.tsx`**: `initializeForUser()` (`202–408`), `setupInitialAdmin()` (`605–676`)
+- **`src/components/LoginScreen.tsx`**: initial setup error / email verification messaging
+- **`package.json`**: *(only if Approach A adds `firebase-admin`)*
+- **`.env.example`**: document `OWNER_EMAIL`, `OWNER_GATE_SECRET`
 
-#### Verified Current Implementation & Vulnerability
-- `server.ts:86–87`: `OWNER_GATE_SECRET` falls back to literal `'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301'`.
-- `server.ts:101–111`: `getConfiguredOwnerEmail()` parses `process.env.OWNER_EMAIL`, but is **only** checked as a boolean in `/api/health` (`921, 931`) and `/api/auth/owner-setup-status` (`943, 948`).
-- `server.ts:554–656`: `authorizeOwnerUser()` **never compares `user.email` against `getConfiguredOwnerEmail()`** when `!primaryOwnerUid`. Any unmapped non-staff Firebase user receives a signed `ownerProof` from `POST /api/auth/verify-owner` (`line 973`).
-- `firestore.rules:56–58, 857–888`: Hardcodes the identical static literal inside `gateSecret()`. Because `firestore.rules` is readable in source/deployments, an attacker can compute `sha256(uid + ':' + email + ':cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301')` locally and directly call `writeBatch` via the Firestore client SDK on an uninitialized database to create `appState/ownerSetup` and `admins/{attackerUid}`—completely bypassing `server.ts` and `OWNER_EMAIL`.
-- `firestore.rules:858`: `allow get: if stateId == 'ownerSetup';` leaks `ownerUid` to unauthenticated users.
-- `package.json`: Confirmed `firebase-admin` is **not** currently installed (`server.ts` performs Firebase ID token verification via Google JWKS + Firestore operations via HTTPS REST API with the caller's Bearer token).
+### 1.2 Verified Current Flaw & Exact Implementation Approach
+- **Verified in `server.ts:554–656`:** When `!primaryOwnerUid`, `authorizeOwnerUser()` only checks `provider in ['password', 'google.com']` and `!email.endsWith('@staff.caremart.app')`—it **never** compares `user.email` against `getConfiguredOwnerEmail()`.
+- **Verified in `firestore.rules:56–58, 884`:** `gateSecret()` embeds `'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301'` in client-readable rules, enabling offline forgery of `ownerProof` and direct Firestore SDK creation of `appState/ownerSetup` + `admins/{uid}` while `appState/ownerSetup` is absent.
+- **Verified in `package.json`:** `firebase-admin` is **not** installed; `server.ts` authenticates Firestore REST calls using the caller's Firebase ID token (`Bearer`).
 
-#### Two Concrete Hardened Designs (No Bypass Via Direct Firestore SDK)
+**Two Mutually Exclusive Hardened Approaches (Zero Bypass via Direct Firestore SDK):**
+1. **Approach A (Recommended — Server-Only Bootstrap + `allow create: if false` in Rules):**
+   - Lock `match /appState/{stateId}` and `match /admins/{adminUid}` to `allow create, update, delete: if false;` in `firestore.rules` so **no client** can ever create initial owner documents via the Firestore SDK.
+   - Provision `firebase-admin` (using Cloud Run ADC or `FIREBASE_SERVICE_ACCOUNT_JSON`) in `server.ts`. Inside `POST /api/auth/verify-owner` (`mode: 'setup'`), enforce `OWNER_EMAIL` configured (fail closed `503` if unset in production), `user.email === configuredEmail`, and `user.emailVerified === true`, then execute a server Firestore transaction checking `!appState/ownerSetup.exists` before atomically creating `appState/ownerSetup` + `admins/{uid}`.
+   - Update `ensureShopInitialized()` (`shopService.ts:160–223`) so it expects `appState/ownerSetup` and `admins/{uid}` to already exist rather than writing them from the client.
+2. **Approach B (Hardened Client Rules — Enforce Actual Configured `OWNER_EMAIL` Without Admin SDK):**
+   - Remove static `gateSecret()` completely from `firestore.rules` and remove the hardcoded fallback in `server.ts:86–87` in production.
+   - Because Firestore rules cannot read `process.env.OWNER_EMAIL` dynamically, bind the SHA-256 digest of the actual lowercased `OWNER_EMAIL` into `firestore.rules` at deploy time (`isConfiguredOwnerEmail()`), plus enforce `request.auth.token.email_verified == true`, `isNotStaffAccount(request.auth.uid)`, `!exists(.../appState/ownerSetup)`, and atomic dual-doc batch (`existsAfter(.../admins/$(request.auth.uid))` paired with `existsAfter(.../appState/ownerSetup)`).
+   - Simultaneously enforce `user.email === getConfiguredOwnerEmail()` + `user.emailVerified === true` inside `server.ts` `authorizeOwnerUser()`.
+   - Pre-deploy verification script aborts deployment if `firestore.rules` still contains an unreplaced email-hash placeholder.
 
-Because Firestore Security Rules **cannot read server environment variables (`process.env.OWNER_EMAIL`) dynamically**, enforcing the actual configured `OWNER_EMAIL` while blocking unauthorized direct SDK writes requires **one of two mutually exclusive implementations**:
+### 1.3 Transaction Behavior, Backward Compatibility & Failure Recovery
+- **Concurrent Setup Race:** Under Approach A, Firestore server transaction precondition `exists: false` on `appState/ownerSetup` lets at most one request succeed (`409` for losers). Under Approach B, Firestore serializes `!exists(appState/ownerSetup)` atomically across concurrent batches.
+- **Unverified Password Accounts:** If `createUserWithEmailAndPassword` yields `emailVerified === false`, `setupInitialAdmin()` triggers `sendEmailVerification()`, prompts verification, and does not write `appState/ownerSetup` until `email_verified == true`.
+- **Backward Compatibility:** Already-initialized primary owners (`appState/ownerSetup` exists, `admins/{uid}` exists), added admins (`adminAuthMap`), and staff (`staffAuthMap`) are 100% unaffected because `isAuthorizedAdminDoc()` (`firestore.rules:60–64`) never checks `ownerProof` or `gateSecret()` after creation.
 
-##### Approach A (Recommended — Zero Client Creation in Rules + Server-Side Provisioning)
-1. **Lock `firestore.rules` completely against direct SDK creation:**
-   - `match /appState/{stateId}` → `allow create, update, delete: if false;`
-   - `match /admins/{adminUid}` → `allow create, update, delete: if false;`
-   - Mathematically guarantees **no client (authorized or unauthorized) can ever directly write initial owner documents via the Firestore SDK**.
-2. **Server-Side Privileged Provisioning (`server.ts`):**
-   - Authenticate server-side Firestore Admin/REST calls via `firebase-admin` (added to `package.json`, initialized via Application Default Credentials on Cloud Run / `FIREBASE_SERVICE_ACCOUNT_JSON`) or Google OAuth2 Service Account JWT using existing `crypto` primitives.
-   - Inside `POST /api/auth/verify-owner` (`mode: 'setup'`):
-     1. Require `OWNER_EMAIL` to be configured (`getConfiguredOwnerEmail() !== ''`); **fail closed (`503`)** if unset in production.
-     2. Enforce `user.email === getConfiguredOwnerEmail()` (exact lowercase match) AND `user.emailVerified === true` (or explicit policy decision on initial password signup verification).
-     3. Execute a Firestore **server transaction** checking `!appState/ownerSetup.exists`, then atomically write `appState/ownerSetup`, `admins/{user.uid}`, and (if needed) `users/{user.uid}` / `shops/{user.uid}` with server-only `ownerProof` (derived from `OWNER_GATE_SECRET`, **never** shared in rules).
-3. **`src/services/shopService.ts:160–223` (`ensureShopInitialized`):**
-   - Stop attempting client `writeBatch` creation of `appState/ownerSetup` and `admins/{uid}`. Instead, verify they already exist (provisioned by `/api/auth/verify-owner`) and only initialize shop workspace defaults (`shops/{uid}`, `settings/main`, default categories) once `admins/{uid}` is confirmed.
+### 1.4 Firestore Rules, Migration Order, Rollback & Tests
+- **Rules (`firestore.rules`):** Change `appState/ownerSetup` `allow get` from unauthenticated (`line 858`) to `allow get: if isOwnerAuthUser() && stateId == 'ownerSetup';`. Apply Approach A (`allow create: if false;`) or Approach B (`isConfiguredOwnerEmail()` + `email_verified == true`).
+- **Migration Order:** (1) Provision `OWNER_EMAIL` + `OWNER_GATE_SECRET` in Cloud Run Secrets; (2) deploy server/client code; (3) deploy updated `firestore.rules`.
+- **Rollback:** Re-deploy previous `firestore.rules` revision from Firebase Console Rules History and redeploy prior server image; zero documents modified for initialized shops.
+- **Tests:** Emulator tests asserting unauthorized email, unverified email, legacy `ownerProof` forgery, and unauthenticated `getDoc(appState/ownerSetup)` all return `PERMISSION_DENIED`; server Vitest tests asserting `403` / `503` fail-closed responses.
 
-##### Approach B (Hardened Client Rules — Explicit Deploy-Time `OWNER_EMAIL` Binding in `firestore.rules`, No Static Secret Fallback)
-If you want to avoid adding server-side Firestore Admin credentials (`firebase-admin`) and keep client `writeBatch` creation for initial setup:
-1. **Enforce Actual Configured `OWNER_EMAIL` Inside Both `server.ts` AND `firestore.rules`:**
-   - Remove `gateSecret()` static literal from `firestore.rules` and remove the hardcoded fallback in `server.ts:86–87`.
-   - Bind the configured owner email directly inside `firestore.rules` using a canonical SHA-256 email digest (so the raw email is not even exposed in plaintext rules!) **generated deterministically from `process.env.OWNER_EMAIL` before rules deployment**:
+---
+
+<a id="43-encryption-secret-enforcement-storage-tiers-session-impact--safe-recovery"></a>
+## 2. §4.3 Encryption Secret Enforcement, Storage Tiers, Session Impact & Safe Recovery
+
+### 2.1 Exact Files and Functions That Will Change
+- **`server/googleSheetsService.ts`**: `getVaultEncryptionKey()` (`39–48`), `readServiceAccountFromVault()`, `saveServiceAccountForOwner()` (`324–385`), `VAULT_DIR`
+- **`server/discordNotifier.ts`**: `getVaultEncryptionKey()` (`54–63`), `readWebhookFromVault()` (`156–220`), `saveDiscordWebhookForOwner()` (`370–427`), `VAULT_DIR`
+- **`server.ts`**: `OWNER_GATE_SECRET` (`86–87`), `SESSION_SECRET` (`88–93`), startup/config validation, `/api/health` non-secret diagnostics
+- **`.env.example`**: document `SERVICE_ACCOUNT_ENCRYPTION_KEY`, `SESSION_SECRET`, `LEGACY_ENCRYPTION_KEYS`, `ALLOW_LEGACY_FALLBACK_DECRYPT`
+
+### 2.2 Explicit Distinction of Credential Storage Models & Cloud Run Behavior
+
+| Storage Mechanism | Where Credentials Live | Survives Cloud Run Restart / Scale-to-Zero? | Shared Across Cloud Run Instances? | Encrypted With `SERVICE_ACCOUNT_ENCRYPTION_KEY`? |
+| :--- | :--- | :---: | :---: | :---: |
+| **1. Environment / Secret Manager (`GOOGLE_SERVICE_ACCOUNT_JSON`, `DISCORD_WEBHOOK_URL`)** | Injected into `process.env` by Cloud Run / GCP Secret Manager | **Yes** | **Yes** | N/A (managed natively by Secret Manager KMS) |
+| **2. Persistent Disk Vault (`CAREMART_SECRETS_DIR` on mounted volume)** | `.caremart-secrets/sa_*.enc.json` & `discord_*.enc.json` on persistent volume (Filestore / Persistent Disk / GCS mount) | **Yes** | **Yes** (if RWX volume) | **Yes** (`AES-256-GCM`) |
+| **3. Ephemeral Cloud Run Container Disk (Current Default)** | Local container `./.caremart-secrets/` (`path.resolve(process.cwd(), '.caremart-secrets')`) | **NO — wiped on restart, cold scale-to-zero, or redeploy** | **NO — per-instance only** | **Yes** while that single container stays alive |
+| **4. Optional Follow-Up: Server-Only Firestore Vault Envelope (`shops/{shopId}/serverVault/*`)** | Encrypted `v: 2` ciphertext stored in Firestore (`allow read, write: if false;` for all clients), decrypted only in `server.ts` using `SERVICE_ACCOUNT_ENCRYPTION_KEY` | **Yes** | **Yes** | **Yes** (`AES-256-GCM`) |
+
+- **Verified Workspace State:** `.caremart-secrets/` **does not exist** locally in `/app/applet`. If production runs stateless Cloud Run without a persistent volume or env secrets, any credential previously pasted into Settings UI on an earlier container revision was already lost on restart—no key migration can recover files deleted by Cloud Run's ephemeral filesystem.
+
+### 2.3 Exact Impact of Changing `SESSION_SECRET` (Verified in `server.ts`)
+- **Verified Code Paths (`server.ts:88–95, 244–270, 974, 1010, 1026–1044`):**
+  - `SESSION_SECRET` is used **only** to HMAC-SHA256 sign and verify the `caremart_session` HTTP-only cookie set by `POST /api/auth/verify-owner` (`line 974`) and `POST /api/auth/verify-staff` (`line 1010`), and checked **only** by `GET /api/auth/session` (`lines 1026–1039`).
+  - Searching `src/` confirms **zero client calls to `/api/auth/session`**. All protected backend endpoints (`requireOwnerMiddleware`, `requireStaffMiddleware`, `resolveShopIdForUpsellRoute`) and all Firestore client queries authenticate via **Firebase Auth ID tokens** (`Authorization: Bearer <token>`), NOT the `caremart_session` cookie.
+- **Exact User Experience When `SESSION_SECRET` Changes:**
+  1. Any existing `caremart_session` cookie in browsers immediately fails `crypto.timingSafeEqual` inside `verifySessionToken()`, so `GET /api/auth/session` returns HTTP `401 { authenticated: false }`.
+  2. **Active Owner and Staff users in the React app are NOT logged out and see zero POS/Dashboard disruption**, because Firebase Auth ID tokens remain valid.
+  3. On the next page reload or sign-in (`AuthContext.initializeForUser()`), `/api/auth/verify-owner` or `/api/auth/verify-staff` issues a fresh `caremart_session` cookie signed with the new `SESSION_SECRET`.
+- **Production Enforcement:** Require explicit `SESSION_SECRET` (`>= 32` chars) in `NODE_ENV === 'production'`. If unset in production, generate a per-boot random 32-byte key in memory (`crypto.randomBytes(32).toString('hex')`) with a critical startup warning rather than deriving from a public hardcoded literal (for single-instance ephemeral boot safety, `caremart_session` refreshes cleanly on reload).
+
+### 2.4 Non-Destructive Vault Migration & Failure Recovery Rules
+1. **`v: 2` Key Derivation Separation:** Primary writes in `googleSheetsService.ts` and `discordNotifier.ts` derive keys strictly from `SERVICE_ACCOUNT_ENCRYPTION_KEY` (`>= 32` chars) via `crypto.hkdfSync('sha256', keySeed, salt, info, 32)`. In `NODE_ENV === 'production'`, saving a vault fails (`503`) if `SERVICE_ACCOUNT_ENCRYPTION_KEY` is missing, short, or equal to `'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301'`.
+2. **Ordered Read Decryption Chain (`v: 1` → `v: 2`):**
+   - Try: (1) `SERVICE_ACCOUNT_ENCRYPTION_KEY` (`v: 2` HKDF or `v: 1` SHA-256), (2) `LEGACY_ENCRYPTION_KEYS` (comma-separated explicit previous keys), (3) `LEGACY_OWNER_GATE_SECRET` / `OWNER_GATE_SECRET`, (4) legacy literal `'cm_gate_...'` **only when `ALLOW_LEGACY_FALLBACK_DECRYPT === 'true'`**.
+3. **Immutable `.v1.bak` Before Atomic Re-Encrypt:** When decrypted via a fallback key, validate parsed payload → copy raw file to `<vault>.v1.bak.<ts>` (`0600`) → write `v: 2` via `.tmp` + `renameSync` (serialized per-file in-process promise lock).
+4. **NEVER Overwrite or Discard on Decryption Failure:** If AES-256-GCM authentication fails for all configured keys:
+   - **Never delete, truncate, or overwrite `.enc.json`!**
+   - Preserve the exact file untouched on disk and return structured status `decrypt_failed` (`VAULT_DECRYPT_KEY_MISMATCH`) in `/api/admin/sheets/status` and `/api/health`.
+   - Operator either restores the original key in `LEGACY_ENCRYPTION_KEYS` OR owner explicitly submits new credentials in Settings UI (which moves the unreadable file to `<vault>.unreadable.<ts>.bak` rather than erasing evidence).
+
+### 2.5 Firestore Rules, Migration Order, Backward Compatibility, Rollback & Tests
+- **Firestore Rules:** None required for disk vaults. (If optional `serverVault` in Firestore is ever added later: `allow read, write: if false;` for all clients.)
+- **Migration Order:** Inspect live Cloud Run secrets/volume first → generate `SERVICE_ACCOUNT_ENCRYPTION_KEY`, `SESSION_SECRET`, `OWNER_GATE_SECRET` → deploy Step 1 with `ALLOW_LEGACY_FALLBACK_DECRYPT=true` + `LEGACY_ENCRYPTION_KEYS` → trigger Owner `/api/admin/sheets/status` & `/api/health?probe=discord` → confirm `v: 2` migration logs → deploy Step 2 removing legacy flags (and preferably configure `GOOGLE_SERVICE_ACCOUNT_JSON` & `DISCORD_WEBHOOK_URL` in Cloud Run Secrets).
+- **Rollback:** Restore `.v1.bak` over `.enc.json` and revert `SERVICE_ACCOUNT_ENCRYPTION_KEY` / `OWNER_GATE_SECRET` / `SESSION_SECRET` env vars in Cloud Run.
+- **Tests:** Vitest tests in `googleSheetsService.test.ts` and `discordNotifier.test.ts` covering `v: 1`→`v: 2` upgrade, `.v1.bak` creation, wrong-key preservation (`VAULT_DECRYPT_KEY_MISMATCH`, file bytes unchanged), and `NODE_ENV=production` weak-key rejection.
+
+---
+
+<a id="53-fifo-allocation-read-before-write-verification-exact-write-budgets--cancellation-proof"></a>
+## 3. §5.3 FIFO Allocation Read-Before-Write Verification, Exact Write Budgets & Cancellation Proof
+
+### 3.1 Exact Files and Functions That Will Change
+- **`src/types/shop.ts`**: add `allocationsStorageMode?: 'inline' | 'chunked'`, `allocationChunkCount?: number`, `totalAllocationCount?: number` on `SaleItem`, plus `SaleItemAllocationChunk`
+- **`src/utils/packaging.ts`**: `allocateFifoFromBatches()` (`line 701+`) — assert 1 allocation entry per unique `batchId`
+- **`src/services/shopService.ts`**: `createSale()` (`2320–2625`), `editSale()` (`2627–3071`), `cancelSale()` (`3073–3255`)
+- **`src/services/staffService.ts`**: `reconcileStaffSaleToOwnerLedger()` (`955–1243`)
+- **`firestore.rules`**: `isValidSaleItem` (`545–584`), `match /saleItems/{itemId}`, new `match /saleItemAllocations/{chunkId}`
+- **`firestore.indexes.json`**: optional `(ownerUid ASC, saleId ASC)` on `saleItemAllocations`
+
+### 3.2 Verified Transaction Read-Before-Write Order & Exact Write Budgets
+
+#### Verification Against Actual Code (Line-by-Line)
+1. **`createSale()` (`src/services/shopService.ts:2357–2580`):**
+   - **Reads (`tx.get`):** Lines `2360–2363` read all `products[involvedPids]` and `inventoryBatches[candidateBatchIds]` via `Promise.all`. Zero `tx.get` calls occur anywhere after line `2363`.
+   - **First Write:** Line `2466` (`saleItems`).
+   - **Verified Exact Writes:**
+     - `1` `sales/{saleId}` (`line 2533`)
+     - `L` `saleItems` (`line 2466`, `L = merged.size`)
+     - `L` `stockMovements` (`line 2495`, 1 per merged line)
+     - `P` `products` (`line 2515`, `P = runningStock.size <= L`)
+     - `B` `inventoryBatches` (`line 2522`, `B = batchMutations.size`)
+     - `1` `auditLogs` (`line 2555`)
+     - `+ C_new` `saleItemAllocations` overflow chunks (`ceil(max(0, allocs_i - 50) / 150)` per line)
+     - **Exact Formula:** `W_create = 2L + P + B + 2 + C_new`
+2. **`reconcileStaffSaleToOwnerLedger()` (`src/services/staffService.ts:984–1216`):**
+   - **Reads (`tx.get`):** Lines `989–994` read `ssRef`, `saleRef`, `products[uniqueProdIds]`, and `inventoryBatches[candidateBatchIds]` via `Promise.all`. Zero `tx.get` calls after line `994`.
+   - **First Write:** Line `1072` (`stockMovements`).
+   - **Verified Exact Writes (Corrected from v2!):**
+     - `1` `sales/{staffSale.id}` (`line 1141`)
+     - `1` `staffSales/{staffSale.id}` (`line 1162`)
+     - `L` `saleItems` (`line 1094`, `L = currentSS.items.length`)
+     - `L_prod` `stockMovements` (`line 1072`, `<= L`, written when `prod` exists)
+     - `P` `products` (`line 1124`)
+     - `B` `inventoryBatches` (`line 1131`, `B = batchMutations.size`)
+     - `1` `auditLogs` (`line 1167`, `SYNC_STAFF_SALE` — omitted in v2, verified at line 1167!)
+     - `+ C_new` `saleItemAllocations` overflow chunks
+     - **Exact Formula:** `W_reconcile = L + L_prod + P + B + 3 + C_new <= 2L + P + B + 3 + C_new`
+3. **`editSale()` (`src/services/shopService.ts:2734–3043`):**
+   - **Reads (`tx.get`):** Currently lines `2737–2742` read `saleRef`, `ssRef`, `products[allProductIds]`, and `inventoryBatches[candidateBatchIds]` via `Promise.all`. Zero `tx.get` calls occur after line `2742`.
+   - **Proposed Read-Before-Write Extension for Overflow Chunks (Strictly Phase 1 Before Line `2824`):**
+     - **Phase 1 Round 1:** `tx.get(saleRef)`, `tx.get(ssRef)`, `tx.get(products[allProductIds])`, AND deterministic chunk docs `tx.get(saleItemAllocations/${item.id}_c${0..item.allocationChunkCount - 1})` for every `existingItem` with `allocationsStorageMode === 'chunked'`.
+     - **Phase 1 Round 2 (Still Strictly Before Any Write!):** Union all `batchId`s discovered inside those chunk docs with `candidateBatchIds`, then call `tx.get(inventoryBatches[...])` for every missing referenced batch ID **before line `2824` (`tx.update(products)`)**.
+     - **Assert Transaction Integrity:** Verify `saleSnap.data().itemCount === existingItems.filter(i => i.status !== 'cancelled').length` (or `saleVersion` counter on `sales`) so concurrent edits never read stale `existingItems`.
+   - **Verified Exact Writes:**
+     - `1` `sales/{sale.id}` (`line 2984`)
+     - `H_ss` (`0` or `1`) `staffSales/{sale.id}` (`line 3021`, if `ssSnap.exists()`)
+     - `P_delta` `products` (`line 2824`, where `stockDelta !== 0`, `<= P`)
+     - `P_delta` `stockMovements` (`line 2830`, `<= P`)
+     - `D` deleted `saleItems` (`line 2870`, non-reused old items)
+     - `L` updated/created `saleItems` (`lines 2915, 2932`, `L = newMap.size`)
+     - `B_touched` `inventoryBatches` (`line 2967`, deduplicated across restored + newly allocated batches, `<= B_old + B_new`)
+     - `1` `auditLogs` (`line 3035`)
+     - `+ C_new` overflow chunk writes (created/updated chunks) + `C_old_del` overflow chunk deletes (for deleted/shrunk items)
+     - **Exact Formula:** `W_edit = L + D + 2*P_delta + B_touched + 2 + H_ss + C_new + C_old_del`
+4. **`cancelSale()` (`src/services/shopService.ts:3103–3229`):**
+   - **Reads (`tx.get`):** Currently lines `3109–3114` read `saleRef`, `ssRef`, `products[uniqueProdIds]`, and `inventoryBatches[batchIdList]` via `Promise.all`. Zero `tx.get` calls occur after line `3114`.
+   - **Proposed Read-Before-Write Extension for Overflow Chunks (Strictly Phase 1 Before Line `3143`):**
+     - **Phase 1 Round 1:** `tx.get(saleRef)`, `tx.get(ssRef)`, `tx.get(products[uniqueProdIds])`, AND deterministic chunk docs `tx.get(saleItemAllocations/${item.id}_c${0..item.allocationChunkCount - 1})`.
+     - **Phase 1 Round 2 (Before Line `3143`):** Merge all chunk `batchAllocations` into `referencedBatchIds`, then `tx.get` every referenced `inventoryBatches` doc before any `tx.update` executes.
+   - **Verified Exact Writes:**
+     - `1` `sales/{sale.id}` (`line 3206`)
+     - `H_ss` (`0` or `1`) `staffSales/{sale.id}` (`line 3213`)
+     - `L_active` `saleItems` status updates (`line 3143`)
+     - `L_active_prod` `stockMovements` (`line 3156`, `<= L_active`)
+     - `P` `products` (`line 3199`)
+     - `B_restored` `inventoryBatches` (`line 3191`, `<= B_created`)
+     - `1` `auditLogs` (`line 3221`)
+     - `0` `saleItemAllocations` writes (overflow chunks remain read-only audit records)
+     - **Exact Formula:** `W_cancel = L_active + L_active_prod + P + B_restored + 2 + H_ss <= 2*L_active + P + B_restored + 2 + H_ss`
+
+### 3.3 Proof of Complete Allocation Recording & Guaranteed Cancellation Restoration
+1. **Zero Truncation Invariant:** Remove `.slice(0, 50)` at `shopService.ts:2486`, `shopService.ts:2900`, and `staffService.ts:1114`. Allocations `0..49` live on `saleItems/{id}.batchAllocations`; allocations `50..total-1` live in deterministic `saleItemAllocations/${itemId}_c${0..K-1}` (150 per chunk). Assert `inlineCount + sum(chunkCounts) === fifo.allocations.length` inside the transaction before writing `saleRef`.
+2. **Pre-Commit Budget Guard (`W <= 480`):** Compute `W` inside `createSale`, `editSale`, and `reconcileStaffSaleToOwnerLedger` **before** calling any `tx.set` / `tx.update` / `tx.delete`. If `W > 480` (leaving 20 writes margin below Firestore's 500-op hard ceiling), throw a deterministic error (`"Transaction exceeds 480 Firestore operations (${W} required across ${B} batches). Split sale lines."`) so zero partial deductions commit.
+3. **Mathematical Cancellation Guarantee:**
+   - Suppose a sale was created by `createSale()` (`W_create = 2L + P + B + 2 + C_new <= 480`) OR by `reconcileStaffSaleToOwnerLedger()` (`W_reconcile = L + L_prod + P + B + 3 + C_new <= 480`).
+   - When `cancelSale()` runs on that sale:
+     - Case 1 (owner sale, `H_ss = 0`, `C_new >= 0`): `W_cancel <= 2L + P + B + 2 <= W_create <= 480 < 500`.
+     - Case 2 (reconciled staff sale, `H_ss = 1`, `C_new >= 0`): `W_cancel <= 2L + P + B + 3 <= W_reconcile <= 480 < 500`.
+   - Even if `editSale()` was allowed only when `W_edit <= 480` (which constrains the new post-edit `L', P', B', C_new'` identically to `2L' + P' + B' + 2 + H_ss <= 480`, except if `B_new` alone was much smaller than `B_old`? Wait—verify that edge case! In `editSale()`, `W_edit` uses `B_touched`, `L`, `2*P_delta`. If `editSale()` created a sale with `L_new=20, P_new=20, B_new=400`, wait: `editSale` only wrote `2*P_delta <= 40` stock movements, whereas `cancelSale` writes `L_active` `saleItems` + `L_active` `stockMovements`! **Good catch!** Therefore `editSale()` MUST ALSO check the future cancellation invariant `2*L_new + P_new + B_new + 3 <= 480` before committing!).
+   - With `2L + P + B + 3 <= 480` checked on **both** `createSale`, `reconcileStaffSaleToOwnerLedger`, AND `editSale` (in addition to `W <= 480`), **every sale that can ever exist in the database is mathematically guaranteed to satisfy `W_cancel <= 480 < 500`** and restore **100% of every deducted batch** in one atomic transaction!
+
+### 3.4 Firestore Rules, Backward Compatibility, Rollback & Regression Tests
+- **Firestore Rules:** Allow optional `allocationsStorageMode`, `allocationChunkCount`, `totalAllocationCount` in `isValidSaleItem` (`545–584`) and `saleItems` `affectedKeys`; add `match /saleItemAllocations/{chunkId}` enforcing `chunkId == incoming().saleItemId + '_c' + string(incoming().chunkIndex)`, `allow update: if false;`.
+- **Backward Compatibility:** Existing `saleItems` without `allocationsStorageMode` (`0..50` allocations) restore identically with zero migration.
+- **Migration Order & Rollback:** Deploy `firestore.rules` first, then client build. On rollback, keep `saleItemAllocations` readable in rules so any chunked sales created before rollback remain cancellable/editable.
+- **Required Regression Tests (To Be Added Upon Approval):**
+  1. **Single-line 120-batch & 350-batch `createSale` → `cancelSale`:** Assert `W_create <= 480`, 100% of batches (`350`) written across inline + chunks, then `cancelSale` restores `remainingBaseQty === initialBaseQty` and `status === 'active'` for **all 350 batches** and `product.currentStock` matches `sum(batches.remainingBaseQty)`.
+  2. **Multi-item boundary sale (`L = 10`, `B = 450`, `W = 475 <= 480`) → `cancelSale`:** Prove cancellation succeeds without hitting 500-op failure and restores all 450 batches.
+  3. **Staff-reconciled 120-batch `reconcileStaffSaleToOwnerLedger` → `cancelSale`:** Assert `W_reconcile` accurately counts `auditLogs` (`+1`), writes chunks, and `cancelSale` restores all 120 batches + marks `staffSales` cancelled.
+  4. **`editSale` 120-batch → 65-batch reduction + invariant test:** Assert batches 1–120 read in Phase 1 before any write, `editSale` rejects if future `W_cancel` would exceed `480`, and all remaining batches restore cleanly.
+  5. **Over-budget rejection test (`W = 485 > 480`):** Assert atomic abort leaves `0` modified products or batches.
+
+---
+
+<a id="71-co-occurrence-cache-scaling-race-free-staging-rebuild--editcancel-reversal"></a>
+## 4. §7.1 Co-Occurrence Cache Scaling, Race-Free Staging Rebuild & Edit/Cancel Reversal
+
+### 4.1 Exact Files and Functions That Will Change
+- **`shared/upsellCacheSchema.ts`**: `COOCCURRENCE_CACHE_VERSION = 3`, `CooccurrenceSnapshotV3`, `UpsellProcessedSaleDoc`, `UpsellRebuildCatchupDoc`
+- **`server/upsellCooccurrenceStore.ts`**: demote local file cache to non-authoritative `(epoch, revision)` L1 cache; remove 2,000-ID eviction counter mutations
+- **`src/services/upsellCooccurrenceService.ts`**: `enqueueSaleCooccurrenceUpdate()`, `enqueueCooccurrenceMutationReconcile()` → atomic `applySaleEditDeltaToCooccurrence()`, `applySaleCancelReversalToCooccurrence()`, new staged rebuild `runStagedCooccurrenceRebuild()`
+- **`src/services/shopService.ts`**: `cancelSale()` & `editSale()` invoke deterministic async co-occurrence edit/cancel events with `saleRevision` + `productIds`
+- **`src/services/staffService.ts`**: `reconcileStaffSaleToOwnerLedger()` enqueues co-occurrence update under Owner context once reconciled
+- **`server.ts`**: `/api/upsell/cooccurrence`, `/update`, `/rebuild`, `/mutate`
+- **`firestore.rules`**: `isValidUpsellCooccurrenceCacheV3`, `match /upsellCache/{cacheId}`, `match /upsellProcessedSales/{saleId}`, `match /upsellRebuildCatchup/{eventId}`
+
+### 4.2 Unbounded Deduplication + Race-Free Staged Rebuild & Cutover Design
+
+#### Why `upsellProcessedSales/{saleId}` Replaces All Bounded Arrays & Buckets
+- Every counted sale receives an independent ~250-byte document `shops/{shopId}/upsellProcessedSales/{saleId}` (`{ ownerUid, saleId, epoch, saleRevision, status: 'counted' | 'reverted', productIds: string[<=40], updatedAt }`).
+- **Zero 2,000-ID eviction, zero 5,000-ID bucket overflow, zero 1 MiB document limits**, even at 500,000+ sales.
+
+#### Race-Free Staged Rebuild & Atomic Cutover Protocol (Fixing `upsellCooccurrenceService.ts:976`)
+1. **Problem with Current Code (`upsellCooccurrenceService.ts:951–1009`):** Current rebuild sends `resetFirst: true` on chunk `0`, wiping the active cache before chunks `1..N` arrive and racing with live sales/cancellations.
+2. **Staged Rebuild Protocol (Live POS Traffic Never Interrupted or Wiped):**
+   - **Step A — Lock & Open Staging Epoch (`runTransaction` on `cooccurrence_v3` + `cooccurrence_staging`):**
+     - Read live `cooccurrence_v3` (`epoch = E`). Check if an active non-stale rebuild lock exists (`activeRebuild.expiresAt > now`).
+     - Set `targetEpoch = E + 1`, `rebuildStartedAt = serverTimestamp()`, and set `cooccurrence_v3.activeRebuildEpoch = targetEpoch` (`cooccurrence_v3` live counts remain **100% untouched** for POS reads!).
+     - Create `shops/{shopId}/upsellCache/cooccurrence_staging` initialized at `epoch: targetEpoch`, `totalCompletedSales: 0`, empty counts, `status: 'building'`, `watermarkSaleId: ''`.
+   - **Step B — Dual-Logging Live Mutations During Rebuild:**
+     - While `cooccurrence_v3.activeRebuildEpoch === targetEpoch`, **every** live `createSale`, `editSale`, and `cancelSale` continues updating live `cooccurrence_v3` (`epoch = E`) normally **AND** also appends an immutable catch-up event doc `shops/{shopId}/upsellRebuildCatchup/${targetEpoch}_${saleId}_${mutationSeq}` (`{ ownerUid, targetEpoch, saleId, action: 'completed' | 'edited' | 'cancelled', productIds, appliedToStaging: false, createdAt }`).
+   - **Step C — Paginated Historical Scan Into `cooccurrence_staging`:**
+     - Stream existing `sales` (`where('ownerUid', '==', shopId).where('status', '==', 'completed').orderBy('createdAt')`, page size `150`) and batch-read their `saleItems`.
+     - For each page inside a **staging checkpoint transaction**:
+       - Update `cooccurrence_staging` counts + `watermarkSaleId` + write `upsellProcessedSales/{saleId}` (`epoch: targetEpoch`, `status: 'counted'`, `productIds`) for each sale in the page (using `tx.get` check so resumable retries after a network drop at page 4 never double-count page 3!).
+       - **Failure mid-rebuild:** Live `cooccurrence_v3` (`epoch = E`) was never modified! Retrying resumes cleanly from `watermarkSaleId` (or restarts safely with `targetEpoch + 1`).
+   - **Step D — Catch-Up Drain (Reconciling Concurrent Sales, Edits & Cancellations):**
+     - After historical pagination finishes, query `upsellRebuildCatchup` where `targetEpoch == targetEpoch && appliedToStaging == false` (in batches of `<= 40` inside `runTransaction`).
+     - For each catch-up event, read `upsellProcessedSales/{saleId}` (`tx.get`) and `sales/{saleId}` (`tx.get`, authoritative source of truth!):
+       - If `sales/{saleId}.status === 'cancelled'` and `dedup.epoch === targetEpoch && dedup.status === 'counted'`: subtract `dedup.productIds` from `cooccurrence_staging`, set `dedup.status = 'reverted'`.
+       - If `sales/{saleId}.status === 'completed'`:
+         - If `dedup.epoch === targetEpoch && dedup.status === 'counted'`: if `dedup.productIds` differs from latest `newIds` (edited during rebuild!), subtract `dedup.productIds`, add `newIds`, update `dedup.productIds = newIds`! If identical, skip cleanly (0 double-counting!).
+         - If `dedup` is missing or `dedup.epoch < targetEpoch`: add `newIds`, write `dedup` (`epoch: targetEpoch`, `status: 'counted'`).
+       - Mark catch-up doc `appliedToStaging = true`.
+   - **Step E — Atomic Cutover Transaction (`cooccurrence_staging` → `cooccurrence_v3`):**
+     - Inside one `runTransaction`: verify `stagingSnap.status === 'building'`, verify zero remaining unapplied `upsellRebuildCatchup` docs for `targetEpoch` (re-run Step D if any arrived in the last millisecond!), then **atomically** overwrite `cooccurrence_v3` with `cooccurrence_staging`'s counts, `epoch: targetEpoch`, `revision: live.revision + 1`, `activeRebuildEpoch: null`, and mark `cooccurrence_staging.status = 'committed'`.
+     - Any concurrent live sale transaction running 1ms after cutover sees `live.epoch === targetEpoch`, aborts if it read stale `E`, retries automatically on `targetEpoch`, reads `upsellProcessedSales/{saleId}` (`epoch === targetEpoch`?), and either skips (already caught up!) or applies once!
+
+### 4.3 Exact `editSale` & `cancelSale` Delta Reversal + Durable Retry Handling
+- **`editSale(uid, sale, existingItems, updated)` Behavior:**
+  - `shopService.ts` computes `nextProductIds` directly from `updated.items` and calls `enqueueCooccurrenceMutationReconcile(uid, sale.id, { action: 'edited', productIds: nextProductIds })`.
+  - Transaction reads `matrixRef = cooccurrence_v3` and `dedupRef = upsellProcessedSales/{sale.id}`:
+    1. **If `dedupSnap.exists() && dedupSnap.epoch === matrix.epoch && dedupSnap.status === 'counted'`:**
+       - Read `oldIds = dedupSnap.productIds` (canonical unique list originally counted).
+       - **Reverse old combinations:** Decrement `totalCompletedSales` (`max(0, total - 1)`), `saleCountsByProduct[p]` (`max(0, count - 1)` for each `p` in `oldIds`), and every unordered pair `(a, b)` in `oldIds` (`pairCounts[a][b] = max(0, count - 1)`, `pairCounts[b][a] = max(0, count - 1)`; delete 0-count keys to keep map clean).
+    2. **Apply new combinations (`nextProductIds`):**
+       - Normalize unique `newIds` (`<= 40`). Increment `totalCompletedSales += 1`, `saleCountsByProduct[p] += 1`, and every unordered pair `(a, b)` in `newIds` (`+1`).
+    3. Update `dedupRef` (`epoch: matrix.epoch, status: 'counted', productIds: newIds`) and `matrixRef.revision += 1`.
+    - *(For `cancelSale`, Step 1 executes identically, Step 2 is skipped, and `dedupRef.status` is set to `'reverted'`.)*
+- **Durable Retry Queue (`cm_upsell_pending_updates_v3_<shopId>`):**
+  - Pending mutations store `{ saleId, action: 'completed' | 'edited' | 'cancelled', productIds, mutationSeq, retryCount, nextAttemptAt }` in `localStorage`.
+  - If offline or transaction contention persists after 5 SDK retries, item remains in the durable queue with bounded exponential backoff (`3s, 10s, 30s, 90s`, re-flushed on `online` event & next `syncCooccurrenceWithBackend`), preserving monotonic `mutationSeq` so out-of-order stale events never overwrite newer edits/cancellations.
+
+### 4.4 Firestore Rules, Migration Order, Backward Compatibility, Rollback & Tests
+- **Firestore Rules:** `cooccurrence_v3` + `cooccurrence_staging` readable by `isOwner(shopId) || staffCanAddSales(shopId)`, writable by `isOwner(shopId)` (and server Admin SDK if provisioned). `upsellProcessedSales/{saleId}` writable by `isOwner(shopId)`. `upsellRebuildCatchup/{eventId}` creatable by `isOwner(shopId) || staffCanAddSales(shopId)` (`appliedToStaging == false` for staff), updatable/deletable by `isOwner(shopId)`.
+- **Backward Compatibility & Rollback:** `cooccurrence_v2` remains intact during rollout; rollback reverts `COOCCURRENCE_CACHE_VERSION` to `2`.
+- **Tests:**
+  1. Concurrent live sale + `cancelSale` + `editSale` interleaved between Step C pages `1` and `2` of staged rebuild → assert cutover counts match fresh batch ground truth **with zero lost sales and zero double-counted sales**.
+  2. Fail chunk `2` mid-rebuild → verify live `cooccurrence_v3` remains intact (`totalCompletedSales` unchanged) and resuming rebuild completes cleanly.
+  3. `editSale` changing `{A, B}` → `{A, C}` → assert `(A, B)` decrements by 1, `(A, C)` increments by 1, `totalCompletedSales` stays 1, and offline retry queue replays idempotently.
+
+---
+
+<a id="8-atomic-idempotent-feedback-migration--safe-folded-event-retention"></a>
+## 5. §8 Atomic, Idempotent Feedback Migration & Safe Folded-Event Retention
+
+### 5.1 Exact Files and Functions That Will Change
+- **`shared/upsellCacheSchema.ts`**: `UpsellFeedbackEventDoc`, `UpsellFeedbackSnapshot`, `MAX_FEEDBACK_RETENTION_DAYS = 30`
+- **`server/upsellFeedbackStore.ts`**: convert disk `.caremart-cache/feedback_v1_*.json` strictly to L1 read-through cache
+- **`server.ts`**: `GET /api/upsell/feedback`, `POST /api/upsell/feedback` (create-only `upsellFeedbackEvents/{eventId}` with `exists=false`), `POST /api/upsell/feedback/reconcile`
+- **`src/services/upsellFeedbackService.ts`**: `recordUpsellFeedbackEvent()`, `reconcileUnfoldedFeedbackEvents()`, `cleanupOldFoldedFeedbackEvents()`
+- **`src/contexts/ShopDataContext.tsx`**: invoke owner `reconcileUnfoldedFeedbackEvents()` + periodic `cleanupOldFoldedFeedbackEvents()`
+- **`firestore.rules`**: `match /upsellFeedbackEvents/{eventId}`, `match /upsellCache/{cacheId}` (`feedback_v1` **strictly Owner-write-only**)
+- **`firestore.indexes.json`**:
+  - `(ownerUid ASC, folded ASC, createdAt ASC)` for owner folding pagination
+  - `(ownerUid ASC, folded ASC, foldedAt ASC)` for safe retention cleanup
+
+### 5.2 Strictly Segregated Architecture (Zero Shared Writable Aggregate for Staff)
+- **Hard Security Guarantee:** `shops/{shopId}/upsellCache/feedback_v1` allows `allow write: if isOwner(shopId)` **ONLY** (staff tokens `staffCanAddSales(shopId)` have `allow get`, **ZERO `create`/`update`/`delete` permission on `feedback_v1`**!).
+- **Staff Event Ingestion (`upsellFeedbackEvents/{eventId}`):**
+  - Staff/Owner events are written as **create-only** immutable documents (`allow update: if false` for staff; REST `PATCH` `currentDocument.exists=false`):
+    ```ts
+    {
+      ownerUid: string,
+      eventId: string,
+      actorUid: string,
+      actorRole: 'owner' | 'staff',
+      productId: string,
+      eventType: 'shown' | 'accepted' | 'dismissed' | 'removed_after_add',
+      categoryKey?: string,
+      anchorCategoryKeys?: string[],
+      folded: false,
+      foldedAt: null,
+      createdAt: Timestamp
+    }
+    ```
+  - Concurrent staff requests create distinct `eventId` documents—**zero write contention, zero lost counters, zero risk of one staff member overwriting another**.
+  - Duplicate retries with the same `eventId` hit `409 ALREADY_EXISTS` (`currentDocument.exists=false`) and return `{ ok: true, duplicate: true }`.
+
+### 5.3 Extended Owner Absence Handling & Pending Event Durability
+- **Scenario: Shop operates for weeks/months with only Staff logging in and Owner never opening the dashboard:**
+  1. **Zero Data Loss:** Unfolded events (`folded: false`) remain safely in Firestore `upsellFeedbackEvents` indefinitely. There is **no TTL or auto-delete on `folded == false` documents**.
+  2. **Bounded Local & Server Continuity:** Each staff terminal retains its local pending retry queue (`cm_upsell_feedback_pending_v1_*` in `localStorage`) until confirmed `200/201/409` in Firestore `upsellFeedbackEvents`, and reads the last folded `feedback_v1` + its own local session feedback mirror so upsell damping still works locally without blocking Sales Entry.
+  3. **Catch-Up When Owner Eventually Logs In:** `reconcileUnfoldedFeedbackEvents(shopId)` paginates `where('ownerUid', '==', shopId).where('folded', '==', false).orderBy('createdAt').limit(40)` in a loop (yield 30ms between batches so UI stays responsive), running atomic `runTransaction` per batch of `40` events (`40` event updates + `1` `feedback_v1` update = `41` writes << `500`), re-checking `eventSnap.data().folded === false` inside every transaction and setting `folded: true, foldedAt: serverTimestamp()`. Even `10,000` accumulated staff events fold cleanly in ~250 small background batches without ever exceeding transaction or document limits!
+  4. *(Optional Server Enhancement if `firebase-admin` / ADC is later enabled in Approach A of §4.1)*: `server.ts` can also fold immediately on the server under service credentials while keeping client `firestore.rules` strictly Owner-write-only on `feedback_v1`.
+
+### 5.4 Safe Retention & Cleanup of Folded Events (Cannot Delete Unprocessed Events)
+1. **Retention Policy:** Keep `folded == true` documents for **`30` days after `foldedAt`** (`MAX_FEEDBACK_RETENTION_DAYS = 30`). This provides a wide safety buffer against delayed offline browser queue replays (`upsellFeedbackService.ts` also drops confirmed `200`/`409` or >30-day-stale offline queue entries cleanly) while preventing unbounded collection growth.
+2. **Double-Enforced Cleanup Safety (Query + Security Rules):**
+   - **Query filter:** `where('ownerUid', '==', shopId).where('folded', '==', true).where('foldedAt', '<=', thirtyDaysAgoTimestamp).limit(200)` — only ever fetches confirmed folded documents older than 30 days.
+   - **Transactional/Rule Guard (`firestore.rules`):** `match /upsellFeedbackEvents/{eventId}` enforces:
      ```rules
-     function expectedOwnerEmailSha256() {
-       return '<64-hex-sha256-of-lowercased-trimmed-OWNER_EMAIL>';
-     }
-     function isConfiguredOwnerEmail() {
-       return request.auth.token.email is string
-         && hashing.sha256(request.auth.token.email.lower()).toHexString().lower() == expectedOwnerEmailSha256();
-     }
+     allow delete: if isOwner(shopId)
+       && shopExists(shopId)
+       && existing().ownerUid == shopId
+       && existing().folded == true
+       && existing().foldedAt is timestamp
+       && existing().foldedAt < request.time - duration.value(7, 'd');
      ```
-     *(Pre-deploy verification script fails deployment if `expectedOwnerEmailSha256()` still contains a placeholder or does not match `sha256(OWNER_EMAIL)`!)*
-   - Inside `firestore.rules`, **every** initial owner document creation (`appState/ownerSetup` AND `admins/{adminUid}`) requires **all four conditions simultaneously**:
-     1. `isOwnerAuthUser()` (provider `'password'` or `'google.com'`, non-staff)
-     2. `request.auth.token.email_verified == true`
-     3. `isConfiguredOwnerEmail()` (matches the exact SHA-256 of `OWNER_EMAIL`)
-     4. `isNotStaffAccount(request.auth.uid)`
-     5. `!exists(/databases/$(database)/documents/appState/ownerSetup)` AND atomic dual-doc batch (`existsAfter(appState/ownerSetup)` + `existsAfter(admins/$(request.auth.uid))`)
-   - In `server.ts` (`authorizeOwnerUser`), ALSO require `emailLower === configuredEmail` when `!primaryOwnerUid`, require `user.emailVerified === true`, and require `OWNER_GATE_SECRET` (minimum 32 chars) in production so `ownerProof` HMAC cannot be forged with a public fallback literal.
-   - **Post-setup locking option:** Once initial setup completes on a single-shop deployment, `appState/ownerSetup` exists (`!exists(...)` becomes permanently `false`), and `allow create` can optionally be tightened to `if false` in subsequent rules updates.
+     Even if a buggy client script called `deleteDoc` on an unfolded (`folded == false`) or recently folded document, **Firestore Security Rules reject the delete with `PERMISSION_DENIED`**, guaranteeing unprocessed staff feedback can **never** be deleted!
 
-#### Affected Files
-- `server.ts` (`OWNER_GATE_SECRET`, `getConfiguredOwnerEmail`, `authorizeOwnerUser`, `POST /api/auth/verify-owner`, `GET /api/auth/owner-setup-status`)
-- `firestore.rules` (`isOwnerAuthUser`, `isVerifiedOwnerEmail`, `isConfiguredOwnerEmail` or `allow create: if false`, `match /appState/{stateId}`, `match /admins/{adminUid}`)
-- `src/services/shopService.ts` (`ensureShopInitialized`, lines 160–223)
-- `src/contexts/AuthContext.tsx` (`initializeForUser`, `setupInitialAdmin`, lines 202–408, 605–676; handle email verification step if `email_verified` required)
-- `src/components/LoginScreen.tsx` (surface clear guidance if owner email does not match `OWNER_EMAIL` or email verification link is pending)
-- `package.json` *(only if Approach A installs `firebase-admin`)*
-- `.env.example` (`OWNER_EMAIL`, `OWNER_GATE_SECRET`)
-
-### 1.2 Data Integrity Guarantees
-- **Single-Owner Uniqueness:** `appState/ownerSetup` has a fixed document ID `'ownerSetup'` with `allow update, delete: if false;`. Combined with `!exists(appState/ownerSetup)` (Approach B) or `allow create: if false;` + server transaction `precondition: { exists: false }` (Approach A), two owners can never overwrite or co-claim the primary shop slot.
-- **Email Allowlist Guarantee:** Neither the UI, nor `/api/auth/verify-owner`, nor direct Firestore SDK calls can initialize `appState/ownerSetup` or `admins/{uid}` unless the authenticated token belongs to the exact verified `OWNER_EMAIL`.
-- **Zero Unauthenticated `ownerUid` Leakage:** Restricting `appState/ownerSetup` `allow get` to `isOwnerAuthUser()` prevents unauthenticated enumeration of the owner UID.
-
-### 1.3 Concurrency and Failure Handling
-- **Concurrent Setup Race:**
-  - Under Approach A: Two concurrent requests to `/api/auth/verify-owner` run Firestore server transactions targeting `appState/ownerSetup` with `exists: false` precondition; Firestore guarantees at most one succeeds while the second receives `409 Conflict` (`ALREADY_EXISTS`).
-  - Under Approach B: Two concurrent client `writeBatch` commits racing on `!exists(appState/ownerSetup)` serialize inside Firestore; only the first succeeds and the second fails `PERMISSION_DENIED` (then retries as normal sign-in if UID matches).
-- **Missing Env Configuration Failure (`Fail Closed`):** If `NODE_ENV === 'production'` and `OWNER_EMAIL` or `OWNER_GATE_SECRET` is missing/weak, `/api/auth/verify-owner` returns `503 Service Unavailable` with explicit operator message—never falling back to open registration or `'cm_gate_...'`.
-- **Unverified Password Account Handling:** If `createUserWithEmailAndPassword` produces `emailVerified === false`, `setupInitialAdmin` sends `sendEmailVerification(cred.user)` and signs out cleanly (or prompts user to click link & refresh token via `user.reload()`) before calling `/api/auth/verify-owner` — no orphaned `appState/ownerSetup` is written until verification succeeds.
-
-### 1.4 Backward Compatibility
-- **Already-initialized primary owner:** Completely unaffected. `admins/{uid}` is only checked via `isAuthorizedAdminDoc(uid)` (`role == 'owner' && email == request.auth.token.email.lower()`) during normal reads/writes, never `allow create`.
-- **Added admins (`adminAuthMap` / `adminMembers`) & Sales Staff (`staffAuthMap`):** Completely unaffected.
-- **Rotating `OWNER_GATE_SECRET`:** Safe for already-initialized shops because existing `admins/{uid}` docs are not re-created or re-verified against `gateSecret()` on read.
-
-### 1.5 Firestore Rules and Permissions
-
-```rules
-// Illustrative Option B Rules (Zero static gateSecret; enforces actual OWNER_EMAIL hash + verified email)
-// NOTE: Replace <SHA256_OWNER_EMAIL_LOWER> at deploy time via verified build/deploy check.
-function isConfiguredOwnerEmail() {
-  return request.auth.token.email is string
-    && request.auth.token.email_verified == true
-    && hashing.sha256(request.auth.token.email.lower()).toHexString().lower() == '<SHA256_OWNER_EMAIL_LOWER>';
-}
-
-match /appState/{stateId} {
-  allow get: if isOwnerAuthUser() && stateId == 'ownerSetup';
-  allow list: if false;
-  // Option A: allow create: if false;
-  // Option B:
-  allow create: if isOwnerAuthUser()
-    && isConfiguredOwnerEmail()
-    && isNotStaffAccount(request.auth.uid)
-    && stateId == 'ownerSetup'
-    && !exists(/databases/$(database)/documents/appState/ownerSetup)
-    && existsAfter(/databases/$(database)/documents/admins/$(request.auth.uid))
-    && isValidOwnerSetupState(incoming())
-    && incoming().ownerUid == request.auth.uid
-    && incoming().createdAt == request.time;
-  allow update, delete: if false;
-}
-
-match /admins/{adminUid} {
-  allow get: if isOwnerAuthUser()
-    && isValidId(adminUid)
-    && adminUid == request.auth.uid
-    && (resource == null || existing().email == request.auth.token.email.lower());
-  allow list: if false;
-  // Option A: allow create: if false;
-  // Option B:
-  allow create: if isOwnerAuthUser()
-    && isConfiguredOwnerEmail()
-    && isNotStaffAccount(request.auth.uid)
-    && isOwnerSetupAuthorizedFor(request.auth.uid)
-    && isValidId(adminUid)
-    && adminUid == request.auth.uid
-    && isValidAdminRecord(incoming())
-    && incoming().email == request.auth.token.email.lower()
-    && incoming().createdAt == request.time
-    && incoming().updatedAt == request.time;
-  allow update, delete: if false;
-}
-```
-
-### 1.6 Emulator and Regression Tests
-- **Firestore Emulator Rules Suite:**
-  1. Attacker signed in with `attacker@gmail.com` (`email_verified: true`) directly calls `setDoc(doc(db, 'appState/ownerSetup'), ...)` + `admins/{attackerUid}` with forged legacy `ownerProof` → **MUST FAIL (`PERMISSION_DENIED`)** under both Option A and Option B.
-  2. User with matching `OWNER_EMAIL` but `email_verified: false` directly calls `setDoc(doc(db, 'appState/ownerSetup'), ...)` → **MUST FAIL (`PERMISSION_DENIED`)**.
-  3. Unauthenticated `getDoc(doc(db, 'appState/ownerSetup'))` → **MUST FAIL (`PERMISSION_DENIED`)**.
-  4. Verified configured owner on Option B (or server-provisioned under Option A) completes initial setup → **MUST SUCCEED**, and a subsequent second create attempt → **MUST FAIL**.
-- **Server Vitest (`server.test.ts`):**
-  - `POST /api/auth/verify-owner` with `OWNER_EMAIL=owner@caremart.com` rejects `other@caremart.com` with `403`, rejects `emailVerified: false` with `403`, and fails closed (`503`) when `OWNER_GATE_SECRET` or `OWNER_EMAIL` is missing in `NODE_ENV=production`.
-
-### 1.7 Rollback Procedure
-1. Restore previous `firestore.rules` revision from Firebase Console Rules History (or backup file) via `deploy_firebase`.
-2. Revert `server.ts` / `AuthContext.tsx` / `shopService.ts` changes and redeploy previous container image.
-3. No Firestore documents are mutated by deploying Option A or Option B rules for an already-initialized shop.
-
-### 1.8 Production Configuration and Manual Actions
-1. **Verify before choosing Option A vs Option B:** Confirm in Firebase Console whether `appState/ownerSetup` already exists in database `ai-studio-36596f53-ce10-4ba0-aae2-9d7f9051d6fe`.
-2. Provision production secrets:
-   - `OWNER_EMAIL` (exact shop owner email)
-   - `OWNER_GATE_SECRET` (`openssl rand -hex 32`)
-   - *(If Option A)* Ensure Cloud Run runtime service account has Cloud Datastore User IAM role (or provide `FIREBASE_SERVICE_ACCOUNT_JSON`).
-   - *(If Option B)* Compute SHA-256 of lowercased `OWNER_EMAIL` and embed into `firestore.rules` before running `deploy_firebase` (and verify `expectedOwnerEmailSha256()` is not a placeholder).
+### 5.5 Backward Compatibility, Rollback & Tests
+- **Backward Compatibility & Migration:** On first Owner sync, if `feedback_v1` does not exist yet and `.caremart-cache/feedback_v1_*.json` or browser mirror has `revision > 0`, seed `feedback_v1` once safely.
+- **Rollback:** Revert server/client code and `firestore.rules`; existing `upsellFeedbackEvents` sit inert without disrupting POS.
+- **Tests:**
+  1. Emulator rules tests: staff `create` (`folded: false`) succeeds; staff `update` on `feedback_v1` or `upsellFeedbackEvents` fails (`PERMISSION_DENIED`); owner `delete` on `folded: false` or `foldedAt` < 7 days old fails (`PERMISSION_DENIED`); owner `delete` on `folded: true && foldedAt < now - 8d` succeeds.
+  2. Vitest tests: 50 concurrent staff events + duplicate replays + long-absence backlog of 120 unfolded events folded in 3 batches (`40` per tx) → assert exact counts (`0` lost, `0` duplicated).
 
 ---
 
-<a id="43-encryption-secret-enforcement-and-legacy-credential-migration"></a>
-## 2. §4.3 Encryption Secret Enforcement and Legacy Credential Migration
+<a id="55-product-and-supplier-referential-deletion-locks--phased-migration-order"></a>
+## 6. §5.5 Product and Supplier Referential Deletion Locks & Phased Migration Order
 
-### 2.1 Exact Implementation Approach and Affected Files
+### 6.1 Exact Files and Functions That Will Change
+- **`src/types/shop.ts`**: `Product.hasTransactionHistory?: boolean`, `Supplier.hasTransactionHistory?: boolean`, `EntityLockDoc`
+- **`src/services/shopService.ts`**:
+  - Transaction writers stamping `hasTransactionHistory: true` + deterministic `entityLocks/prod_${id}` / `entityLocks/sup_${id}`: `createPurchase()`, `createSale()`, `editSale()`, `adjustStock()`, `recordSupplierPayment()`, `createProduct()` (when `supplierId` set), `updateProduct()` (when `supplierId` changed to non-empty), `importHistoricalSaleToLedger()`
+  - `deleteProduct()` (`1442–1541`) & `deleteSupplier()` (`1153–1200`) — execute final check + delete inside `runTransaction` reading `entityLocks`
+  - New idempotent migration & verification helpers: `backfillEntityHistoryLocks(uid)`, `verifyEntityHistoryLocksCoverage(uid)`
+- **`src/services/staffService.ts`**: `reconcileStaffSaleToOwnerLedger()` (`955+`, stamps product lock/flag)
+- **`firestore.rules`**: `isValidProduct`, `isValidSupplier`, `match /products/{productId}`, `match /suppliers/{supplierId}`, `match /staffCatalog/{productId}`, new `match /entityLocks/{lockId}`, new `match /migrations/{migrationId}`
 
-#### Verified Current Storage & Encryption Facts
-- `server/googleSheetsService.ts:39–48, 348–378`: Encrypts Google Service Account JSON to `.caremart-secrets/sa_<sha256(uid)[:24]>.enc.json` (`v: 1`, AES-256-GCM) using `SHA-256('caremart-service-account-vault:v1:' + (SERVICE_ACCOUNT_ENCRYPTION_KEY || OWNER_GATE_SECRET || 'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301'))`.
-- `server/discordNotifier.ts:54–63, 400–424`: Encrypts Discord Webhook URL to `.caremart-secrets/discord_<sha256(shopId)[:24]>.enc.json` (`v: 1`, AES-256-GCM) using the exact same fallback chain with prefix `'caremart-discord-webhook-vault:v1:'`.
-- `server.ts:86–93`: `SESSION_SECRET` falls back to `SHA-256('${OWNER_GATE_SECRET}:${firebaseConfig.projectId}:session')`.
-- **Verified workspace state:** `.caremart-secrets/` **does not exist** in the workspace container right now. In Cloud Run deployments without a persistent volume mount, the container filesystem is **ephemeral**: any file under `.caremart-secrets/` is wiped whenever a Cloud Run revision deploys, scales to zero, or replaces an instance!
+### 6.2 Safe 4-Phase Migration & Deployment Order (Zero Unprotected Window)
 
-#### Honest Reality Regarding Existing Encrypted Credentials (No Silent Recovery Assumption)
-1. **Scenario 1 — Credentials configured via Environment Variables (`GOOGLE_SERVICE_ACCOUNT_JSON`, `DISCORD_WEBHOOK_URL`):**
-   - Plaintext env/Secret-Manager values bypass `.caremart-secrets/*.enc.json` completely and remain **100% accessible** across restarts and encryption key changes.
-2. **Scenario 2 — Credentials saved via Settings UI to `.caremart-secrets/*.enc.json` on an Ephemeral Cloud Run Container:**
-   - **Cannot be preserved across a container restart/redeploy** unless `.caremart-secrets` is mounted on persistent storage (e.g., Cloud Run Volume / Cloud Storage FUSE / Filestore) OR migrated into a durable backend store (encrypted envelope in Cloud Secret Manager or Firestore). Rebuilding/redeploying a stateless Cloud Run container wipes `.caremart-secrets/`—no key migration code can recover a deleted container file!
-3. **Scenario 3 — Existing `.caremart-secrets/*.enc.json` files DO exist on persistent storage or live disk:**
-   - AES-256-GCM **only** decrypts if we possess the **exact seed** that was active when that file was encrypted (`SERVICE_ACCOUNT_ENCRYPTION_KEY`, `OWNER_GATE_SECRET`, or `'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301'`).
-   - If an unknown ad-hoc secret was previously used and lost, decryption will **fail explicitly** (`Unsupported state or unable to authenticate data`). We **never** silently swallow, delete, or overwrite failed vault files.
+**Critical Rule:** **NEVER** deploy strict `hasTransactionHistory == false && !exists(entityLocks/...)` deletion rules as the primary guard while pre-existing historical products/suppliers have not been backfilled yet, **AND NEVER** deploy unprotected `allow delete` while migrating. Follow this exact sequence:
 
-#### Exact Implementation Design
-1. **Separate Keyring & HKDF-SHA256 `v: 2` Envelope (`server/googleSheetsService.ts`, `server/discordNotifier.ts`):**
-   - **Primary write key:** Strictly derived from `process.env.SERVICE_ACCOUNT_ENCRYPTION_KEY` (must be `>= 32` chars and distinct from `OWNER_GATE_SECRET` and `'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301'`) via `crypto.hkdfSync('sha256', primaryKey, salt, info, 32)`.
-   - **Production fail-closed enforcement (`NODE_ENV === 'production'`):**
-     - Refuse to encrypt/save new vaults (`503`) if `SERVICE_ACCOUNT_ENCRYPTION_KEY` is missing, `< 32` chars, or matches the legacy default literal.
-     - Refuse to sign session cookies with weak defaults: require `SESSION_SECRET` (`>= 32` chars) in production (or fail startup cleanly with explicit log error rather than forging weak cookies).
-2. **Explicit Multi-Key Migration Chain (`readServiceAccountFromVault`, `readWebhookFromVault`):**
-   - Candidate decryption keys tried strictly in order:
-     1. Current `SERVICE_ACCOUNT_ENCRYPTION_KEY` (`v: 2` HKDF if `envelope.v === 2`, else `v: 1` SHA-256)
-     2. Explicit comma-separated `LEGACY_ENCRYPTION_KEYS` (`v: 1` SHA-256)
-     3. Explicit `LEGACY_OWNER_GATE_SECRET` or current `OWNER_GATE_SECRET` (`v: 1` SHA-256)
-     4. **Strictly gated legacy default:** `'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301'` is ONLY attempted when `process.env.ALLOW_LEGACY_FALLBACK_DECRYPT === 'true'` during an explicit migration window!
-   - **Safe Re-Encryption with Immutable `.v1.bak` Backup:**
-     - If decryption succeeds with a legacy/fallback key AND `SERVICE_ACCOUNT_ENCRYPTION_KEY` is configured:
-       1. Validate decrypted JSON/URL schema completely first.
-       2. Copy original ciphertext to `<vaultPath>.v1.bak.<timestamp>` (`0600` permissions) if not already backed up.
-       3. Write new `v: 2` envelope atomically via `<vaultPath>.tmp.<pid>` → `renameSync(<tmp>, <vaultPath>)`.
-     - If **all** candidate keys fail GCM tag verification:
-       - Do **not** delete or modify the `.enc.json` file.
-       - Return structured status `'decrypt_failed'` (`VAULT_DECRYPT_KEY_MISMATCH`) surfaced clearly in Settings UI + `/api/admin/sheets/status` + `/api/health`, instructing the operator either to supply the original key in `LEGACY_ENCRYPTION_KEYS` or re-save the credential in Settings.
-3. **Optional Durable Cloud Run Persistence Upgrade (Recommended Follow-Up):**
-   - Document option to store the `v: 2` AES-256-GCM ciphertext envelope inside Firestore (`shops/{shopId}/serverVault/{type}`, `allow read, write: if false;` for ALL client SDKs—readable/writable ONLY by `server.ts` via Firebase Admin / Service Account!) while keeping `SERVICE_ACCOUNT_ENCRYPTION_KEY` strictly in Cloud Run Secrets. That way Cloud Run cold restarts never lose Settings-saved credentials AND Firestore admins/clients still cannot read plaintext or even ciphertext!
+#### Phase 1 — Deploy Lock-Down Protection + Compatible Lock-Writing App Code
+1. **Deploy Phase-1 `firestore.rules`:**
+   - Add `match /entityLocks/{lockId}` (`allow create` by `isOwner(shopId)`, `allow update, delete: if false;`), allow optional `hasTransactionHistory: bool` (immutable once `true`) on `products` & `suppliers`, and add `match /migrations/{migrationId}`.
+   - **Throughout the migration window, set `allow delete: if false;` on BOTH `products/{productId}` and `suppliers/{supplierId}` (and `staffCatalog/{productId}` only deletable by owner if `allow delete: if false;` temporarily or locked behind Phase 3)!**
+   - *Why this is 100% safe:* Owners cannot lose Archive functionality (`isActive: false` remains active via `update`), while **zero** historical or unbackfilled products/suppliers can be hard-deleted via SDK or REST during the backfill window!
+2. **Deploy updated app code (`shopService.ts`, `staffService.ts`):**
+   - Every new purchase, sale, stock adjustment, supplier payment, staff reconciliation, and product-supplier link now atomically sets `hasTransactionHistory: true` + `entityLocks/prod_${pid}` / `entityLocks/sup_${sid}` inside its transaction (keeping Phase-1 read-before-write intact: `tx.get(lockRef)` in Phase 1, `tx.set(lockRef)` in Phase 2 only if `!lockSnap.exists()`).
 
-#### Affected Files
-- `server/googleSheetsService.ts` (`getVaultEncryptionKey`, `readServiceAccountFromVault`, `saveServiceAccountToVault`)
-- `server/discordNotifier.ts` (`getVaultEncryptionKey`, `readWebhookFromVault`, `saveWebhookToVault`)
-- `server.ts` (`OWNER_GATE_SECRET`, `SESSION_SECRET`, startup secret validation, `/api/health` non-secret key/vault health flags)
-- `.env.example` (document `SERVICE_ACCOUNT_ENCRYPTION_KEY`, `SESSION_SECRET`, `LEGACY_ENCRYPTION_KEYS`, `ALLOW_LEGACY_FALLBACK_DECRYPT`)
-
-### 2.2 Data Integrity Guarantees
-- **Authenticated Encryption Integrity:** AES-256-GCM 128-bit authentication tag guarantees corrupted or wrong-key ciphertext is rejected before JSON parsing; corrupted files are never silently treated as empty or overwritten.
-- **Atomic Writes + Pre-Rotation Backups:** Writing to `.tmp` + `fs.renameSync` prevents half-written vault files during crashes; `.v1.bak` preserves exact pre-migration ciphertext for deterministic rollback.
-
-### 2.3 Concurrency and Failure Handling
-- **Concurrent Reads/Migrations:** Protect in-process migration of a given vault path with a `Map<string, Promise<...>>` per-file lock so two concurrent requests on boot do not race creating `.v1.bak` or renaming `.tmp` simultaneously.
-- **Startup Failure Mode:** If `SESSION_SECRET` or `SERVICE_ACCOUNT_ENCRYPTION_KEY` is missing in production, surface deterministic HTTP `503` on vault save/auth rather than crashing the whole read-only health check or silently downgrading cryptography.
-
-### 2.4 Backward Compatibility
-- Existing `v: 1` vaults encrypted under `OWNER_GATE_SECRET` or the legacy fallback remain 100% readable during the controlled migration window (`ALLOW_LEGACY_FALLBACK_DECRYPT=true` + `LEGACY_ENCRYPTION_KEYS`) and upgrade automatically to `v: 2`.
-- Env-var credentials (`GOOGLE_SERVICE_ACCOUNT_JSON`, `DISCORD_WEBHOOK_URL`) remain 100% compatible with zero changes.
-
-### 2.5 Firestore Rules and Permissions
-- **No Firestore rules changes required** for disk vault migration.
-- *(Only if the optional Cloud Run–durable server-only Firestore vault envelope is approved later)*: add `match /serverVault/{vaultId} { allow read, write: if false; }` under `shops/{shopId}` so client SDK access is completely blocked.
-
-### 2.6 Emulator and Regression Tests
-- **Vitest Unit Tests (`server/googleSheetsService.test.ts`, `server/discordNotifier.test.ts`):**
-  1. Legacy `v: 1` vault encrypted with default literal → read with `SERVICE_ACCOUNT_ENCRYPTION_KEY=<new>` and `ALLOW_LEGACY_FALLBACK_DECRYPT=true` → verifies successful decrypt, `.v1.bak` created, primary file upgraded to `v: 2`, and re-read succeeds with `ALLOW_LEGACY_FALLBACK_DECRYPT=false`.
-  2. Wrong key decrypt (`LEGACY_ENCRYPTION_KEYS` wrong, `ALLOW_LEGACY_FALLBACK_DECRYPT=false`) → returns `'decrypt_failed'` (`VAULT_DECRYPT_KEY_MISMATCH`), original ciphertext file **untouched**.
-  3. `NODE_ENV=production` with missing/short `SERVICE_ACCOUNT_ENCRYPTION_KEY` → `saveServiceAccountForOwner` / `saveDiscordWebhookForOwner` throws explicit config error without writing weak ciphertext.
-
-### 2.7 Rollback Procedure
-1. Keep `.caremart-secrets/*.v1.bak` backups and old `SERVICE_ACCOUNT_ENCRYPTION_KEY` / `OWNER_GATE_SECRET` recorded securely before rotation.
-2. To roll back:
-   - Restore `.v1.bak` over `.enc.json` (if any client/code downgrade occurs) AND restore previous `SERVICE_ACCOUNT_ENCRYPTION_KEY` / `OWNER_GATE_SECRET` / `SESSION_SECRET` env vars in Cloud Run.
-   - Re-entering credentials in Settings UI or setting `GOOGLE_SERVICE_ACCOUNT_JSON` / `DISCORD_WEBHOOK_URL` env vars directly also restores integrations immediately.
-
-### 2.8 Production Configuration and Manual Actions
-1. **Check live production state BEFORE migration:** Verify whether `.caremart-secrets/` currently holds files in the running Cloud Run instance or whether credentials are injected via `GOOGLE_SERVICE_ACCOUNT_JSON` / `DISCORD_WEBHOOK_URL` secrets.
-2. **Generate independent 32-byte secrets** (`openssl rand -hex 32`) for `SERVICE_ACCOUNT_ENCRYPTION_KEY`, `SESSION_SECRET`, and `OWNER_GATE_SECRET` and store backups in a secure password manager / GCP Secret Manager.
-3. **Two-phase rollout:**
-   - **Step 1:** Deploy with new secrets + `ALLOW_LEGACY_FALLBACK_DECRYPT=true` (and `LEGACY_ENCRYPTION_KEYS` if any custom key existed previously). Trigger `/api/admin/sheets/status` and `/api/health?probe=discord` as Owner to migrate any disk vaults to `v: 2`.
-   - **Step 2:** Remove `ALLOW_LEGACY_FALLBACK_DECRYPT` and `LEGACY_ENCRYPTION_KEYS` once migrated, and strongly consider configuring `GOOGLE_SERVICE_ACCOUNT_JSON` / `DISCORD_WEBHOOK_URL` in Cloud Run Secrets (or persistent volume) so container restarts never wipe credentials.
-
----
-
-<a id="53-fifo-allocation-recording-restoration-and-500-write-budget-proof"></a>
-## 3. §5.3 FIFO Allocation Recording, Restoration, and 500-Write Budget Proof
-
-### 3.1 Exact Implementation Approach and Affected Files
-
-#### Exact Current Write Inventory & Truncation Bug
-Verified in `src/services/shopService.ts` and `src/services/staffService.ts`:
-- `createSale()` (`shopService.ts:2486`) slices `fifo.allocations.slice(0, 50)`.
-- `editSale()` (`shopService.ts:2900`) slices `fifo.allocations.slice(0, 50)`.
-- `reconcileStaffSaleToOwnerLedger()` (`staffService.ts:1114`) slices `fifo.allocations.slice(0, 50)`.
-- `firestore.rules:578` caps `batchAllocations.size() <= 50`.
-- Meanwhile, `allocateFifoFromBatches()` (`src/utils/packaging.ts:701`) deducts from **every** batch it touches (`> 50` batches if a line spans many micro-batches). Batches 51+ are deducted in `inventoryBatches` (`line 2521`), never recorded on `saleItems`, and therefore **never restored** by `editSale()` (`lines 2794–2802`) or `cancelSale()` (`lines 3093–3098`, `3175–3183`).
-
-#### Exact Implementation: Overflow Subcollection + Pre-Commit 500-Write Budget Guard
-1. **Inline + Deterministic Overflow Chunks (`saleItemAllocations`):**
-   - **Normal sales (`allocations.length <= 50`):** Stored identically inline on `saleItems/{itemId}.batchAllocations` (`allocationsStorageMode` omitted or `'inline'`). **Zero extra reads or writes.**
-   - **High-batch sales (`allocations.length > 50`):**
-     - Store allocations `0..49` inline in `saleItems/{itemId}.batchAllocations` (keeping fast compatibility), set:
-       - `allocationsStorageMode: 'chunked'`
-       - `allocationChunkCount: K` (where $K = \lceil (\text{allocations.length} - 50) / 150 \rceil$)
-       - `totalAllocationCount: allocations.length`
-     - Write deterministic overflow chunk docs at `shops/{shopId}/saleItemAllocations/${saleItemId}_c${chunkIdx}` (`chunkIdx = 0..K-1`, max `150` allocations/chunk ≈ 18 KB/doc, safely under 1 MiB):
-       ```ts
-       {
-         ownerUid: string,
-         saleId: string,
-         saleItemId: string,
-         chunkIndex: number,
-         allocations: BatchAllocation[], // 1..150 items
-         createdAt: Timestamp
-       }
-       ```
-     - **Why deterministic doc IDs (`${saleItemId}_c${chunkIdx}`) are critical:** Inside `editSale()` and `cancelSale()`, because `allocationChunkCount` is stored on `saleItem`, the transaction can call `tx.get(shopDoc(uid, 'saleItemAllocations', `${item.id}_c${idx}`))` **inside `runTransaction`** (Firestore transactions allow `tx.get` on document refs, not collection queries!), guaranteeing serializable, race-free reading of 100% of allocations!
-2. **Hard Pre-Commit Firestore 500-Write Transaction Budget Check:**
-   - Before executing any `tx.set` / `tx.update` / `tx.delete`, compute the exact write count $W$ for the transaction (see proof in §3.2) and enforce $W \le 480$ (leaving 20 writes headroom below Firestore's 500-write hard transaction limit).
-   - If $W > 480$, abort **atomically inside Phase 1/2 before any writes** with a clear error indicating the exact cart/batch count limit so zero partial inventory deduction ever occurs.
-
-#### Affected Files
-- `src/types/shop.ts` (`SaleItem`, new `SaleItemAllocationChunk`)
-- `src/utils/packaging.ts` (`allocateFifoFromBatches` — assert/deduplicate 1 entry per `batchId`)
-- `src/services/shopService.ts`:
-  - `createSale()` (lines 2385–2580)
-  - `editSale()` (lines 2700–3010)
-  - `cancelSale()` (lines 3073–3230)
-  - New helpers: `computeSaleWriteBudget()`, `loadSaleItemAllocationsTransactional()`
-- `src/services/staffService.ts`:
-  - `reconcileStaffSaleToOwnerLedger()` (lines 955–1170)
-- `firestore.rules`:
-  - `isValidSaleItem` (lines 545–584) + `match /saleItems/{itemId}` `affectedKeys`
-  - New `match /saleItemAllocations/{chunkId}`
-- `firestore.indexes.json`:
-  - Optional index on `saleItemAllocations` `(ownerUid ASC, saleId ASC)` for cleanup/audits
-
-### 3.2 Data Integrity Guarantees — Complete Write Budget & Restoration Proof
-
-#### Step 1: Exact Firestore Write Count Equations (Verified Against Code)
-Let:
-- `L` = number of cart / sale lines (`merged.size` / `newMap.size` / `items.length`)
-- `P` = number of distinct product IDs (`runningStock.size` / updated products)
-- `B` = number of distinct `inventoryBatches` updated (`batchMutations.size` / `batchRestoreAccum.size`)
-- `D` = deleted `saleItems` docs in `editSale`
-- `C_new` = overflow chunk docs created (`sum over i=1..L of ceil(max(0, allocs_i - 50) / 150)`)
-- `C_old_del` = old overflow chunk docs deleted/replaced in `editSale`
-
-Verified write operations per Firestore transaction:
-
-| Operation | `sales` / `staffSales` | `saleItems` | `stockMovements` | `products` | `inventoryBatches` | `auditLogs` | `saleItemAllocations` | Total Writes `W` |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **`createSale()`** (`shopService.ts:2465–2575`) | `1` (`sales`) | `L` | `L` | `P` | `B` | `1` | `C_new` | `W_create = 2L + P + B + 2 + C_new` |
-| **`reconcileStaffSaleToOwnerLedger()`** (`staffService.ts:984–1170`) | `2` (`sales` + `staffSales`) | `L` | `L` | `P` | `B` | `0` | `C_new` | `W_reconcile = 2L + P + B + 2 + C_new` |
-| **`editSale()`** (`shopService.ts:2734–3020`) | `1` or `2` | `L + D` | `<= P` | `<= P` | `B_touched` (`<= B_old + B_new`) | `1` | `C_new + C_old_del` | `W_edit <= L + D + 2P + B_touched + 3 + C_new + C_old_del` |
-| **`cancelSale()`** (`shopService.ts:3103–3229`) | `1` or `2` | `L_active` | `L_active` | `P` | `B_restored` | `1` | `0` (chunks left read-only) | `W_cancel <= 2L + P + B_restored + 3` |
-
-*(Note: In `editSale()`, every batch modified during restoration OR new FIFO allocation is deduplicated into `batchMap` and written at most once at `shopService.ts:2963–2973`, so `B_touched <= B_old + B_new`.)*
-
-#### Step 2: Proof That Every Deducted Batch Is Recorded and Restorable
-1. **Completeness of Recording:** For every line `i`, `allocateFifoFromBatches()` produces unique-by-`batchId` allocations `A_i` matching `fifo.updatedBatches` 1-for-1:
-   - `sum(a.consumedBaseQty for a in A_i) == sum(b.prevRemaining - b.nextRemaining for b in updatedBatches_i)`
-   - Because `.slice(0, 50)` is removed and all entries of `A_i` are stored across `saleItems/{id}.batchAllocations[0..49]` plus deterministic overflow chunks `saleItemAllocations/${itemId}_c{0..K-1}` before `tx` finishes, **every** deducted `batchId` and exact `consumedBaseQty` is persisted atomically inside the same Firestore transaction that deducts `inventoryBatches`.
-2. **Feasibility Guarantee Under Firestore's 500-Write Limit:**
-   - Every distinct batch deducted requires `1` `tx.update(inventoryBatches/{batchId})`. Thus any valid transaction in Firestore **cannot** deduct more than `B_max < 500 - (2L + P + 2)` distinct batches regardless of storage layout.
-   - With `150` allocations per overflow chunk, storing `B` allocations adds only `ceil(max(0, B - 50) / 150) <= 3` extra document writes—still leaving capacity for **~450+ batch allocations in a single atomic transaction** while strictly enforcing `W <= 480`!
-   - **Important Edge Case for `cancelSale()` and `editSale()`:**
-     - What if an `editSale()` restores `B_old = 260` old batches AND allocates `B_new = 260` mostly *disjoint* new batches (`B_touched > 480`)? The pre-commit budget check catches `W_edit > 480` cleanly before writing and instructs the owner to **cancel the sale and enter replacement sales**.
-     - Crucially, **every sale that succeeded at `createSale()` (`W_create <= 480`) satisfies `W_cancel <= W_create + 1 <= 481 < 500`**, because `cancelSale()` writes **`0` overflow chunk docs** and restores at most the exact `B` batches that `createSale()` deducted (plus at most `+1` `staffSales` header update). Therefore **every recorded sale can ALWAYS be atomically cancelled and 100% restored in a single transaction!**
-
-### 3.3 Concurrency and Failure Handling
-- **Transactional Chunk Reads:** Inside `editSale` and `cancelSale`, `tx.get` fetches `saleRef`, `saleItems`, deterministic `saleItemAllocations/${id}_c${0..K-1}`, `products`, and **all** `inventoryBatches` referenced across both inline and chunk allocations. If another transaction modifies the sale or any batch concurrently, Firestore automatically aborts and retries the transaction with fresh snapshots.
-- **Safety Assertion:** Before committing `createSale` / `editSale` / `reconcileStaffSaleToOwnerLedger`, verify `recordedCount === fifo.allocations.length` and `W <= 480`; throw an explicit descriptive error if violated.
-- **Unbatched Overflow / Override Sales:** When `allowStockOverride` is used and active batches run out before `line.baseQuantity`, `fifo.allocations` equals only the actual batch quantities deducted; `cancelSale` restores `Math.min(batch.initialBaseQty, batch.remainingBaseQty + addQty)` safely.
-
-### 3.4 Backward Compatibility
-- **100% backwards-compatible:** All existing `saleItems` with `0..50` `batchAllocations` and without `allocationsStorageMode` or `allocationChunkCount` continue reading and restoring identically.
-- No changes to existing `saleItems` data or APIs required.
-
-### 3.5 Firestore Rules and Permissions
-
-```rules
-// Inside isValidSaleItem(data, shopId) (line 545+):
-// Allow optional 'allocationsStorageMode', 'allocationChunkCount', 'totalAllocationCount' in hasOnly([...])
-&& (!('batchAllocations' in data) || (data.batchAllocations is list && data.batchAllocations.size() <= 50 && (data.batchAllocations.size() == 0 || data.batchAllocations[0] is map)))
-&& (!('allocationsStorageMode' in data) || data.allocationsStorageMode in ['inline', 'chunked'])
-&& (!('allocationChunkCount' in data) || (data.allocationChunkCount is int && data.allocationChunkCount >= 0 && data.allocationChunkCount <= 20))
-&& (!('totalAllocationCount' in data) || (data.totalAllocationCount is int && data.totalAllocationCount >= 0 && data.totalAllocationCount <= 2000))
-
-// Also allow updating those 3 fields inside match /saleItems/{itemId} allow update affectedKeys list.
-
-function isValidSaleItemAllocationChunk(data, shopId) {
-  return data.keys().hasAll(['ownerUid', 'saleId', 'saleItemId', 'chunkIndex', 'allocations', 'createdAt'])
-    && data.keys().hasOnly(['ownerUid', 'saleId', 'saleItemId', 'chunkIndex', 'allocations', 'createdAt'])
-    && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
-    && isValidId(data.saleId)
-    && isValidId(data.saleItemId)
-    && data.chunkIndex is int && data.chunkIndex >= 0 && data.chunkIndex < 20
-    && data.allocations is list && data.allocations.size() >= 1 && data.allocations.size() <= 150
-    && data.allocations[0] is map
-    && data.createdAt is timestamp;
-}
-
-match /saleItemAllocations/{chunkId} {
-  allow get: if isOwner(shopId) && isValidId(chunkId) && (resource == null || (shopExists(shopId) && existing().ownerUid == shopId));
-  allow list: if isOwner(shopId) && existing().ownerUid == shopId;
-  allow create: if isOwner(shopId)
-    && isValidId(chunkId)
-    && chunkId == incoming().saleItemId + '_c' + string(incoming().chunkIndex)
-    && isValidSaleItemAllocationChunk(incoming(), shopId)
-    && incoming().createdAt == request.time
-    && shopExists(shopId);
-  allow update: if false; // Immutable chunks (new edits write/delete chunks explicitly)
-  allow delete: if isOwner(shopId) && isValidId(chunkId) && shopExists(shopId) && existing().ownerUid == shopId;
-}
-```
-
-### 3.6 Emulator and Regression Tests
-1. **Vitest Service Tests (`src/services/financialTransactions.test.ts`):**
-   - `createSale` consuming **120 batches** (`2` units each = `240` units) on 1 item + 5 normal items → verify `batchAllocations` holds 50, `saleItemAllocations/{itemId}_c0` holds 70, total recorded = 120, `W_create < 480`.
-   - `cancelSale` on that 120-batch sale → assert **all 120** batches restore `remainingBaseQty` to exact pre-sale levels and `product.currentStock === sum(batches.remainingBaseQty)`.
-   - `editSale` reducing quantity from 240 to 130 across those 120 batches → assert batches 51–120 restore cleanly.
-   - `reconcileStaffSaleToOwnerLedger` spanning 80 batches → assert all 80 recorded across inline + chunk.
-   - Massive cart spanning **485 write ops** → assert `createSale` aborts cleanly *before* mutating any product or batch (`0` partial stock changes).
-2. **Firestore Emulator Rules Tests:**
-   - Verify deterministic chunk ID enforcement (`${saleItemId}_c0`), max 150 entries/chunk, and staff denial on `saleItemAllocations`.
-
-### 3.7 Rollback Procedure
-1. Keep `saleItemAllocations` read permissions in `firestore.rules` even if rolling back client write code so any high-batch sale created while live can still be edited/cancelled cleanly.
-2. Revert `shopService.ts` / `staffService.ts` only after confirming no active chunked sales require creation, or keep read-path fallback permanently.
-
-### 3.8 Production Configuration and Manual Actions
-1. Deploy updated `firestore.rules` (and `firestore.indexes.json` if optional `(ownerUid, saleId)` index is added) **before** deploying the client bundle.
-2. Optionally run a read-only diagnostic check scanning historical `saleItems` where `batchAllocations.size() == 50` to identify if any past live sale was ever truncated before this fix.
-
----
-
-<a id="71-co-occurrence-cache-above-2000-processed-sales"></a>
-## 4. §7.1 Co-Occurrence Cache Scaling Beyond 2,000 Processed Sales
-
-### 4.1 Exact Implementation Approach and Affected Files
-
-#### Verified Current Flaws
-- `shared/upsellCacheSchema.ts:2`: `MAX_PROCESSED_SALE_IDS = 2000`.
-- `server/upsellCooccurrenceStore.ts:213–219, 273–275`: `applyCompletedSaleSync()` splices oldest entries out of `processedSaleIds` and `processedSet` once size `> 2000`. Replaying an evicted sale ID increments `totalCompletedSales`, `saleCountsByProduct`, and `pairCounts` a second time.
-- `firestore.rules:848, 1607`: Enforces `processedSaleIds.size() <= 2000` and hardcodes `cacheId == 'cooccurrence_v2'`.
-- `src/services/shopService.ts` (`cancelSale` / `editSale`): Currently does **not** decrement co-occurrence counts when a completed sale is cancelled.
-
-#### Revised Architecture: Unbounded Per-Sale Idempotency Ledger (`upsellProcessedSales/{saleId}`) + Epoch-Versioned Matrix
-To eliminate **every** fixed bucket ceiling (no 2,000-ID cap AND no 5,000-ID hash-bucket overflow ceiling!), separate the **hot aggregated matrix** from an **unbounded 1-doc-per-sale idempotency ledger**:
-
-1. **Hot Aggregated Matrix (`shops/{shopId}/upsellCache/cooccurrence_v3`):**
-   - Contains **zero unbounded ID arrays**:
+#### Phase 2 — Execute Paginated Historical Backfill & Strict Verification Gate
+1. **Run `backfillEntityHistoryLocks(shopId)` (Owner-initiated, paginated, idempotent):**
+   - Paginates through `inventoryBatches`, `saleItems`, `purchaseItems`, `stockMovements`, `purchases`, `supplierPayments`, and `products` (extracting every referenced `productId` and `supplierId`).
+   - Writes `hasTransactionHistory: true` + `entityLocks/prod_${pid}` / `entityLocks/sup_${sid}` in `writeBatch` chunks of `<= 350` ops (checking existing locks first so re-runs skip already-locked entities).
+2. **Mandatory Verification Step (`verifyEntityHistoryLocksCoverage(shopId)`):**
+   - Independently re-scans the same collections, counts distinct historical `productId`s and `supplierId`s, verifies every single one has **both** `product.hasTransactionHistory === true` (if product doc still exists) **and** `exists(entityLocks/...)`, and writes a verification manifest `shops/{shopId}/migrations/entityLocks_v1`:
      ```ts
      {
-       ownerUid: string,
-       version: 3,
-       epoch: number,             // Incremented atomically on full rebuild
-       revision: number,          // Monotonic matrix revision
-       totalCompletedSales: number,
-       saleCountsByProduct: Record<string, number>, // max 1000 keys
-       pairCounts: Record<string, Record<string, number>>, // max 1000 outer x 40 inner
-       createdAt: Timestamp,
-       updatedAt: Timestamp
+       ownerUid: shopId,
+       status: 'verified',
+       verifiedProductCount: number,
+       verifiedSupplierCount: number,
+       missingLocksCount: 0,
+       verifiedAt: serverTimestamp()
      }
      ```
-   - Read once on session load / background sync by POS & Product Details (<80 KB doc, constant `O(1)` read regardless of whether the shop has `100` or `1,000,000` sales!).
-2. **Unbounded Per-Sale Idempotency Ledger (`shops/{shopId}/upsellProcessedSales/{saleId}`):**
-   - Each processed sale creates/updates **its own** tiny document (~250 bytes):
-     ```ts
-     {
-       ownerUid: string,
-       saleId: string,
-       epoch: number,                   // Matches matrix.epoch when counted
-       status: 'counted' | 'reverted',
-       productIds: string[],            // Exact deduplicated productIds (max 40) counted into matrix
-       updatedAt: Timestamp
-     }
-     ```
-   - **Why `upsellProcessedSales/{saleId}` never overflows:** Even at `1,000,000` sales, every sale has its own independent 250-byte document (`O(1)` `get`), never hits any `5,000`-ID array limit or `1 MiB` Firestore document limit, and **never evicts historical deduplication records**!
-   - **Why storing `productIds` enables exact `cancelSale` / `editSale` reversal:**
-     - When `cancelSale(saleId)` completes asynchronously, the co-occurrence worker runs a Firestore transaction reading `upsellProcessedSales/{saleId}` and `cooccurrence_v3`. If `epoch === matrix.epoch && status === 'counted'`, it decrements `totalCompletedSales` (`-1`), `saleCountsByProduct[p]` (`-1`), and `pairCounts[a][b]` (`-1`) using those **exact** counted `productIds`, and flips `status: 'reverted'`.
-3. **Serialized Concurrency (No Lost Updates Across Multiple Registers / Cloud Run Instances):**
-   - All updates to `cooccurrence_v3` + `upsellProcessedSales/{saleId}` execute inside an **atomic Firestore transaction** (either via `runTransaction` from the client SDK or Firestore REST `:beginTransaction` + `:commit` in `server.ts`, or via server Admin SDK if enabled):
-     - Inside the transaction: `tx.get(dedupRef)` and `tx.get(matrixRef)`.
-     - If `dedupSnap.exists() && dedupSnap.epoch === matrix.epoch && dedupSnap.status === 'counted'`: **return `duplicate: true` immediately (zero double-counting!)**.
-     - Otherwise, update `matrixRef` (`revision + 1`, counts updated) AND set `dedupRef` (`epoch: matrix.epoch, status: 'counted', productIds`) **in the exact same atomic transaction**!
-   - **No more `.caremart-cache` split-brain authority:** Server memory/disk `.caremart-cache/` acts purely as an L1 read-through cache keyed by `(epoch, revision)` and refreshed from Firestore whenever `revision` advances—never as an independent counter that diverges across Cloud Run instances.
-4. **Epoch-Safe Full Rebuilds Without Deleting Millions of Docs Atomically:**
-   - When an owner runs a full rebuild:
-     1. Read current `matrix.epoch` (e.g., `E`), compute `nextEpoch = E + 1`.
-     2. Stream completed sales in paginated batches of `150`, accumulating the clean fresh matrix in memory (or staging snapshot).
-     3. Commit `cooccurrence_v3` with `epoch: nextEpoch`, `revision: prevRevision + 1`, and fresh counts **while tagging batched `upsellProcessedSales/{saleId}` docs with `epoch: nextEpoch`** (using `writeBatch` chunks of `400` writes).
-     4. Any old `upsellProcessedSales/{saleId}` doc still carrying `epoch < matrix.epoch` is automatically treated as "not yet counted in `nextEpoch`" (never blocking a rebuild AND never requiring deletion of all historical docs before swap!). Meanwhile, concurrent live sales occurring during rebuild target `matrix.epoch` cleanly via `runTransaction` idempotency.
+   - **Hard Gate:** Phase 3 rules deployment **MUST NOT** proceed unless `migrations/entityLocks_v1.status === 'verified' && missingLocksCount === 0`!
 
-#### Affected Files
-- `shared/upsellCacheSchema.ts` (`COOCCURRENCE_CACHE_VERSION = 3`, `UpsellProcessedSaleDoc`, `CooccurrenceSnapshot`)
-- `server/upsellCooccurrenceStore.ts` (L1 cache keyed by `(epoch, revision)`, remove 2,000-ID eviction counter mutation, support Firestore transactional sync)
-- `server.ts` (`GET /api/upsell/cooccurrence`, `POST /api/upsell/cooccurrence/update`, `POST /api/upsell/cooccurrence/rebuild`, new `POST /api/upsell/cooccurrence/cancel`)
-- `src/services/upsellCooccurrenceService.ts` (transactional `upsellProcessedSales/{saleId}` + `cooccurrence_v3` updates, async `enqueueSaleCooccurrenceReversal`, paginated epoch rebuild)
-- `src/services/shopService.ts` (`cancelSale()` asynchronously fires `enqueueSaleCooccurrenceReversal` post-commit)
-- `firestore.rules` (`isValidUpsellCooccurrenceCache`, `isValidUpsellProcessedSale`, `match /upsellCache/{cacheId}`, `match /upsellProcessedSales/{saleId}`)
+#### Phase 3 — Activate Strict Referential Deletion Rules
+- Deploy **Phase-3 `firestore.rules`** replacing temporary `allow delete: if false;` with deterministic referential rules:
+  - `products/{productId}` `allow delete` requires: `isOwner(shopId)`, `existing().currentStock == 0`, `(!('emptyContainersOnHand' in existing()) || existing().emptyContainersOnHand == 0)`, `existing().isActive == false`, `existing().get('hasTransactionHistory', false) == false`, `!exists(.../entityLocks/prod_$(productId))`, **AND** `exists(.../migrations/entityLocks_v1)` (rules themselves refuse deletion unless backfill verification manifest exists!).
+  - `suppliers/{supplierId}` `allow delete` requires: `isOwner(shopId)`, `existing().outstandingBalance == 0`, `existing().totalPurchased == 0`, `existing().totalPaid == 0`, `existing().get('hasTransactionHistory', false) == false`, `!exists(.../entityLocks/sup_$(supplierId))`, **AND** `exists(.../migrations/entityLocks_v1)`.
+  - `staffCatalog/{productId}` `allow delete` requires `isOwner(shopId)` AND (`!exists(.../products/$(productId))` OR `!exists(.../entityLocks/prod_$(productId))`).
 
-### 4.2 Data Integrity Guarantees
-- **Zero Silent Eviction:** Every processed sale ID persists permanently in `upsellProcessedSales/{saleId}` with no array cap (`MAX_PROCESSED_SALE_IDS` limit removed).
-- **Exact Idempotency & No Lost Updates:** Atomic `runTransaction` over `(matrixRef, dedupRef)` guarantees that concurrent retries, multi-device offline flushes, and duplicate API requests can increment a given `saleId` at most **once per epoch**, and concurrent distinct sales serialize cleanly without overwriting each other's counts.
-- **Cancellation Consistency:** Cancelled sales cleanly reverse their exact counted pairs without requiring a full rebuild.
+### 6.3 Exact Rollback Sequence
+1. **If an issue occurs during Phase 1 or Phase 2 (before Phase 3):**
+   - Keep `allow delete: if false;` (zero data risk), or revert `firestore.rules` to pre-migration snapshot from Firebase Console Rules History, then revert app build (`shopService.ts`). Existing `entityLocks` / `hasTransactionHistory` fields are harmless additive fields and do not affect sales, purchases, or reports.
+2. **If an issue occurs after Phase 3 rules are live:**
+   - **Step 1 (Immediate Rules Rollback):** If a false-positive lock or rule bug blocks a legitimate deletion, redeploy `Phase 1` (`allow delete: if false;` while fixing) or pre-migration `firestore.rules` from Firebase Console Rules History (re-enabling `shopService.ts`'s query-guarded `deleteProduct`/`deleteSupplier`).
+   - **Step 2 (Code Rollback):** Revert `shopService.ts` / `staffService.ts` to stop writing new `entityLocks` if needed; wait until rules are rolled back BEFORE deploying older code if older code doesn't recognize new fields.
+   - **Step 3 (Optional Lock Cleanup):** Only if permanently abandoning `entityLocks`, delete `shops/{shopId}/entityLocks/*` and `migrations/entityLocks_v1` via an owner maintenance script after rules rollback; **never** remove `hasTransactionHistory` without auditing transaction history first.
 
-### 4.3 Concurrency and Failure Handling
-- **Transaction Contention Backoff:** Under heavy multi-register load (`> 5` concurrent writes/sec to the single `cooccurrence_v3` doc), Firestore `runTransaction` retries automatically up to 5 times; any residual contention falls back into `upsellCooccurrenceService.ts`'s existing durable offline retry queue (`cm_upsell_pending_updates_*`) with exponential backoff, never affecting POS checkout speed.
-- **Permission Note for Staff Registers:** Since `staffCanAddSales(shopId)` staff should not directly rewrite the shop-wide `cooccurrence_v3` matrix from client SDK if untrusted:
-  - **Recommended:** Staff checkout submits `POST /api/upsell/cooccurrence/update` and `server.ts` executes the transaction using Firebase Admin / Owner-delegated service credentials (justifies `firebase-admin` / server ADC!), OR staff writes an append-only `upsellPendingSales/{saleId}` marker (`allow create`) that owner/server drains transactionally! Wait—if `firebase-admin` / server ADC is unavailable, owner reconciliation (`reconcileStaffSaleToOwnerLedger`, which already runs for every staff sale!) already reconciles staff sales into the owner ledger and can invoke the transactional co-occurrence write cleanly under Owner credentials! Let's highlight this verified synergy!
-
-### 4.4 Backward Compatibility
-- Bumping `COOCCURRENCE_CACHE_VERSION` to `3` (`cooccurrence_v3`) cleanly avoids schema collisions with legacy `cooccurrence_v2` docs while keeping `cooccurrence_v2` readable during transition.
-- A one-time owner background backfill rebuilds `cooccurrence_v3` + `upsellProcessedSales/*` from authoritative `sales` (`status == 'completed'`) and `saleItems`.
-
-### 4.5 Firestore Rules and Permissions
-
-```rules
-function isValidUpsellCooccurrenceCacheV3(data, shopId) {
-  return data.keys().hasAll([
-      'ownerUid', 'version', 'epoch', 'revision', 'totalCompletedSales',
-      'saleCountsByProduct', 'pairCounts', 'createdAt', 'updatedAt'
-    ])
-    && data.keys().hasOnly([
-      'ownerUid', 'version', 'epoch', 'revision', 'totalCompletedSales',
-      'saleCountsByProduct', 'pairCounts', 'createdAt', 'updatedAt'
-    ])
-    && data.ownerUid == shopId
-    && data.version == 3
-    && data.epoch is int && data.epoch >= 1
-    && data.revision is int && data.revision >= 0
-    && data.totalCompletedSales is int && data.totalCompletedSales >= 0
-    && data.saleCountsByProduct is map && data.saleCountsByProduct.size() <= 1000
-    && data.pairCounts is map && data.pairCounts.size() <= 1000
-    && data.createdAt is timestamp
-    && data.updatedAt is timestamp;
-}
-
-function isValidUpsellProcessedSale(data, shopId, saleId) {
-  return data.keys().hasAll(['ownerUid', 'saleId', 'epoch', 'status', 'productIds', 'updatedAt'])
-    && data.keys().hasOnly(['ownerUid', 'saleId', 'epoch', 'status', 'productIds', 'updatedAt'])
-    && data.ownerUid == shopId
-    && data.saleId == saleId
-    && data.epoch is int && data.epoch >= 1
-    && data.status in ['counted', 'reverted']
-    && data.productIds is list && data.productIds.size() <= 40
-    && data.updatedAt is timestamp;
-}
-
-match /upsellCache/{cacheId} {
-  allow get: if isValidId(cacheId)
-    && cacheId in ['cooccurrence_v2', 'cooccurrence_v3']
-    && ((isOwner(shopId) && (resource == null || existing().ownerUid == shopId))
-        || (staffCanAddSales(shopId) && shopExists(shopId) && (resource == null || existing().ownerUid == shopId)));
-  allow list: if false;
-  allow create, update: if isOwner(shopId) && shopExists(shopId) && ...;
-  allow delete: if isOwner(shopId) && shopExists(shopId) && existing().ownerUid == shopId;
-}
-
-match /upsellProcessedSales/{saleId} {
-  allow get: if isOwner(shopId) && isValidId(saleId) && (resource == null || existing().ownerUid == shopId);
-  allow list: if isOwner(shopId) && existing().ownerUid == shopId;
-  allow create, update: if isOwner(shopId)
-    && isValidId(saleId)
-    && isValidUpsellProcessedSale(incoming(), shopId, saleId)
-    && incoming().updatedAt == request.time
-    && shopExists(shopId);
-  allow delete: if isOwner(shopId) && isValidId(saleId) && shopExists(shopId);
-}
-```
-
-### 4.6 Emulator and Regression Tests
-1. **Scale & Replay Tests (`upsellCooccurrenceService.test.ts` / `upsellCooccurrenceStore.test.ts`):**
-   - Process `6,000` distinct completed sales → assert `totalCompletedSales === 6000` and 6,000 `upsellProcessedSales/*` markers exist.
-   - Replay sales `#1`, `#2500`, `#5999` concurrently → assert `totalCompletedSales` remains `6000` (0 duplicates).
-   - Cancel sale `#1` → assert `upsellProcessedSales/sale_1.status === 'reverted'`, `totalCompletedSales === 5999`, and pair counts decrement accurately; re-running cancel is a no-op.
-   - Concurrent `Promise.all` of 10 distinct sales via transactional mock → assert all 10 reflected (`totalCompletedSales === 6009`, zero lost updates).
-2. **Emulator Rules Tests:**
-   - Verify `staffCanAddSales` can read `cooccurrence_v3` but **cannot** tamper with `cooccurrence_v3` or `upsellProcessedSales/*` directly.
-
-### 4.7 Rollback Procedure
-1. Keep `cooccurrence_v2` untouched during `v3` rollout; rolling back `COOCCURRENCE_CACHE_VERSION` to `2` in client/server restores previous behavior immediately.
-2. Delete/ignore `upsellProcessedSales` cleanly without affecting `sales` or `saleItems`.
-
-### 4.8 Production Configuration and Manual Actions
-1. Deploy updated `firestore.rules`.
-2. Deploy updated app build.
-3. Have Owner trigger one-time background rebuild from Settings/Dashboard if historical sales exist so `cooccurrence_v3` and `upsellProcessedSales/*` populate from `sales` + `saleItems`.
+### 6.4 Concurrency, Backward Compatibility & Tests
+- **Concurrent First Transaction vs Delete Race:** Inside `deleteProduct()` / `deleteSupplier()`, convert the final check + delete into a `runTransaction` reading `prodRef`/`supRef` and `entityLocks/{lockId}` in Phase 1 before calling `tx.delete`. Any concurrent `createPurchase`/`createSale` writing `entityLocks` serializes cleanly and aborts `deleteProduct`.
+- **Tests:**
+  1. Emulator rules tests: `Phase 1` denies all hard deletes (`PERMISSION_DENIED`); `Phase 3` denies delete when `migrations/entityLocks_v1` is absent, when `entityLocks/prod_*` exists, when `hasTransactionHistory == true`, when `currentStock > 0`, or when `isActive == true`; allows delete only for genuinely unused archived products (`missingLocks == 0` verified).
+  2. Vitest tests: `backfillEntityHistoryLocks` + `verifyEntityHistoryLocksCoverage` idempotency and verification manifest check across pre-existing sales, purchases, batches, and supplier payments.
 
 ---
 
-<a id="8-atomic-and-idempotent-feedback-storage-migration-to-firestore"></a>
-## 5. §8 Atomic and Idempotent Feedback Storage Migration to Firestore
+<a id="verified-facts-vs-theoretical--unverified-claims"></a>
+## 7. Verified Facts vs. Theoretical / Unverified Claims
 
-### 5.1 Exact Implementation Approach and Affected Files
+To maintain strict engineering transparency prior to approval, every claim in this document falls into one of two explicitly verified categories:
 
-#### Verified Current Flaws
-- `server/upsellFeedbackStore.ts:13–29, 121–294`: Stores `UpsellFeedbackSnapshot` + `processedEventIds` strictly in `.caremart-cache/feedback_v1_<hash>.json` on the ephemeral container disk.
-- `server.ts:2179–2310`: `GET /api/upsell/feedback` and `POST /api/upsell/feedback` never read from or persist to Firestore. Restarts wipe learned acceptance/dismissal penalties, and multiple Cloud Run instances maintain divergent local files.
-- **Why naive shared-doc updates break:** If multiple staff/owner devices read `feedback_v1`, increment locally, and write back the full `productStats` / `categoryPairStats` maps, concurrent requests silently overwrite each other's counters (**lost-update race**)!
+### 7.1 Directly Verified Against Actual Repository Code & Tooling
+1. **Exact existing bugs & line numbers:**
+   - `server.ts`: `OWNER_GATE_SECRET` fallback (`86–87`), `SESSION_SECRET` fallback (`88–93`), `authorizeOwnerUser` unchecked `OWNER_EMAIL` (`554–656`), `caremart_session` usage limited solely to `verifySessionToken` in `GET /api/auth/session` (`1026–1039`), zero calls to `/api/auth/session` in `src/`.
+   - `server/googleSheetsService.ts` (`39–48, 348–378`) & `server/discordNotifier.ts` (`54–63, 400–424`): `v: 1` AES-256-GCM disk vaults and fallback to `OWNER_GATE_SECRET` / `'cm_gate_7d3e9a2c4f1b8e6092c4a1d7f5b8e301'`.
+   - `src/services/shopService.ts`: exact Phase-1 `tx.get` before Phase-2 write order and exact write counts in `createSale` (`2357–2580`), `editSale` (`2734–3043`), `cancelSale` (`3103–3229`), and `.slice(0, 50)` truncation (`2486, 2900`).
+   - `src/services/staffService.ts`: exact Phase-1 `tx.get` order and write counts including `auditLogs` (`+1` at `1167`) in `reconcileStaffSaleToOwnerLedger` (`984–1216`) and `.slice(0, 50)` (`1114`).
+   - `shared/upsellCacheSchema.ts` (`2`), `server/upsellCooccurrenceStore.ts` (`213–219, 273–275`), & `src/services/upsellCooccurrenceService.ts` (`951–1009`): `2000`-ID eviction and `resetFirst: idx === 0` mid-rebuild wipe bug.
+   - `server/upsellFeedbackStore.ts`: disk-only `.caremart-cache/feedback_v1_*.json` persistence.
+   - `firestore.rules`: static `gateSecret()` (`56–58`), `batchAllocations.size() <= 50` (`578`), `processedSaleIds.size() <= 2000` (`848`), unchecked `allow delete` on `suppliers` (`1244`) & `products` (`1283`).
+   - `package.json`: `firebase-admin` is **not** installed.
+   - Workspace filesystem: `.git` does **not** exist; `.caremart-secrets/` does **not** exist; `.caremart-cache/` exists locally; Groups 1–6 Vitest suite (`9` files, `46/46` tests), `tsc --noEmit`, `eslint`, and `vite build` currently pass.
 
-#### Genuinely Atomic, Idempotent, Zero-Overwrite Architecture: Append-Only Deduplicated Event Ledger + Owner-Authoritative Transactional Folding (With Real-Time Optional Atomic Increment)
-
-We recommend **Pattern B (Two-Layer Event Ledger + Transactional Folding)** as primary—and detail **Pattern A** as an alternative if instant cross-device counter reflection via staff token is required without server Admin SDK:
-
-##### Pattern B (Recommended — Zero Staff Overwrite Risk + 100% Atomic & Idempotent)
-1. **Immutable, Idempotent Event Creation (`shops/{shopId}/upsellFeedbackEvents/{eventId}`):**
-   - Client (`upsellFeedbackService.ts`) generates a deterministic or unique `eventId` per discrete UX action (e.g., `fb_${actorUidSlice}_${cartSessionId}_${productId}_${eventType}_${seq}`, valid `^[a-zA-Z0-9_.:-]{8,128}$`).
-   - `POST /api/upsell/feedback` (or direct Firestore SDK for offline-queued flush) validates product ownership (`products`/`staffCatalog`), then executes a **create-only** Firestore write on `shops/{shopId}/upsellFeedbackEvents/{eventId}` (REST `PATCH` with `currentDocument.exists=false` / SDK `runTransaction` `!snap.exists()`):
-     ```ts
-     {
-       ownerUid: string,
-       eventId: string,
-       actorUid: string,
-       actorRole: 'owner' | 'staff',
-       productId: string,
-       eventType: 'shown' | 'accepted' | 'dismissed' | 'removed_after_add',
-       categoryKey: string,
-       anchorCategoryKeys: string[], // max 10
-       folded: boolean,              // starts false (or folded in same tx if server/owner)
-       createdAt: Timestamp
-     }
-     ```
-   - **Idempotency & Concurrency Proof:**
-     - Firestore guarantees `currentDocument: { exists: false }` (or `allow create` with `allow update: if false` for staff) succeeds **at most once per `eventId`** across all Cloud Run instances and browser retries.
-     - Replaying the same `eventId` fails with `409 ALREADY_EXISTS`, which `POST /api/upsell/feedback` converts cleanly into `{ ok: true, duplicate: true }`—**zero duplicate counting ever**!
-     - Because two concurrent staff requests create **distinct document IDs** (`fb_staffA_...` vs `fb_staffB_...`), **two staff members can NEVER overwrite or contend with each other**!
-2. **Atomic Transactional Folding into `shops/{shopId}/upsellCache/feedback_v1`:**
-   - **If caller is Owner** (or **if server uses Firebase Admin / Service Account credentials**): `POST /api/upsell/feedback` (or a debounced background batch every 5–10s / on `GET`) folds all `folded == false` events inside a single Firestore `runTransaction`:
-     - Reads `feedback_v1` + up to `50` unfolded `upsellFeedbackEvents` docs (`folded == false`).
-     - Inside `runTransaction`: re-checks `eventSnap.data().folded === false`, increments `productStats[pid][metric]` and `categoryPairStats[pair][metric]` + `revision`, sets `eventSnap.folded = true`, and caps `productStats` (`<= 500` LRU) and `categoryPairStats` (`<= 400` LRU) cleanly.
-   - **If caller is Staff (and no server Admin SDK is configured):**
-     - Staff `POST /api/upsell/feedback` atomically creates `upsellFeedbackEvents/{eventId}` (`folded: false`) and returns `202` / `200` with optimistic local mirror increment so the staff UI updates immediately.
-     - Whenever **any** Owner dashboard/session runs (or via existing background reconciliation alongside `reconcileStaffSaleToOwnerLedger`), pending `folded == false` events are atomically folded into `feedback_v1` via `runTransaction`!
-   - *(Compare **Pattern A** if instant staff-to-staff global sync without Admin SDK is required: inside a single Firestore REST `:commit` batch, execute Write #1 `create` `upsellFeedbackEvents/{eventId}` (`exists: false` precondition) + Write #2 `transform` `FieldValue.increment(1)` on `productStats.<pid>.<field>`, `categoryPairStats.<pair>.<field>`, `revision`—requires Firestore rules verifying `incoming().revision == existing().revision + 1` and forbidding key deletions by staff, which still needs periodic owner LRU pruning once `productStats.size()` nears `500`. **Pattern B** has cleaner rules and zero map-key-limit contention!)*
-
-#### Affected Files
-- `shared/upsellCacheSchema.ts` (`UpsellFeedbackEventDoc`, `MAX_FEEDBACK_EVENT_IDS`, `UpsellFeedbackSnapshot`)
-- `server/upsellFeedbackStore.ts` (demote disk `.caremart-cache/` to non-authoritative L1 cache keyed by `(shopId, revision)`)
-- `server.ts` (`GET /api/upsell/feedback`, `POST /api/upsell/feedback` — Firestore REST `create` with `exists=false` + transactional folding when authorized, plus `POST /api/upsell/feedback/reconcile` for Owner)
-- `src/services/upsellFeedbackService.ts` (hydrate from Firestore `feedback_v1` + unfolded events, durable `localStorage` offline queue with stable `eventId`s, owner folding hook)
-- `src/contexts/ShopDataContext.tsx` (invoke `reconcileUnfoldedFeedbackEvents(shopId)` for Owner alongside `reconcileStaffSaleToOwnerLedger`)
-- `firestore.rules` (`isValidUpsellFeedbackCache`, `isValidUpsellFeedbackEvent`, `match /upsellCache/{cacheId}`, `match /upsellFeedbackEvents/{eventId}`)
-- `firestore.indexes.json` (composite index on `upsellFeedbackEvents` `(ownerUid ASC, folded ASC, createdAt ASC)`)
-
-### 5.2 Data Integrity Guarantees
-- **True Idempotency Beyond Memory & Container Life:** Because `eventId` uniqueness is enforced by Firestore document primary key (`upsellFeedbackEvents/{eventId}` with `exists: false` precondition), surviving container restarts, multi-instance scaling, and offline browser queue replays, **zero events are ever double-counted**.
-- **Zero Lost Updates Under Concurrent Staff Activity:** Concurrent staff writes hit distinct `upsellFeedbackEvents/{eventId}` docs with zero contention; folding into `feedback_v1` runs exclusively inside serialized Firestore `runTransaction` checking `folded === false`.
-- **Tamper Resistance:** Staff accounts can never decrement, reset, or overwrite `feedback_v1` counters.
-
-### 5.3 Concurrency and Failure Handling
-- **Two Staff Clicks Simultaneously:** Staff A creates `upsellFeedbackEvents/fb_A_1`; Staff B creates `upsellFeedbackEvents/fb_B_1`. Zero lock contention, zero overwrites.
-- **Duplicate Replay / Network Retry:** Client retries `fb_A_1` after timeout → Firestore rejects second create with `409 ALREADY_EXISTS` → server/client treats `409` as idempotent success (`duplicate: true`) and drops the item from the pending retry queue.
-- **Folding Race Between Two Owner Tabs:** Both tabs run `runTransaction` reading `folded === false` events and `feedback_v1`. Firestore aborts and retries the second tab, which sees `folded === true` on re-read and skips those events—guaranteeing exact `+1` count per event.
-- **Offline POS Checkout:** Browser queues `{ eventId, ... }` in `localStorage` (`cm_upsell_feedback_pending_v1_*`) and flushes cleanly once online.
-
-### 5.4 Backward Compatibility
-- Existing `UpsellFeedbackSnapshot` shape (`productStats`, `categoryPairStats`, `revision`, `version: 1`) stays identical.
-- On first upgrade, if local `.caremart-cache/feedback_v1_*.json` or browser mirror has counters while Firestore `feedback_v1` does not exist yet, an owner session seeds `feedback_v1` once safely (`create` if absent).
-
-### 5.5 Firestore Rules and Permissions
-
-```rules
-function isValidUpsellFeedbackEvent(data, shopId, eventId) {
-  return data.keys().hasAll([
-      'ownerUid', 'eventId', 'actorUid', 'actorRole',
-      'productId', 'eventType', 'folded', 'createdAt'
-    ])
-    && data.keys().hasOnly([
-      'ownerUid', 'eventId', 'actorUid', 'actorRole',
-      'productId', 'eventType', 'categoryKey', 'anchorCategoryKeys',
-      'folded', 'createdAt'
-    ])
-    && data.ownerUid == shopId
-    && data.eventId == eventId
-    && data.actorUid == request.auth.uid
-    && data.actorRole in ['owner', 'staff']
-    && isValidId(data.productId)
-    && exists(/databases/$(database)/documents/shops/$(shopId)/products/$(data.productId))
-    && data.eventType in ['shown', 'accepted', 'dismissed', 'removed_after_add']
-    && (!('categoryKey' in data) || (data.categoryKey is string && data.categoryKey.size() <= 80))
-    && (!('anchorCategoryKeys' in data) || (data.anchorCategoryKeys is list && data.anchorCategoryKeys.size() <= 10))
-    && data.folded is bool
-    && data.createdAt is timestamp;
-}
-
-// In match /upsellFeedbackEvents/{eventId}:
-match /upsellFeedbackEvents/{eventId} {
-  allow get: if isValidId(eventId)
-    && ((isOwner(shopId) && (resource == null || existing().ownerUid == shopId))
-        || (staffCanAddSales(shopId) && resource != null && existing().actorUid == request.auth.uid));
-  allow list: if isOwner(shopId) && existing().ownerUid == shopId;
-  allow create: if eventId.matches('^[a-zA-Z0-9_.:-]{8,128}$')
-    && shopExists(shopId)
-    && isValidUpsellFeedbackEvent(incoming(), shopId, eventId)
-    && incoming().createdAt == request.time
-    && (
-      (isOwner(shopId) && incoming().actorRole == 'owner') ||
-      (staffCanAddSales(shopId) && incoming().actorRole == 'staff' && incoming().folded == false)
-    );
-  allow update: if isOwner(shopId)
-    && shopExists(shopId)
-    && existing().ownerUid == shopId
-    && existing().folded == false
-    && incoming().folded == true
-    && incoming().diff(existing()).affectedKeys().hasOnly(['folded']);
-  allow delete: if isOwner(shopId) && shopExists(shopId) && existing().ownerUid == shopId;
-}
-
-// feedback_v1 under match /upsellCache/{cacheId}:
-// Readable by isOwner(shopId) || staffCanAddSales(shopId)
-// Writable ONLY by isOwner(shopId) (or server Admin SDK if provisioned)
-```
-
-### 5.6 Emulator and Regression Tests
-1. **Vitest Concurrency & Idempotency Tests (`upsellFeedbackService.test.ts` & `upsellFeedbackStore.test.ts`):**
-   - Simulate 20 concurrent `POST /api/upsell/feedback` events from Staff A and Staff B + duplicate replay of 5 `eventId`s → assert `20` unique events folded, `0` overwritten counters, `0` duplicates counted.
-   - Simulate server restart (clear memory + delete `.caremart-cache/`) → assert hydration restores exact counters from Firestore `feedback_v1` + unfolded events.
-2. **Emulator Rules Tests:**
-   - Staff creates `upsellFeedbackEvents/{id}` with `folded: false` → **SUCCEEDS**.
-   - Staff attempts to update `upsellCache/feedback_v1` directly or forge `actorUid` / `actorRole: 'owner'` or `folded: true` → **FAILS (`PERMISSION_DENIED`)**.
-   - Staff attempts to create duplicate `upsellFeedbackEvents/{id}` → **FAILS (`ALREADY_EXISTS` / `PERMISSION_DENIED` on update)**.
-
-### 5.7 Rollback Procedure
-1. Revert `server.ts`, `upsellFeedbackStore.ts`, and `upsellFeedbackService.ts` to disk-backed mode.
-2. Revert `firestore.rules` (removing `upsellFeedbackEvents` and `feedback_v1` branch in `upsellCache`).
-3. Existing `upsellFeedbackEvents` docs remain inert without touching any sales/inventory collections.
-
-### 5.8 Production Configuration and Manual Actions
-1. Deploy updated `firestore.rules` and `firestore.indexes.json` (`upsellFeedbackEvents` index `(ownerUid, folded, createdAt)`).
-2. Deploy updated build.
-3. Optional: Decide whether to add `firebase-admin` / Cloud Run Service Account so staff events fold immediately on the server instead of waiting for an owner session.
-
----
-
-<a id="55-product-and-supplier-deletion-rules"></a>
-## 6. §5.5 Product and Supplier Referential Deletion Rules
-
-### 6.1 Exact Implementation Approach and Affected Files
-
-#### Verified Current Gap
-- Client app logic (`shopService.ts:1153–1200` `deleteSupplier()`, `1442–1541` `deleteProduct()`) already queries `inventoryBatches`, `saleItems`, `purchaseItems`, `products`, and `purchases` before deleting.
-- **However, `firestore.rules:1244` (`suppliers`) and `1283` (`products`) only check ownership!**
-- Crucially, checking only `currentStock == 0` in `firestore.rules` is **insufficient** to protect historical data: a product that was purchased, sold completely out (`currentStock == 0`), and has exhausted `inventoryBatches`, `saleItems`, `purchaseItems`, and `stockMovements` could still be hard-deleted via direct Firestore SDK/REST calls—damaging product lineage, batch provenance, restock links, and historical inventory audits! Similarly, a supplier linked to existing products or cancelled/paid purchases could be hard-deleted if only `outstandingBalance == 0` were checked.
-
-#### Exact Implementation: Deterministic History Locks (`entityLocks` + Monotonic `hasTransactionHistory` Flag) Enforced in `firestore.rules`
-Because Firestore Security Rules cannot run collection queries across `saleItems`/`purchaseItems`/`inventoryBatches`, enforce referential integrity deterministically inside `firestore.rules` using **both** intrinsic financial balances AND an **irreversible transaction-history lock**:
-
-1. **Monotonic `hasTransactionHistory` Flag + Immutable `entityLocks/{lockId}` Subcollection:**
-   - Whenever any transaction creates/links a record referencing a product or supplier:
-     - **Product triggers:** `createPurchase()`, `createSale()`, `editSale()`, `adjustStock()`, `reconcileStaffSaleToOwnerLedger()`, `importHistoricalSaleToLedger()`.
-       - Set `hasTransactionHistory: true` on `products/{productId}` **and** write an immutable marker doc `shops/{shopId}/entityLocks/prod_${productId}` (`{ ownerUid, entityType: 'product', entityId: productId, createdAt }`) inside the **exact same Firestore `runTransaction` / `writeBatch`**!
-     - **Supplier triggers:** `createPurchase()`, `recordSupplierPayment()`, `createProduct()` (when `supplierId` is non-empty and linked to a supplier doc).
-       - Set `hasTransactionHistory: true` on `suppliers/{supplierId}` **and** write immutable `shops/{shopId}/entityLocks/sup_${supplierId}`!
-   - **Why BOTH `hasTransactionHistory` + `entityLocks`?**
-     - `entityLocks` is **immutable (`allow update, delete: if false;`)** once created, so not even an owner token calling raw SDK `updateDoc` can clear `hasTransactionHistory` back to `false` and delete the historical record!
-2. **Enforce Full Guard Conditions in `firestore.rules` (`allow delete`):**
-   - **`products/{productId}` `allow delete`:**
-     - `existing().currentStock == 0`
-     - `(!('emptyContainersOnHand' in existing()) || existing().emptyContainersOnHand == 0)`
-     - `existing().get('hasTransactionHistory', false) == false`
-     - `!exists(/databases/$(database)/documents/shops/$(shopId)/entityLocks/prod_$(productId))`
-     - `existing().isActive == false` *(recommended Archive-first policy, or confirmed toggle)*
-   - **`suppliers/{supplierId}` `allow delete`:**
-     - `existing().outstandingBalance == 0`
-     - `existing().totalPurchased == 0`
-     - `existing().totalPaid == 0`
-     - `existing().get('hasTransactionHistory', false) == false`
-     - `!exists(/databases/$(database)/documents/shops/$(shopId)/entityLocks/sup_$(supplierId))`
-   - **`staffCatalog/{productId}` `allow delete`:**
-     - Require parent `products/{productId}` either no longer exists OR satisfies `!exists(.../entityLocks/prod_$(productId))` and `currentStock == 0`, preventing orphaned staff catalog deletion on active historical products.
-3. **Pre-Rule Mandatory Historical Backfill Script:**
-   - Before deploying the `entityLocks` / `hasTransactionHistory` rule enforcement, run an idempotent owner-triggered migration script scanning `inventoryBatches`, `saleItems`, `purchaseItems`, `stockMovements`, `purchases`, `supplierPayments`, and `products` (for `supplierId` links) to create `entityLocks/prod_<id>` + `entityLocks/sup_<id>` and stamp `hasTransactionHistory: true` on every pre-existing historical product and supplier.
-
-#### Affected Files
-- `src/types/shop.ts` (`Product.hasTransactionHistory?: boolean`, `Supplier.hasTransactionHistory?: boolean`)
-- `src/services/shopService.ts`:
-  - `createPurchase()`, `createSale()`, `editSale()`, `adjustStock()`, `recordSupplierPayment()`, `createProduct()`, `updateProduct()` (stamp `hasTransactionHistory: true` + `entityLocks` inside existing transactions)
-  - `deleteProduct()` (lines 1442–1541) and `deleteSupplier()` (lines 1153–1200) — keep full query guards + clear user messaging directing to Archive (`isActive: false`)
-  - New idempotent helper: `backfillEntityHistoryLocks(uid)` (explicitly run once by owner before turning on strict lock enforcement if historical data exists)
-- `src/services/staffService.ts`:
-  - `reconcileStaffSaleToOwnerLedger()` (stamp `hasTransactionHistory: true` + `entityLocks/prod_${pid}` if not yet marked)
-- `firestore.rules`:
-  - `isValidProduct`, `isValidSupplier` (allow optional `hasTransactionHistory` boolean, immutable once `true`)
-  - `match /products/{productId}` (`allow delete` + `allow update` immutability of `hasTransactionHistory == true`)
-  - `match /suppliers/{supplierId}` (`allow delete` + `allow update` immutability of `hasTransactionHistory == true`)
-  - `match /entityLocks/{lockId}` (`allow update, delete: if false;`)
-
-### 6.2 Data Integrity Guarantees
-- **Zero Orphaned Sales/Purchases/Batches/Financial Reports:** Even a direct Firestore SDK/REST delete request cannot delete any product or supplier with stock, balances, or transaction history once locked.
-- **Irreversible Lock:** Because `entityLocks` forbids `update` and `delete`, and `hasTransactionHistory` forbids `true → false` transitions, an owner or compromised session cannot bypass deletion rules by resetting a flag first.
-- **Safe Archival:** Historical SKUs can always be deactivated (`isActive: false`), hiding them from POS selection while preserving 100% of past invoices, COGS, supplier ledgers, and P&L reports.
-
-### 6.3 Concurrency and Failure Handling
-- **Concurrent First Purchase/Sale vs Delete Race:** If an owner opens Delete on an unused product while another action records a purchase/sale on it, `deleteDoc` runs concurrently with `createPurchase`/`createSale`. Writing `entityLocks/prod_${productId}` inside `createPurchase`/`createSale` forces Firestore's preconditions to block `delete` once committed; additionally, executing `deleteProduct` inside `runTransaction` (checking `tx.get(prodRef)` + `tx.get(lockRef)` alongside pre-queried checks) closes the last client-side TOCTOU window!
-- **500-Write Budget Note:** Setting `hasTransactionHistory: true` on `products`/`suppliers` (which are already updated in `createSale`/`createPurchase`) adds `0` extra product writes; creating `entityLocks/prod_${id}` only happens if `!lockSnap.exists()` (at most once in the lifetime of a SKU, and accounted for in §5.3's 480-write budget!).
-
-### 6.4 Backward Compatibility
-- Products and suppliers created prior to migration without `hasTransactionHistory` still work seamlessly in all read/update/sale/purchase flows (`hasTransactionHistory` optional).
-- `shopService.ts`'s existing `getDocs` referential checks continue protecting legacy products/suppliers even during the transition window prior to completing backfill.
-
-### 6.5 Firestore Rules and Permissions
-
-```rules
-// Monotonic field helper: once true, cannot revert to false
-// Inside match /products/{productId} allow update:
-&& !(existing().get('hasTransactionHistory', false) == true && incoming().get('hasTransactionHistory', false) == false)
-
-// Hardened delete on products (line 1283):
-allow delete: if isOwner(shopId)
-  && isValidId(productId)
-  && shopExists(shopId)
-  && existing().ownerUid == shopId
-  && existing().currentStock == 0
-  && (!('emptyContainersOnHand' in existing()) || existing().emptyContainersOnHand == 0)
-  && existing().isActive == false
-  && existing().get('hasTransactionHistory', false) == false
-  && !exists(/databases/$(database)/documents/shops/$(shopId)/entityLocks/$( 'prod_' + productId ));
-
-// Hardened delete on suppliers (line 1244):
-allow delete: if isOwner(shopId)
-  && isValidId(supplierId)
-  && shopExists(shopId)
-  && existing().ownerUid == shopId
-  && existing().outstandingBalance == 0
-  && existing().totalPurchased == 0
-  && existing().totalPaid == 0
-  && existing().get('hasTransactionHistory', false) == false
-  && !exists(/databases/$(database)/documents/shops/$(shopId)/entityLocks/$( 'sup_' + supplierId ));
-
-match /entityLocks/{lockId} {
-  allow get, list: if isOwner(shopId) && existing().ownerUid == shopId;
-  allow create: if isOwner(shopId)
-    && isValidId(lockId)
-    && (lockId.matches('^prod_.+') || lockId.matches('^sup_.+'))
-    && incoming().keys().hasAll(['ownerUid', 'entityType', 'entityId', 'createdAt'])
-    && incoming().keys().hasOnly(['ownerUid', 'entityType', 'entityId', 'createdAt'])
-    && incoming().ownerUid == shopId
-    && incoming().entityType in ['product', 'supplier']
-    && isValidId(incoming().entityId)
-    && incoming().createdAt == request.time
-    && shopExists(shopId);
-  allow update, delete: if false;
-}
-```
-
-### 6.6 Emulator and Regression Tests
-1. **Firestore Emulator Rules Tests:**
-   - Direct `deleteDoc` on product with `currentStock: 10` → **FAILS**.
-   - Direct `deleteDoc` on zero-stock product (`currentStock: 0`, `isActive: false`) that has `hasTransactionHistory: true` or `entityLocks/prod_<id>` → **FAILS (`PERMISSION_DENIED`)**.
-   - Direct attempt to flip `hasTransactionHistory: true → false` or delete `entityLocks/prod_<id>` → **FAILS (`PERMISSION_DENIED`)**.
-   - Direct `deleteDoc` on supplier with `outstandingBalance: 0, totalPurchased: 0, totalPaid: 0` but `entityLocks/sup_<id>` present (or `totalPurchased: 100`) → **FAILS**.
-   - Direct `deleteDoc` on genuinely unused archived product (`currentStock: 0, isActive: false, hasTransactionHistory: false`, no lock) → **SUCCEEDS**.
-2. **Vitest Service Tests (`financialTransactions.test.ts`):**
-   - `createPurchase` / `createSale` stamps `hasTransactionHistory: true` and creates `entityLocks`; subsequent `deleteProduct` / `deleteSupplier` fails even after stock reaches `0`.
-
-### 6.7 Rollback Procedure
-1. Restore previous `allow delete` rules (`1244, 1283`) in `firestore.rules` if an unexpected legitimate deletion is blocked.
-2. Client-side `shopService.ts` query checks remain active as safety net; `entityLocks` documents can sit harmlessly without breaking any reports or transactions.
-
-### 6.8 Production Configuration and Manual Actions
-1. Deploy `firestore.rules` with `entityLocks` and optional `hasTransactionHistory` fields first.
-2. Run the one-time owner-approved `backfillEntityHistoryLocks(shopId)` script (scanning `inventoryBatches`, `saleItems`, `purchaseItems`, `stockMovements`, `purchases`, `supplierPayments`, and product supplier links) to lock all existing historical products and suppliers **before** relying solely on `entityLocks` for legacy items.
-3. Inform shop owner that `Archive / Deactivate (isActive: false)` is required before deleting even an unused mistake product (if `existing().isActive == false` guard is kept).
-
----
-
-<a id="unverified-assumptions--pre-implementation-verification-matrix"></a>
-## 7. Unverified Assumptions & Pre-Implementation Verification Matrix
-
-To avoid making silent assumptions that could fail in live production, the table below explicitly separates **codebase facts verified directly in repository files** from **production/environment assumptions that CANNOT be inspected from this sandbox container and MUST be verified before executing any approved item**:
-
-| Area | Verified Fact in Codebase | Unverified Production Assumption (Must Check Before Implementation) |
-| :--- | :--- | :--- |
-| **Git / Version History** | Verified `.git` directory does **not** exist in `/app/applet`; v1 saved at `/STOP_AND_ASK_PROPOSALS.v1.md`. | Whether you maintain an external Git/GitHub repository outside this AI Studio container where commits should be pushed. |
-| **Firebase Admin SDK (`§4.1`, `§7.1`, `§8`)** | Verified `firebase-admin` is **not** in `package.json`; `server.ts` currently uses HTTPS REST with user Bearer ID tokens only. | Whether the Cloud Run service account has IAM permissions (Application Default Credentials / Datastore User) to use `firebase-admin` without needing an exported JSON key, or whether client-signed/user-scoped REST approaches are required. |
-| **Production Owner Bootstrap (`§4.1`)** | Verified `appState/ownerSetup` logic in `server.ts` and `firestore.rules`, and `OWNER_EMAIL` is currently unchecked during initial setup. | Whether `appState/ownerSetup` and `admins/{ownerUid}` **already exist** in live Firestore DB `ai-studio-36596f53-ce10-4ba0-aae2-9d7f9051d6fe`, whether `OWNER_EMAIL` is already set in Cloud Run Secrets, and whether the owner's Firebase Auth password account has `email_verified == true`. |
-| **Production Vault Files & Secrets (`§4.3`)** | Verified `.caremart-secrets/` does **not** exist in the container workspace, while `.caremart-cache/` exists locally (`cooccurrence_v2_*.json`, `feedback_v1_*.json`). | Whether live production uses `GOOGLE_SERVICE_ACCOUNT_JSON` / `DISCORD_WEBHOOK_URL` env secrets vs `.caremart-secrets/*.enc.json` files on a persistent volume, and whether any custom `OWNER_GATE_SECRET` or `SERVICE_ACCOUNT_ENCRYPTION_KEY` was ever previously configured in production. |
-| **Live Data Scale (`§5.3`, `§7.1`, `§5.5`)** | Verified `batchAllocations.size() <= 50` and `MAX_PROCESSED_SALE_IDS = 2000` in code/rules. | Actual live counts in `ai-studio-36596f53-ce10-4ba0-aae2-9d7f9051d6fe`: (a) whether any historical `saleItems` already hit `batchAllocations.length == 50`, (b) total completed `sales` count (`< 2,000` or `> 2,000`), and (c) number of historical `products` / `suppliers` needing `entityLocks` backfill. |
-| **Product Delete UX (`§5.5`)** | Verified `shopService.ts` already blocks deleting stocked/historical items in UI. | Whether you want `existing().isActive == false` (Archive-first) strictly enforced in `firestore.rules` even for brand-new unused test entries, or allow deleting unused active entries while locking all `hasTransactionHistory` items. |
+### 7.2 Theoretical / Unverified Claims (Require Emulator Tests or Production Inspection Before Execution)
+1. **Proposed `firestore.rules` Expressions Not Yet Tested in Firebase Emulator:**
+   - This workspace currently has **0** Firebase Emulator rules tests (`@firebase/rules-unit-testing` / `firebase emulators:exec` is not configured or run).
+   - Therefore, exact CEL/Rules behavior—such as `hashing.sha256(...).toHexString().lower()`, `duration.value(7, 'd')` subtraction against `existing().foldedAt`, `chunkId == incoming().saleItemId + '_c' + string(incoming().chunkIndex)`, and cross-document `existsAfter` / `exists` read-cost limits (rules allow max `10` document access calls per single-doc eval / `20` per batch)—is **theoretically sound based on Firestore Rules documentation, NOT yet runtime-verified against the Firebase Emulator**!
+2. **Staged Rebuild Cutover & Multi-Instance Cloud Run Contention:**
+   - The `cooccurrence_staging` catch-up + atomic cutover protocol (`§7.1`) and transactional batch folding (`§8`) have **not** been stress-tested under concurrent multi-instance Cloud Run traffic or real Firestore transaction retry limits.
+3. **Production Environment & Live Database State (Cannot Be Inspected From Sandbox):**
+   - Whether Cloud Run runtime IAM has Application Default Credentials (`Datastore User`) for `firebase-admin` (`§4.1`, `§7.1`, `§8`).
+   - Whether `appState/ownerSetup` already exists, whether `OWNER_EMAIL` is set in Cloud Run Secrets, and whether the primary owner's password auth account has `email_verified === true` (`§4.1`).
+   - Whether live production currently holds `.caremart-secrets/*.enc.json` files on a persistent volume or uses `GOOGLE_SERVICE_ACCOUNT_JSON` / `DISCORD_WEBHOOK_URL` env secrets (`§4.3`).
+   - Actual live document counts in `ai-studio-36596f53-ce10-4ba0-aae2-9d7f9051d6fe` (e.g., whether any existing `saleItems` hit `50` allocations, total completed sales `<` or `> 2,000`, and number of historical `products` / `suppliers` requiring `entityLocks` backfill).
 
 ---
 
 ## Individual Approval Checklist
 
-Reply with your approval (and option selection where applicable) per item when ready:
+Please indicate which items (and options) you approve implementing first:
 
-1. **§4.1 Owner Setup Security:** Approve **Approach A** (server-side provisioning + `allow create: if false;` in rules — requires Cloud Run ADC or `firebase-admin` key) OR **Approach B** (deploy-time `OWNER_EMAIL` SHA-256 hash + `email_verified == true` enforced in `firestore.rules`). Confirm whether `email_verified == true` should also be required for initial Email/Password setup.
-2. **§4.3 Encryption & Migration:** Confirm whether production relies on env secrets (`GOOGLE_SERVICE_ACCOUNT_JSON`, `DISCORD_WEBHOOK_URL`) or disk vaults needing the 2-step `ALLOW_LEGACY_FALLBACK_DECRYPT=true` migration window, and whether you want follow-up durable server-only Firestore vault storage (`shops/{shopId}/serverVault`).
-3. **§5.3 FIFO > 50 Batches:** Approve deterministic `saleItemAllocations/${saleItemId}_c${chunkIndex}` overflow chunking + strict `W <= 480` pre-commit transaction budget check (eliminating `.slice(0, 50)` completely).
-4. **§7.1 Co-Occurrence > 2,000 Sales:** Approve `cooccurrence_v3` + unbounded `upsellProcessedSales/{saleId}` per-sale idempotency ledger + `cancelSale` exact-pair reversal.
-5. **§8 Feedback Migration:** Approve **Pattern B** (append-only `upsellFeedbackEvents/{eventId}` deduplication + atomic owner/server transactional folding into `feedback_v1`) OR **Pattern A** (`:commit` atomic `FieldValue.increment(1)` with strict delta rules).
-6. **§5.5 Deletion Rules:** Approve `entityLocks` + monotonic `hasTransactionHistory` lock + historical backfill + field checks in `firestore.rules`, and confirm whether `existing().isActive == false` should also be mandatory prior to hard deletion.
+1. **§4.1 Owner Setup Security:** **Approach A** (server provisioning + `allow create: if false;`) or **Approach B** (deploy-time `OWNER_EMAIL` SHA-256 hash + `email_verified == true` in `firestore.rules`).
+2. **§4.3 Encryption & Session Hardening:** Approve `v: 2` HKDF vault separation, non-destructive `VAULT_DECRYPT_KEY_MISMATCH` handling, and production `SERVICE_ACCOUNT_ENCRYPTION_KEY` / `SESSION_SECRET` enforcement (and indicate env secret vs persistent disk vs Firestore `serverVault`).
+3. **§5.3 FIFO > 50 Batches:** Approve deterministic `saleItemAllocations` chunks + strict Phase-1 read-before-write + `W <= 480` & `W_cancel <= 480` invariants + cancellation restoration regression tests.
+4. **§7.1 Co-Occurrence > 2,000 Sales:** Approve `cooccurrence_v3` + `upsellProcessedSales/{saleId}` + race-free `cooccurrence_staging` rebuild & cutover + `editSale` / `cancelSale` delta reversal.
+5. **§8 Feedback Migration:** Approve staff create-only `upsellFeedbackEvents/{eventId}` + Owner transactional folding into `feedback_v1` + 30-day (`>= 7d` rule-enforced) folded-event cleanup.
+6. **§5.5 Deletion Locks:** Approve the 4-phase migration (`allow delete: if false;` during window → backfill + `verifyEntityHistoryLocksCoverage` manifest → Phase-3 strict `entityLocks` + `hasTransactionHistory` rules).

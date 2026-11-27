@@ -8,11 +8,74 @@ import {
   persistentLocalCache,
   persistentMultipleTabManager,
 } from 'firebase/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
+interface FirebaseWebConfig {
+  projectId: string;
+  appId: string;
+  apiKey: string;
+  authDomain: string;
+  firestoreDatabaseId?: string;
+  storageBucket?: string;
+  messagingSenderId?: string;
+  measurementId?: string;
+}
+
+const localFirebaseModules = import.meta.glob<
+  FirebaseWebConfig & { default?: FirebaseWebConfig }
+>('../../firebase-applet-config.json', { eager: true });
+
+function resolveFirebaseConfig(): FirebaseWebConfig {
+  const firstMod = Object.values(localFirebaseModules)[0];
+  const fileConfig = firstMod ? firstMod.default ?? firstMod : undefined;
+
+  const projectId =
+    (import.meta.env.VITE_FIREBASE_PROJECT_ID as string | undefined)?.trim() ||
+    fileConfig?.projectId ||
+    '';
+  const apiKey =
+    (import.meta.env.VITE_FIREBASE_API_KEY as string | undefined)?.trim() ||
+    fileConfig?.apiKey ||
+    '';
+  const authDomain =
+    (import.meta.env.VITE_FIREBASE_AUTH_DOMAIN as string | undefined)?.trim() ||
+    fileConfig?.authDomain ||
+    (projectId ? `${projectId}.firebaseapp.com` : '');
+  const appId =
+    (import.meta.env.VITE_FIREBASE_APP_ID as string | undefined)?.trim() ||
+    fileConfig?.appId ||
+    '';
+  const firestoreDatabaseId =
+    (import.meta.env.VITE_FIREBASE_DATABASE_ID as string | undefined)?.trim() ||
+    fileConfig?.firestoreDatabaseId ||
+    '(default)';
+  const storageBucket =
+    (import.meta.env.VITE_FIREBASE_STORAGE_BUCKET as string | undefined)?.trim() ||
+    fileConfig?.storageBucket ||
+    undefined;
+  const messagingSenderId =
+    (import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID as string | undefined)?.trim() ||
+    fileConfig?.messagingSenderId ||
+    undefined;
+  const measurementId =
+    (import.meta.env.VITE_FIREBASE_MEASUREMENT_ID as string | undefined)?.trim() ||
+    fileConfig?.measurementId ||
+    undefined;
+
+  return {
+    projectId,
+    appId,
+    apiKey,
+    authDomain,
+    firestoreDatabaseId,
+    ...(storageBucket ? { storageBucket } : {}),
+    ...(messagingSenderId ? { messagingSenderId } : {}),
+    ...(measurementId ? { measurementId } : {}),
+  };
+}
+
+const firebaseConfig = resolveFirebaseConfig();
 
 const app = getApps().some((a) => a.name === '[DEFAULT]') ? getApp() : initializeApp(firebaseConfig);
-const firestoreDatabaseId =
-  (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId || '(default)';
+const firestoreDatabaseId = firebaseConfig.firestoreDatabaseId || '(default)';
 
 function initDb() {
   try {

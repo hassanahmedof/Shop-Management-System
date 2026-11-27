@@ -81,7 +81,41 @@ interface AuthenticatedRequest extends Request {
 }
 
 const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
-const firebaseConfig: FirebaseAppletConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const fileFirebaseConfig: Partial<FirebaseAppletConfig> = fs.existsSync(configPath)
+  ? (JSON.parse(fs.readFileSync(configPath, 'utf8')) as Partial<FirebaseAppletConfig>)
+  : {};
+
+const firebaseConfig: FirebaseAppletConfig = {
+  projectId:
+    process.env.FIREBASE_PROJECT_ID?.trim() ||
+    process.env.VITE_FIREBASE_PROJECT_ID?.trim() ||
+    fileFirebaseConfig.projectId ||
+    '',
+  appId:
+    process.env.VITE_FIREBASE_APP_ID?.trim() ||
+    fileFirebaseConfig.appId ||
+    '',
+  apiKey:
+    process.env.VITE_FIREBASE_API_KEY?.trim() ||
+    fileFirebaseConfig.apiKey ||
+    '',
+  authDomain:
+    process.env.VITE_FIREBASE_AUTH_DOMAIN?.trim() ||
+    fileFirebaseConfig.authDomain ||
+    '',
+  firestoreDatabaseId:
+    process.env.FIREBASE_DATABASE_ID?.trim() ||
+    process.env.VITE_FIREBASE_DATABASE_ID?.trim() ||
+    fileFirebaseConfig.firestoreDatabaseId ||
+    '(default)',
+};
+
+if (!firebaseConfig.projectId) {
+  throw new Error(
+    'Firebase projectId missing. Provide firebase-applet-config.json locally or set FIREBASE_PROJECT_ID / VITE_FIREBASE_PROJECT_ID.'
+  );
+}
+
 const FIRESTORE_DB_ID = firebaseConfig.firestoreDatabaseId || '(default)';
 
 const SESSION_COOKIE_NAME = 'caremart_session';

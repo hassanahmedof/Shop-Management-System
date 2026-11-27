@@ -8,3 +8,5 @@ coverage/
 !.env.example
 .caremart-secrets/
 .caremart-cache/
+firebase-applet-config.json
+

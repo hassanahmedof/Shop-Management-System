@@ -28,6 +28,7 @@ import {
 } from '../services/productSearchService';
 import { createStaffSale } from '../services/staffService';
 import type { PaymentMethod, StaffCatalogItem, StaffPortalSection } from '../types/shop';
+import { WebsiteOrdersView } from './WebsiteOrdersPage';
 import {
   addDaysToIso,
   formatDateDDMMYYYY,
@@ -1402,7 +1403,22 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
     );
   }
 
-  // 4. Products & Stock (Read-only: Names, Selling Prices, Available Stock ONLY)
+  // 4. Website Orders (Authorized sales staff can view & mark Confirmed -> Out for Delivery -> Delivered)
+  if (activeSection === 'website_orders') {
+    if (!staffProfile.permissions.canAddSales) {
+      return (
+        <div className="cm-surface border rounded-xl p-6 text-center space-y-2">
+          <h2 className="text-base font-semibold text-[var(--cm-text-primary)]">Website Orders Restricted</h2>
+          <p className="text-sm text-[var(--cm-text-secondary)]">
+            Your account does not currently have permission to view website orders. Contact your shop owner.
+          </p>
+        </div>
+      );
+    }
+    return <WebsiteOrdersView readOnlyFinancialConfirmation={true} />;
+  }
+
+  // 5. Products & Stock (Read-only: Names, Selling Prices, Available Stock ONLY)
   if (!staffProfile.permissions.canViewStock) {
     return (
       <div className="cm-surface border rounded-xl p-6 text-center space-y-2">

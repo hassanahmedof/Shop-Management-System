@@ -21,3 +21,10 @@
 10. **Path Variable ID Poisoning**: User `u1` creates a product with doc ID containing invalid characters or length > 128 -> `PERMISSION_DENIED`.
 11. **Terminal State Mutation**: User `u1` attempts to update a sale whose `existing().status == 'cancelled'` -> `PERMISSION_DENIED`.
 12. **Audit Log Tampering**: User `u1` attempts to update or delete an entry in `/shops/u1/auditLogs/log1` -> `PERMISSION_DENIED`.
+13. **Storefront Cost Field Leakage / Injection**: Attacker attempts to write `purchasePrice`, `wholesalePrice`, or `profitMarginPct` to `/shops/u1/storefrontCatalog/p1` -> `PERMISSION_DENIED`.
+14. **Public WebsiteOrder Enumeration / PII Read**: Unauthenticated caller attempts `get` or `list` on `/shops/u1/websiteOrders` -> `PERMISSION_DENIED`.
+15. **Storefront Stock Negative / Inflation Tampering**: Public caller attempts to increase `storefrontCatalog/{productId}.currentStock` or set negative stock -> `PERMISSION_DENIED`.
+16. **Pre-Confirmed WebsiteOrder Spoofing**: Public caller attempts to create `/shops/u1/websiteOrders/wo1` with `status: 'Confirmed'` or `linkedSaleId` -> `PERMISSION_DENIED`.
+17. **Oversized Order Line-Item DoS**: Public caller submits `websiteOrders` with `items.size() > 50` or invalid phone format -> `PERMISSION_DENIED`.
+18. **Staff Financial Confirmation Escalation**: Sales staff attempts to change a `Pending Confirmation` website order to `Confirmed` -> `PERMISSION_DENIED`.
+

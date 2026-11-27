@@ -5,6 +5,8 @@ import { roundStockQty } from './packaging';
 
 export const OWNER_PRIMARY_ID = 'owner_primary';
 export const OWNER_UNASSIGNED_ID = 'owner_unassigned';
+export const WEBSITE_STOREFRONT_ID = 'website_storefront';
+export const WEBSITE_STOREFRONT_LABEL = 'Website Storefront';
 export const ALL_OWNERS_FILTER_ID = 'all_owners';
 export const ALL_STAFF_FILTER_ID = 'all_staff';
 
@@ -24,7 +26,7 @@ export interface ResolvedSellerIdentity {
 export interface SellerPerformanceRow {
   sellerKey: string;
   sellerLabel: string;
-  roleType: 'owner_admin' | 'unassigned' | 'staff';
+  roleType: 'owner_admin' | 'unassigned' | 'staff' | 'website';
   orders: number;
   unitsSold: number;
   revenue: number;
@@ -142,11 +144,17 @@ export function resolveCurrentAdminSeller(
   };
 }
 
+export function isWebsiteRecordedSale(
+  sale: Pick<Sale, 'staffId' | 'recordedByRole'>
+): boolean {
+  return sale.recordedByRole === 'website' || (sale.staffId || '').trim() === WEBSITE_STOREFRONT_ID;
+}
+
 export function isStaffRecordedSale(
   sale: Pick<Sale, 'staffId' | 'recordedByRole'>
 ): boolean {
   if (sale.recordedByRole === 'staff') return true;
-  if (sale.recordedByRole === 'owner') return false;
+  if (sale.recordedByRole === 'owner' || isWebsiteRecordedSale(sale)) return false;
   const sid = (sale.staffId || '').trim();
   if (!sid || sid === 'owner' || sid === OWNER_PRIMARY_ID || sid === OWNER_UNASSIGNED_ID) {
     return false;
@@ -160,6 +168,9 @@ export function isStaffRecordedSale(
 export function getSaleSellerKey(
   sale: Pick<Sale, 'staffId' | 'recordedByRole'>
 ): string {
+  if (isWebsiteRecordedSale(sale)) {
+    return WEBSITE_STOREFRONT_ID;
+  }
   if (isStaffRecordedSale(sale)) {
     return (sale.staffId || '').trim() || 'staff';
   }
@@ -173,6 +184,9 @@ export function getSaleSellerKey(
 export function formatSaleSellerLabel(
   sale: Pick<Sale, 'staffId' | 'staffName' | 'recordedByRole'>
 ): string {
+  if (isWebsiteRecordedSale(sale)) {
+    return (sale.staffName || '').trim() || WEBSITE_STOREFRONT_LABEL;
+  }
   if (isStaffRecordedSale(sale)) {
     return (sale.staffName || '').trim() || 'Sales Staff';
   }
@@ -189,7 +203,7 @@ export function matchesSellerFilter(
 ): boolean {
   if (!filterValue || filterValue === 'all') return true;
   if (filterValue === ALL_OWNERS_FILTER_ID || filterValue === 'owner') {
-    return !isStaffRecordedSale(sale);
+    return !isStaffRecordedSale(sale) && !isWebsiteRecordedSale(sale);
   }
   if (filterValue === ALL_STAFF_FILTER_ID) {
     return isStaffRecordedSale(sale);
@@ -272,6 +286,17 @@ export function buildSellerFilterOptions(params: {
     seenKeys.add(staff.id);
   }
 
+  const hasWebsiteSales = sales.some((s) => isWebsiteRecordedSale(s));
+  if (hasWebsiteSales) {
+    options.push({
+      value: WEBSITE_STOREFRONT_ID,
+      label: WEBSITE_STOREFRONT_LABEL,
+      subtitle: 'Confirmed Cash-on-Delivery storefront orders',
+      keywords: ['website', 'storefront', 'online order', 'cod'],
+    });
+    seenKeys.add(WEBSITE_STOREFRONT_ID);
+  }
+
   // Include any historical seller keys present in sales (e.g. deleted staff/admin)
   for (const s of sales) {
     const key = getSaleSellerKey(s);
@@ -281,7 +306,11 @@ export function buildSellerFilterOptions(params: {
     options.push({
       value: key,
       label,
-      subtitle: isStaffRecordedSale(s) ? 'Sales Staff (Historical)' : 'Admin (Historical)',
+      subtitle: isWebsiteRecordedSale(s)
+        ? 'Online Storefront'
+        : isStaffRecordedSale(s)
+          ? 'Sales Staff (Historical)'
+          : 'Admin (Historical)',
       keywords: [label],
     });
   }
@@ -353,9 +382,11 @@ export function computeSellerPerformanceBreakdown(params: {
     const roleType: SellerPerformanceRow['roleType'] =
       key === OWNER_UNASSIGNED_ID
         ? 'unassigned'
-        : isStaffRecordedSale(s)
-          ? 'staff'
-          : 'owner_admin';
+        : isWebsiteRecordedSale(s)
+          ? 'website'
+          : isStaffRecordedSale(s)
+            ? 'staff'
+            : 'owner_admin';
 
     const row = ensureRow(key, label, roleType);
     // Keep most specific label if seeded name was generic
@@ -384,7 +415,7 @@ export function computeSellerPerformanceBreakdown(params: {
   return rows.sort((a, b) => {
     if (b.revenue !== a.revenue) return b.revenue - a.revenue;
     if (a.roleType !== b.roleType) {
-      const rank = { owner_admin: 0, staff: 1, unassigned: 2 };
+      const rank = { owner_admin: 0, website: 1, staff: 2, unassigned: 3 };
       return rank[a.roleType] - rank[b.roleType];
     }
     return a.sellerLabel.localeCompare(b.sellerLabel);

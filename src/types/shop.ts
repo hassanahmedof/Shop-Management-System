@@ -104,6 +104,16 @@ export interface StaffPackagingOption {
   isDefaultSale?: boolean;
 }
 
+export interface StorefrontPackagingOption {
+  unitName: string;
+  conversionQty: number;
+  containsQty?: number;
+  parentUnitName?: string;
+  allowSale: boolean;
+  salePrice: number;
+  isDefaultSale?: boolean;
+}
+
 export interface BatchAllocation {
   batchId: string;
   consumedBaseQty: number;
@@ -157,6 +167,7 @@ export interface Product {
   supplierName: string;
   expiryDate: string; // YYYY-MM-DD or ''
   profitMarginPct: number;
+  image?: string;
   isActive: boolean;
   createdAt?: Timestamp;
   updatedAt?: Timestamp;
@@ -220,7 +231,7 @@ export interface Sale {
   itemCount: number;
   staffId?: string;
   staffName?: string;
-  recordedByRole?: 'owner' | 'staff';
+  recordedByRole?: 'owner' | 'staff' | 'website';
   customerWhatsapp?: string;
   notes: string;
   status: TransactionStatus;
@@ -518,9 +529,85 @@ export interface StaffSale {
   updatedAt?: Timestamp;
 }
 
+export interface StorefrontMeta {
+  id: string;
+  ownerUid: string;
+  shopName: string;
+  phone: string;
+  address: string;
+  currency: 'PKR';
+  updatedAt?: Timestamp;
+}
+
+export interface StorefrontCatalogItem {
+  id: string;
+  ownerUid: string;
+  productId: string;
+  name: string;
+  category: string;
+  brand: string;
+  salePrice: number;
+  currentStock: number;
+  unit: string;
+  baseUnit: string;
+  packagingUnits: StorefrontPackagingOption[];
+  image: string;
+  isActive: boolean;
+  updatedAt?: Timestamp;
+}
+
+export type WebsiteOrderStatus =
+  | 'Pending Confirmation'
+  | 'Confirmed'
+  | 'Out for Delivery'
+  | 'Delivered'
+  | 'Cancelled/Rejected';
+
+export interface WebsiteOrderItem {
+  productId: string;
+  productName: string;
+  unitName: string;
+  conversionFactor: number;
+  quantity: number;
+  baseQuantity: number;
+  unitPrice: number;
+  lineTotal: number;
+}
+
+export interface WebsiteOrder {
+  id: string;
+  ownerUid: string;
+  shopId: string;
+  orderNumber: string;
+  customerName: string;
+  customerPhone: string;
+  customerAddress: string;
+  customerNotes: string;
+  paymentMethod: 'Cash on Delivery';
+  status: WebsiteOrderStatus;
+  items: WebsiteOrderItem[];
+  itemCount: number;
+  totalQuantity: number;
+  subtotal: number;
+  deliveryFee: number;
+  totalAmount: number;
+  linkedSaleId?: string;
+  linkedSaleNumber?: string;
+  rejectionReason?: string;
+  confirmedBy?: string;
+  confirmedByName?: string;
+  confirmedAt?: Timestamp;
+  outForDeliveryAt?: Timestamp;
+  deliveredAt?: Timestamp;
+  cancelledAt?: Timestamp;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
 export type NavSection =
   | 'dashboard'
   | 'sales'
+  | 'website_orders'
   | 'staff'
   | 'products'
   | 'inventory'
@@ -532,7 +619,12 @@ export type NavSection =
   | 'activity'
   | 'settings';
 
-export type StaffPortalSection = 'dashboard' | 'new_sale' | 'my_sales' | 'stock';
+export type StaffPortalSection =
+  | 'dashboard'
+  | 'new_sale'
+  | 'my_sales'
+  | 'stock'
+  | 'website_orders';
 
 export interface GoogleSheetsIntegration {
   id: string;

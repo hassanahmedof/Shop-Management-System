@@ -60,6 +60,7 @@ import {
   normalizePackagingUnits,
   resolveCanonicalCategoryName,
   roundStockQty,
+  toStorefrontPackagingUnits,
 } from '../utils/packaging';
 
 import {
@@ -74,6 +75,8 @@ import {
 } from '../utils/productTemplateHelpers';
 import { recordPerfMetric, startPerfTimer } from '../utils/perfMonitor';
 import { formatOwnerAdminLabel, OWNER_PRIMARY_ID } from '../utils/sellerAttribution';
+
+export { generateTxnNumber };
 
 function clip(val: string | undefined | null, maxLen: number): string {
   return (val || '').trim().slice(0, maxLen);
@@ -294,6 +297,15 @@ export async function ensureShopInitialized(
         autoBackupEnabled: true,
         lastBackupAt: '',
         createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      batch.set(shopDoc(uid, 'storefront', 'meta'), {
+        ownerUid: uid,
+        shopName: initialShopName,
+        phone: '',
+        address: '',
+        currency: 'PKR',
         updatedAt: serverTimestamp(),
       });
 
@@ -1252,6 +1264,7 @@ export interface ProductInput {
   supplierId: string;
   supplierName: string;
   expiryDate: string;
+  image?: string;
   isActive: boolean;
 }
 
@@ -1264,6 +1277,7 @@ export async function createProduct(uid: string, input: ProductInput): Promise<s
   const wholesalePrice = Math.max(0, roundMoney(input.wholesalePrice));
   const profitMarginPct = calcProfitMarginPct(purchasePrice, salePrice);
   const initialStock = roundStockQty(Math.max(0, Number(input.currentStock) || 0));
+  const cleanImage = clip(input.image, 500);
   const todayIso = getKarachiDateIso();
 
   try {
@@ -1297,8 +1311,25 @@ export async function createProduct(uid: string, input: ProductInput): Promise<s
       supplierName: clip(input.supplierName, 150),
       expiryDate: clip(input.expiryDate, 20),
       profitMarginPct,
+      ...(cleanImage ? { image: cleanImage } : {}),
       isActive: input.isActive,
       createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    batch.set(shopDoc(uid, 'storefrontCatalog', prodRef.id), {
+      ownerUid: uid,
+      productId: prodRef.id,
+      name: clip(input.name, 180),
+      category: clip(input.categoryName, 100),
+      brand: clip(input.brandName, 100),
+      salePrice,
+      currentStock: initialStock,
+      unit: baseUnit,
+      baseUnit,
+      packagingUnits: toStorefrontPackagingUnits(packagingUnits, baseUnit),
+      image: cleanImage,
+      isActive: Boolean(input.isActive),
       updatedAt: serverTimestamp(),
     });
 
@@ -1380,6 +1411,7 @@ export async function updateProduct(
   const salePrice = Math.max(0, roundMoney(input.salePrice));
   const wholesalePrice = Math.max(0, roundMoney(input.wholesalePrice));
   const profitMarginPct = calcProfitMarginPct(purchasePrice, salePrice);
+  const cleanImage = input.image !== undefined ? clip(input.image, 500) : undefined;
 
   try {
     const batch = writeBatch(db);
@@ -1410,6 +1442,7 @@ export async function updateProduct(
       supplierName: clip(input.supplierName, 150),
       expiryDate: clip(input.expiryDate, 20),
       profitMarginPct,
+      ...(cleanImage !== undefined ? { image: cleanImage } : {}),
       isActive: input.isActive,
       updatedAt: serverTimestamp(),
     });
@@ -1446,10 +1479,12 @@ export async function deleteProduct(
 ): Promise<void> {
   const prodRef = shopDoc(uid, 'products', product.id);
   const staffCatRef = shopDoc(uid, 'staffCatalog', product.id);
+  const storefrontCatRef = shopDoc(uid, 'storefrontCatalog', product.id);
   try {
-    const [prodSnap, staffCatSnap, activeBatchSnap, exhaustedBatchSnap] = await Promise.all([
+    const [prodSnap, staffCatSnap, storefrontCatSnap, activeBatchSnap, exhaustedBatchSnap] = await Promise.all([
       getDoc(prodRef),
       getDoc(staffCatRef),
+      getDoc(storefrontCatRef),
       getDocs(
         query(
           shopCol(uid, 'inventoryBatches'),
@@ -1512,6 +1547,9 @@ export async function deleteProduct(
     batch.delete(prodRef);
     if (staffCatSnap.exists()) {
       batch.delete(staffCatRef);
+    }
+    if (storefrontCatSnap.exists()) {
+      batch.delete(storefrontCatRef);
     }
     const logRef = doc(shopCol(uid, 'auditLogs'));
     batch.set(logRef, {
@@ -2198,6 +2236,359 @@ export interface SaleLineDraft {
   salePricePerUnit: number;
 }
 
+export interface MergedSaleLine {
+  key: string;
+  productId: string;
+  unitName: string;
+  conversionFactor: number;
+  unitQuantity: number;
+  baseQuantity: number;
+  salePricePerUnit: number;
+}
+
+export function normalizeAndMergeSaleLines(items: SaleLineDraft[]): {
+  merged: Map<string, MergedSaleLine>;
+  involvedProductIds: Set<string>;
+} {
+  if (!items.length) {
+    throw new Error('Add at least one product to record a sale.');
+  }
+
+  const merged = new Map<string, MergedSaleLine>();
+  const involvedProductIds = new Set<string>();
+
+  for (const row of items) {
+    const unitQty = roundStockQty(Number(row.quantity) || 0);
+    const conv = roundStockQty(Number(row.conversionFactor) || 1);
+    if (unitQty <= 0) throw new Error('Quantity must be greater than zero.');
+    if (conv <= 0) throw new Error('Unit conversion factor must be greater than zero.');
+    if (row.salePricePerUnit < 0) throw new Error('Selling price cannot be negative.');
+
+    const cleanUnit = clip(row.unitName || '', 40);
+    const key = `${row.productId}::${cleanUnit.toLowerCase() || '__base__'}`;
+    involvedProductIds.add(row.productId);
+
+    const existing = merged.get(key);
+    if (existing) {
+      existing.unitQuantity = roundStockQty(existing.unitQuantity + unitQty);
+      existing.baseQuantity = roundStockQty(existing.unitQuantity * existing.conversionFactor);
+      existing.salePricePerUnit = roundMoney(row.salePricePerUnit);
+    } else {
+      merged.set(key, {
+        key,
+        productId: row.productId,
+        unitName: cleanUnit,
+        conversionFactor: conv,
+        unitQuantity: unitQty,
+        baseQuantity: roundStockQty(unitQty * conv),
+        salePricePerUnit: roundMoney(row.salePricePerUnit),
+      });
+    }
+  }
+
+  return { merged, involvedProductIds };
+}
+
+export async function fetchCandidateActiveBatchIds(
+  uid: string,
+  involvedPids: string[],
+  hintBatchIds?: string[]
+): Promise<string[]> {
+  const FIRESTORE_IN_CHUNK_SIZE = 30;
+  const batchIdSet = new Set<string>(hintBatchIds || []);
+  if (involvedPids.length === 0) return Array.from(batchIdSet);
+
+  try {
+    const pidChunks: string[][] = [];
+    for (let i = 0; i < involvedPids.length; i += FIRESTORE_IN_CHUNK_SIZE) {
+      pidChunks.push(involvedPids.slice(i, i + FIRESTORE_IN_CHUNK_SIZE));
+    }
+    const batchSnaps = await Promise.all(
+      pidChunks.map((chunk) =>
+        getDocs(
+          query(
+            shopCol(uid, 'inventoryBatches'),
+            where('ownerUid', '==', uid),
+            where('productId', 'in', chunk),
+            where('status', '==', 'active')
+          )
+        )
+      )
+    );
+    for (const batchSnap of batchSnaps) {
+      for (const d of batchSnap.docs) {
+        const data = d.data() as InventoryBatch;
+        if (Number(data.remainingBaseQty) > 0) {
+          batchIdSet.add(d.id);
+        }
+      }
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/inventoryBatches`);
+  }
+  return Array.from(batchIdSet);
+}
+
+export interface StageSaleLedgerParams {
+  tx: Parameters<Parameters<typeof runTransaction>[1]>[0];
+  uid: string;
+  saleRef: ReturnType<typeof doc>;
+  saleNumber: string;
+  saleDate: string;
+  paymentMethod: PaymentMethod;
+  customerWhatsapp?: string;
+  notes: string;
+  sellerId: string;
+  sellerName: string;
+  recordedByRole: 'owner' | 'website';
+  allowStockOverride: boolean;
+  merged: Map<string, MergedSaleLine>;
+  productMap: Map<string, Product>;
+  batchesByProduct: Map<string, InventoryBatch[]>;
+  extraPlannedWrites?: number;
+  auditAction?: string;
+  auditSummary?: string;
+}
+
+export function stageValidatedSaleLedgerWrites(params: StageSaleLedgerParams): {
+  totalAmount: number;
+  totalCost: number;
+  totalProfit: number;
+  totalQuantity: number;
+  itemCount: number;
+  discordPayload: Parameters<typeof notifyDiscordTransaction>[1];
+} {
+  const {
+    tx,
+    uid,
+    saleRef,
+    saleNumber,
+    saleDate,
+    paymentMethod,
+    customerWhatsapp,
+    notes,
+    sellerId,
+    sellerName,
+    recordedByRole,
+    allowStockOverride,
+    merged,
+    productMap,
+    batchesByProduct,
+    extraPlannedWrites = 0,
+    auditAction = 'CREATE_SALE',
+    auditSummary,
+  } = params;
+
+  const requestedBaseByProduct = new Map<string, number>();
+  for (const line of merged.values()) {
+    requestedBaseByProduct.set(
+      line.productId,
+      roundStockQty((requestedBaseByProduct.get(line.productId) || 0) + line.baseQuantity)
+    );
+  }
+
+  for (const [pid, reqBase] of requestedBaseByProduct.entries()) {
+    const product = productMap.get(pid)!;
+    const baseUnit = getEffectiveBaseUnit(product);
+    if (!allowStockOverride && product.currentStock < reqBase) {
+      throw new Error(
+        `Insufficient stock for "${product.name}". Available: ${product.currentStock} ${baseUnit}, Requested: ${reqBase} ${baseUnit}.`
+      );
+    }
+  }
+
+  let totalAmount = 0;
+  let totalCost = 0;
+  let totalQuantity = 0;
+  const discordItems: Array<{
+    productName: string;
+    quantity: number;
+    unitPrice: number;
+    lineTotal: number;
+    unit: string;
+  }> = [];
+
+  const runningStock = new Map<string, number>();
+  for (const [pid, prod] of productMap.entries()) {
+    runningStock.set(pid, roundStockQty(prod.currentStock));
+  }
+
+  const batchMutations = new Map<string, { remainingBaseQty: number; status: 'active' | 'exhausted' }>();
+
+  for (const line of merged.values()) {
+    const product = productMap.get(line.productId)!;
+    const baseUnit = getEffectiveBaseUnit(product);
+    const unitLabel = line.unitName || baseUnit;
+    const productBatches = batchesByProduct.get(line.productId) || [];
+
+    const fifo = allocateFifoFromBatches(
+      productBatches,
+      line.baseQuantity,
+      product.purchasePrice
+    );
+    for (const mut of fifo.updatedBatches) {
+      batchMutations.set(mut.batchId, {
+        remainingBaseQty: mut.nextRemainingBaseQty,
+        status: mut.nextStatus,
+      });
+    }
+
+    const lineTotal = roundMoney(line.unitQuantity * line.salePricePerUnit);
+    const lineCost = fifo.totalCost;
+    const lineProfit = roundMoney(lineTotal - lineCost);
+
+    totalAmount = roundMoney(totalAmount + lineTotal);
+    totalCost = roundMoney(totalCost + lineCost);
+    totalQuantity = roundStockQty(totalQuantity + line.baseQuantity);
+
+    discordItems.push({
+      productName: clip(product.name, 180),
+      quantity: line.unitQuantity,
+      unitPrice: line.salePricePerUnit,
+      lineTotal,
+      unit:
+        line.conversionFactor > 1
+          ? clip(`${unitLabel} (${line.conversionFactor} ${baseUnit})`, 40)
+          : clip(unitLabel, 40),
+    });
+
+    const prevStock = runningStock.get(line.productId) ?? product.currentStock;
+    const nextStock = roundStockQty(Math.max(0, prevStock - line.baseQuantity));
+    runningStock.set(line.productId, nextStock);
+
+    const itemRef = doc(shopCol(uid, 'saleItems'));
+    tx.set(itemRef, {
+      ownerUid: uid,
+      saleId: saleRef.id,
+      saleDate,
+      productId: line.productId,
+      productName: clip(product.name, 180),
+      categoryId: clip(product.categoryId, 128),
+      categoryName: clip(product.categoryName, 100),
+      brandId: clip(product.brandId, 128),
+      brandName: clip(product.brandName, 100),
+      quantity: line.unitQuantity,
+      unitName: clip(unitLabel, 40),
+      unitQuantity: line.unitQuantity,
+      conversionFactor: line.conversionFactor,
+      baseQuantity: line.baseQuantity,
+      salePricePerUnit: line.salePricePerUnit,
+      purchasePriceAtSale: fifo.weightedBaseUnitCost,
+      lineTotal,
+      lineCost,
+      lineProfit,
+      batchAllocations: fifo.allocations.slice(0, 50),
+      staffId: sellerId,
+      staffName: sellerName,
+      status: 'completed',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    const movRef = doc(shopCol(uid, 'stockMovements'));
+    tx.set(movRef, {
+      ownerUid: uid,
+      productId: line.productId,
+      productName: clip(product.name, 180),
+      movementDate: saleDate,
+      movementType: 'sale',
+      quantityChange: -line.baseQuantity,
+      previousStock: prevStock,
+      newStock: nextStock,
+      unitName: clip(unitLabel, 40),
+      unitQuantity: line.unitQuantity,
+      conversionFactor: line.conversionFactor,
+      baseQuantity: line.baseQuantity,
+      referenceId: saleRef.id,
+      notes: clip(`Sale ${saleNumber} (${line.unitQuantity} ${unitLabel})`, 500),
+      createdAt: serverTimestamp(),
+    });
+  }
+
+  const plannedTxWrites =
+    2 * merged.size + runningStock.size + batchMutations.size + 2 + extraPlannedWrites;
+  if (plannedTxWrites > 500) {
+    throw new Error(
+      `This sale requires ${plannedTxWrites} database writes (including ${batchMutations.size} FIFO batch updates), exceeding Firestore's 500-write atomic transaction limit. Please split it into smaller bills.`
+    );
+  }
+
+  for (const [pid, nextStock] of runningStock.entries()) {
+    tx.update(shopDoc(uid, 'products', pid), {
+      currentStock: nextStock,
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  for (const [batchId, mut] of batchMutations.entries()) {
+    tx.update(shopDoc(uid, 'inventoryBatches', batchId), {
+      remainingBaseQty: mut.remainingBaseQty,
+      status: mut.status,
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  const totalProfit = roundMoney(totalAmount - totalCost);
+  const saleDateTime = formatDateTimeKarachi(new Date());
+  const cleanWhatsapp = normalizeCustomerWhatsapp(customerWhatsapp);
+
+  tx.set(saleRef, {
+    ownerUid: uid,
+    saleNumber,
+    saleDate,
+    saleDateTime,
+    paymentMethod,
+    totalAmount,
+    totalCost,
+    totalProfit,
+    totalQuantity,
+    itemCount: merged.size,
+    staffId: sellerId,
+    staffName: sellerName,
+    recordedByRole,
+    ...(cleanWhatsapp ? { customerWhatsapp: clip(cleanWhatsapp, 32) } : {}),
+    notes: clip(notes, 500),
+    status: 'completed',
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
+  const logRef = doc(shopCol(uid, 'auditLogs'));
+  tx.set(logRef, {
+    ownerUid: uid,
+    action: auditAction,
+    entityType: 'sale',
+    entityId: saleRef.id,
+    summary: clip(
+      auditSummary ||
+        `Recorded sale ${saleNumber} (${paymentMethod}) by ${sellerName}: PKR ${totalAmount} · Profit PKR ${totalProfit}`,
+      400
+    ),
+    createdAt: serverTimestamp(),
+  });
+
+  return {
+    totalAmount,
+    totalCost,
+    totalProfit,
+    totalQuantity,
+    itemCount: merged.size,
+    discordPayload: {
+      type: 'sale',
+      dedupeId: saleRef.id,
+      saleId: saleNumber,
+      saleDate,
+      saleDateTime,
+      staffName: sellerName,
+      paymentMethod,
+      items: discordItems,
+      totalAmount,
+      totalProfit,
+      notes: clip(notes, 500),
+    },
+  };
+}
+
 export async function createSale(
   uid: string,
   input: {
@@ -2276,49 +2667,7 @@ export async function createSale(
     }
   }
 
-  // Merge duplicate (productId, unitName) rows while preserving separate unit lines (e.g. Pack + Piece)
-  interface MergedSaleLine {
-    key: string;
-    productId: string;
-    unitName: string;
-    conversionFactor: number;
-    unitQuantity: number;
-    baseQuantity: number;
-    salePricePerUnit: number;
-  }
-  const merged = new Map<string, MergedSaleLine>();
-  const involvedProductIds = new Set<string>();
-
-  for (const row of input.items) {
-    const unitQty = roundStockQty(Number(row.quantity) || 0);
-    const conv = roundStockQty(Number(row.conversionFactor) || 1);
-    if (unitQty <= 0) throw new Error('Quantity must be greater than zero.');
-    if (conv <= 0) throw new Error('Unit conversion factor must be greater than zero.');
-    if (row.salePricePerUnit < 0) throw new Error('Selling price cannot be negative.');
-
-    const cleanUnit = clip(row.unitName || '', 40);
-    const key = `${row.productId}::${cleanUnit.toLowerCase() || '__base__'}`;
-    involvedProductIds.add(row.productId);
-
-    const existing = merged.get(key);
-    if (existing) {
-      existing.unitQuantity = roundStockQty(existing.unitQuantity + unitQty);
-      existing.baseQuantity = roundStockQty(existing.unitQuantity * existing.conversionFactor);
-      existing.salePricePerUnit = roundMoney(row.salePricePerUnit);
-    } else {
-      merged.set(key, {
-        key,
-        productId: row.productId,
-        unitName: cleanUnit,
-        conversionFactor: conv,
-        unitQuantity: unitQty,
-        baseQuantity: roundStockQty(unitQty * conv),
-        salePricePerUnit: roundMoney(row.salePricePerUnit),
-      });
-    }
-  }
-
-  const FIRESTORE_IN_CHUNK_SIZE = 30;
+  const { merged, involvedProductIds } = normalizeAndMergeSaleLines(input.items);
   const involvedPids = Array.from(involvedProductIds);
   const minimumTxWrites = 2 * merged.size + involvedPids.length + 2;
   if (minimumTxWrites > 500) {
@@ -2328,36 +2677,11 @@ export async function createSale(
   }
 
   // Merge caller hints with chunked indexed batch queries (30 products per query) so concurrent purchases are never missed
-  const batchIdSet = new Set<string>(options?.activeBatchIds || []);
-  try {
-    const pidChunks: string[][] = [];
-    for (let i = 0; i < involvedPids.length; i += FIRESTORE_IN_CHUNK_SIZE) {
-      pidChunks.push(involvedPids.slice(i, i + FIRESTORE_IN_CHUNK_SIZE));
-    }
-    const batchSnaps = await Promise.all(
-      pidChunks.map((chunk) =>
-        getDocs(
-          query(
-            shopCol(uid, 'inventoryBatches'),
-            where('ownerUid', '==', uid),
-            where('productId', 'in', chunk),
-            where('status', '==', 'active')
-          )
-        )
-      )
-    );
-    for (const batchSnap of batchSnaps) {
-      for (const d of batchSnap.docs) {
-        const data = d.data() as InventoryBatch;
-        if (Number(data.remainingBaseQty) > 0) {
-          batchIdSet.add(d.id);
-        }
-      }
-    }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/inventoryBatches`);
-  }
-  const candidateBatchIds = Array.from(batchIdSet);
+  const candidateBatchIds = await fetchCandidateActiveBatchIds(
+    uid,
+    involvedPids,
+    options?.activeBatchIds
+  );
 
   const saleRef = doc(shopCol(uid, 'sales'));
   const saleNumber = generateTxnNumber('SL');
@@ -2368,7 +2692,6 @@ export async function createSale(
 
     await runTransaction(db, async (tx) => {
       // Phase 1: ALL reads before ANY writes (parallelized via Promise.all)
-      const involvedPids = Array.from(involvedProductIds);
       const [prodSnaps, batchSnaps] = await Promise.all([
         Promise.all(involvedPids.map((pid) => tx.get(shopDoc(uid, 'products', pid)))),
         Promise.all(candidateBatchIds.map((batchId) => tx.get(shopDoc(uid, 'inventoryBatches', batchId)))),
@@ -2395,207 +2718,25 @@ export async function createSale(
         }
       }
 
-      // Sum total base units requested per product across all unit lines
-      const requestedBaseByProduct = new Map<string, number>();
-      for (const line of merged.values()) {
-        requestedBaseByProduct.set(
-          line.productId,
-          roundStockQty((requestedBaseByProduct.get(line.productId) || 0) + line.baseQuantity)
-        );
-      }
-
-      for (const [pid, reqBase] of requestedBaseByProduct.entries()) {
-        const product = productMap.get(pid)!;
-        const baseUnit = getEffectiveBaseUnit(product);
-        if (!allowStockOverride && product.currentStock < reqBase) {
-          throw new Error(
-            `Insufficient stock for "${product.name}". Available: ${product.currentStock} ${baseUnit}, Requested: ${reqBase} ${baseUnit}.`
-          );
-        }
-      }
-
-      // Phase 2: Calculate FIFO costs, prepare writes
-      let totalAmount = 0;
-      let totalCost = 0;
-      let totalQuantity = 0;
-      const discordItems: Array<{
-        productName: string;
-        quantity: number;
-        unitPrice: number;
-        lineTotal: number;
-        unit: string;
-      }> = [];
-
-      const runningStock = new Map<string, number>();
-      for (const [pid, prod] of productMap.entries()) {
-        runningStock.set(pid, roundStockQty(prod.currentStock));
-      }
-
-      const batchMutations = new Map<string, { remainingBaseQty: number; status: 'active' | 'exhausted' }>();
-
-      for (const line of merged.values()) {
-        const product = productMap.get(line.productId)!;
-        const baseUnit = getEffectiveBaseUnit(product);
-        const unitLabel = line.unitName || baseUnit;
-        const productBatches = batchesByProduct.get(line.productId) || [];
-
-        const fifo = allocateFifoFromBatches(
-          productBatches,
-          line.baseQuantity,
-          product.purchasePrice
-        );
-        for (const mut of fifo.updatedBatches) {
-          batchMutations.set(mut.batchId, {
-            remainingBaseQty: mut.nextRemainingBaseQty,
-            status: mut.nextStatus,
-          });
-        }
-
-        const lineTotal = roundMoney(line.unitQuantity * line.salePricePerUnit);
-        const lineCost = fifo.totalCost;
-        const lineProfit = roundMoney(lineTotal - lineCost);
-
-        totalAmount = roundMoney(totalAmount + lineTotal);
-        totalCost = roundMoney(totalCost + lineCost);
-        totalQuantity = roundStockQty(totalQuantity + line.baseQuantity);
-
-        discordItems.push({
-          productName: clip(product.name, 180),
-          quantity: line.unitQuantity,
-          unitPrice: line.salePricePerUnit,
-          lineTotal,
-          unit:
-            line.conversionFactor > 1
-              ? clip(`${unitLabel} (${line.conversionFactor} ${baseUnit})`, 40)
-              : clip(unitLabel, 40),
-        });
-
-        const prevStock = runningStock.get(line.productId) ?? product.currentStock;
-        const nextStock = roundStockQty(Math.max(0, prevStock - line.baseQuantity));
-        runningStock.set(line.productId, nextStock);
-
-        const itemRef = doc(shopCol(uid, 'saleItems'));
-        tx.set(itemRef, {
-          ownerUid: uid,
-          saleId: saleRef.id,
-          saleDate: input.saleDate,
-          productId: line.productId,
-          productName: clip(product.name, 180),
-          categoryId: clip(product.categoryId, 128),
-          categoryName: clip(product.categoryName, 100),
-          brandId: clip(product.brandId, 128),
-          brandName: clip(product.brandName, 100),
-          quantity: line.unitQuantity,
-          unitName: clip(unitLabel, 40),
-          unitQuantity: line.unitQuantity,
-          conversionFactor: line.conversionFactor,
-          baseQuantity: line.baseQuantity,
-          salePricePerUnit: line.salePricePerUnit,
-          purchasePriceAtSale: fifo.weightedBaseUnitCost,
-          lineTotal,
-          lineCost,
-          lineProfit,
-          batchAllocations: fifo.allocations.slice(0, 50),
-          staffId: sellerId,
-          staffName: sellerName,
-          status: 'completed',
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-
-        const movRef = doc(shopCol(uid, 'stockMovements'));
-        tx.set(movRef, {
-          ownerUid: uid,
-          productId: line.productId,
-          productName: clip(product.name, 180),
-          movementDate: input.saleDate,
-          movementType: 'sale',
-          quantityChange: -line.baseQuantity,
-          previousStock: prevStock,
-          newStock: nextStock,
-          unitName: clip(unitLabel, 40),
-          unitQuantity: line.unitQuantity,
-          conversionFactor: line.conversionFactor,
-          baseQuantity: line.baseQuantity,
-          referenceId: saleRef.id,
-          notes: clip(`Sale ${saleNumber} (${line.unitQuantity} ${unitLabel})`, 500),
-          createdAt: serverTimestamp(),
-        });
-      }
-
-      const plannedTxWrites = 2 * merged.size + runningStock.size + batchMutations.size + 2;
-      if (plannedTxWrites > 500) {
-        throw new Error(
-          `This sale requires ${plannedTxWrites} database writes (including ${batchMutations.size} FIFO batch updates), exceeding Firestore's 500-write atomic transaction limit. Please split it into smaller bills.`
-        );
-      }
-
-      for (const [pid, nextStock] of runningStock.entries()) {
-        tx.update(shopDoc(uid, 'products', pid), {
-          currentStock: nextStock,
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      for (const [batchId, mut] of batchMutations.entries()) {
-        tx.update(shopDoc(uid, 'inventoryBatches', batchId), {
-          remainingBaseQty: mut.remainingBaseQty,
-          status: mut.status,
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      const totalProfit = roundMoney(totalAmount - totalCost);
-      const saleDateTime = formatDateTimeKarachi(new Date());
-      const cleanWhatsapp = normalizeCustomerWhatsapp(input.customerWhatsapp);
-
-      tx.set(saleRef, {
-        ownerUid: uid,
+      // Phase 2: Validate stock, calculate FIFO costs, stage ledger writes
+      const staged = stageValidatedSaleLedgerWrites({
+        tx,
+        uid,
+        saleRef,
         saleNumber,
         saleDate: input.saleDate,
-        saleDateTime,
         paymentMethod: input.paymentMethod,
-        totalAmount,
-        totalCost,
-        totalProfit,
-        totalQuantity,
-        itemCount: merged.size,
-        staffId: sellerId,
-        staffName: sellerName,
+        customerWhatsapp: input.customerWhatsapp,
+        notes: input.notes,
+        sellerId,
+        sellerName,
         recordedByRole: 'owner',
-        ...(cleanWhatsapp ? { customerWhatsapp: clip(cleanWhatsapp, 32) } : {}),
-        notes: clip(input.notes, 500),
-        status: 'completed',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+        allowStockOverride,
+        merged,
+        productMap,
+        batchesByProduct,
       });
-
-      const logRef = doc(shopCol(uid, 'auditLogs'));
-      tx.set(logRef, {
-        ownerUid: uid,
-        action: 'CREATE_SALE',
-        entityType: 'sale',
-        entityId: saleRef.id,
-        summary: clip(
-          `Recorded sale ${saleNumber} (${input.paymentMethod}) by ${sellerName}: PKR ${totalAmount} · Profit PKR ${totalProfit}`,
-          400
-        ),
-        createdAt: serverTimestamp(),
-      });
-
-      discordPayload = {
-        type: 'sale',
-        dedupeId: saleRef.id,
-        saleId: saleNumber,
-        saleDate: input.saleDate,
-        saleDateTime,
-        staffName: sellerName,
-        paymentMethod: input.paymentMethod,
-        items: discordItems,
-        totalAmount,
-        totalProfit,
-        notes: clip(input.notes, 500),
-      };
+      discordPayload = staged.discordPayload;
     });
 
     if (discordPayload) {
@@ -3103,26 +3244,33 @@ export async function editSale(
   }
 }
 
-export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by owner'): Promise<void> {
-  if (sale.status === 'cancelled') return;
-
+export async function fetchSaleItemsAndReferencedBatches(
+  uid: string,
+  saleId: string
+): Promise<{
+  items: SaleItem[];
+  uniqueProdIds: string[];
+  referencedBatchIds: string[];
+}> {
   const itemsQuery = query(
     shopCol(uid, 'saleItems'),
     where('ownerUid', '==', uid),
-    where('saleId', '==', sale.id)
+    where('saleId', '==', saleId)
   );
   let items: SaleItem[] = [];
   try {
     const snap = await getDocs(itemsQuery);
     items = snap.docs
       .map((d) => ({ id: d.id, ...(d.data() as Omit<SaleItem, 'id'>) }))
-      .filter((item) => item.saleId === sale.id);
+      .filter((item) => item.saleId === saleId);
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, `shops/${uid}/saleItems`);
   }
 
   const referencedBatchIds = new Set<string>();
+  const uniqueProdIds = new Set<string>();
   for (const item of items) {
+    uniqueProdIds.add(item.productId);
     if (item.status !== 'cancelled' && Array.isArray(item.batchAllocations)) {
       for (const alloc of item.batchAllocations) {
         if (alloc?.batchId) referencedBatchIds.add(alloc.batchId);
@@ -3130,20 +3278,170 @@ export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by
     }
   }
 
+  return {
+    items,
+    uniqueProdIds: Array.from(uniqueProdIds),
+    referencedBatchIds: Array.from(referencedBatchIds),
+  };
+}
+
+export function stageCancelSaleLedgerWrites(params: {
+  tx: Parameters<Parameters<typeof runTransaction>[1]>[0];
+  uid: string;
+  saleId: string;
+  saleNumber: string;
+  saleTotalAmount: number;
+  existingNotes: string;
+  reason: string;
+  todayIso: string;
+  items: SaleItem[];
+  saleRef: ReturnType<typeof doc>;
+  ssRef?: ReturnType<typeof doc>;
+  ssExists?: boolean;
+  prodSnaps: Map<string, Product>;
+  batchSnaps: Map<string, InventoryBatch>;
+  auditAction?: string;
+  auditSummary?: string;
+}): void {
+  const {
+    tx,
+    uid,
+    saleId,
+    saleNumber,
+    saleTotalAmount,
+    existingNotes,
+    reason,
+    todayIso,
+    items,
+    saleRef,
+    ssRef,
+    ssExists = false,
+    prodSnaps,
+    batchSnaps,
+    auditAction = 'CANCEL_SALE',
+    auditSummary,
+  } = params;
+
+  const runningStock = new Map<string, number>();
+  for (const [pid, prod] of prodSnaps.entries()) {
+    runningStock.set(pid, roundStockQty(prod.currentStock));
+  }
+
+  const batchRestoreAccum = new Map<string, number>();
+
+  for (const item of items) {
+    if (item.status !== 'cancelled') {
+      tx.update(shopDoc(uid, 'saleItems', item.id), {
+        status: 'cancelled',
+        updatedAt: serverTimestamp(),
+      });
+
+      const restoreBase = roundStockQty(
+        item.baseQuantity ?? item.quantity * (item.conversionFactor || 1)
+      );
+      const cur = runningStock.get(item.productId);
+      if (cur !== undefined) {
+        const next = roundStockQty(cur + restoreBase);
+        runningStock.set(item.productId, next);
+        const movRef = doc(shopCol(uid, 'stockMovements'));
+        tx.set(movRef, {
+          ownerUid: uid,
+          productId: item.productId,
+          productName: clip(item.productName, 180),
+          movementDate: todayIso,
+          movementType: 'sale_cancel',
+          quantityChange: restoreBase,
+          previousStock: cur,
+          newStock: next,
+          unitName: clip(item.unitName || '', 40),
+          unitQuantity: item.unitQuantity ?? item.quantity,
+          conversionFactor: item.conversionFactor ?? 1,
+          baseQuantity: restoreBase,
+          referenceId: saleId,
+          notes: clip(`Returned from cancelled sale ${saleNumber}`, 500),
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      if (Array.isArray(item.batchAllocations)) {
+        for (const alloc of item.batchAllocations) {
+          if (!alloc?.batchId || !alloc.consumedBaseQty) continue;
+          batchRestoreAccum.set(
+            alloc.batchId,
+            roundStockQty((batchRestoreAccum.get(alloc.batchId) || 0) + alloc.consumedBaseQty)
+          );
+        }
+      }
+    }
+  }
+
+  for (const [bId, addQty] of batchRestoreAccum.entries()) {
+    const batch = batchSnaps.get(bId);
+    if (!batch || batch.status === 'cancelled') continue;
+    const nextRem = roundStockQty(Math.min(batch.initialBaseQty, batch.remainingBaseQty + addQty));
+    tx.update(shopDoc(uid, 'inventoryBatches', bId), {
+      remainingBaseQty: nextRem,
+      status: nextRem > 0 ? 'active' : 'exhausted',
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  for (const [pid, nextStock] of runningStock.entries()) {
+    tx.update(shopDoc(uid, 'products', pid), {
+      currentStock: nextStock,
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  const combinedNotes = existingNotes ? `${existingNotes} | Cancelled: ${reason}` : `Cancelled: ${reason}`;
+  tx.update(saleRef, {
+    status: 'cancelled',
+    notes: clip(combinedNotes, 500),
+    updatedAt: serverTimestamp(),
+  });
+
+  if (ssExists && ssRef) {
+    tx.update(ssRef, {
+      status: 'cancelled',
+      notes: clip(combinedNotes, 500),
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  const logRef = doc(shopCol(uid, 'auditLogs'));
+  tx.set(logRef, {
+    ownerUid: uid,
+    action: auditAction,
+    entityType: 'sale',
+    entityId: saleId,
+    summary: clip(
+      auditSummary ||
+        `Cancelled sale ${saleNumber} (PKR ${saleTotalAmount}) and restored inventory`,
+      400
+    ),
+    createdAt: serverTimestamp(),
+  });
+}
+
+export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by owner'): Promise<void> {
+  if (sale.status === 'cancelled') return;
+
+  const { items, uniqueProdIds, referencedBatchIds } = await fetchSaleItemsAndReferencedBatches(
+    uid,
+    sale.id
+  );
   const todayIso = getKarachiDateIso();
 
   try {
     await runTransaction(db, async (tx) => {
       const saleRef = shopDoc(uid, 'sales', sale.id);
       const ssRef = shopDoc(uid, 'staffSales', sale.id);
-      const uniqueProdIds = Array.from(new Set(items.map((item) => item.productId)));
-      const batchIdList = Array.from(referencedBatchIds);
 
       const [saleSnap, ssSnap, prodDocs, batchDocs] = await Promise.all([
         tx.get(saleRef),
         tx.get(ssRef),
         Promise.all(uniqueProdIds.map((pid) => tx.get(shopDoc(uid, 'products', pid)))),
-        Promise.all(batchIdList.map((bId) => tx.get(shopDoc(uid, 'inventoryBatches', bId)))),
+        Promise.all(referencedBatchIds.map((bId) => tx.get(shopDoc(uid, 'inventoryBatches', bId)))),
       ]);
       if (!saleSnap.exists() || saleSnap.data()?.status === 'cancelled') {
         throw new Error('Sale is already cancelled.');
@@ -3164,100 +3462,21 @@ export async function cancelSale(uid: string, sale: Sale, reason = 'Cancelled by
         }
       }
 
-      const runningStock = new Map<string, number>();
-      for (const [pid, prod] of prodSnaps.entries()) {
-        runningStock.set(pid, roundStockQty(prod.currentStock));
-      }
-
-      const batchRestoreAccum = new Map<string, number>();
-
-      for (const item of items) {
-        if (item.status !== 'cancelled') {
-          tx.update(shopDoc(uid, 'saleItems', item.id), {
-            status: 'cancelled',
-            updatedAt: serverTimestamp(),
-          });
-
-          const restoreBase = roundStockQty(
-            item.baseQuantity ?? item.quantity * (item.conversionFactor || 1)
-          );
-          const cur = runningStock.get(item.productId);
-          if (cur !== undefined) {
-            const next = roundStockQty(cur + restoreBase);
-            runningStock.set(item.productId, next);
-            const movRef = doc(shopCol(uid, 'stockMovements'));
-            tx.set(movRef, {
-              ownerUid: uid,
-              productId: item.productId,
-              productName: clip(item.productName, 180),
-              movementDate: todayIso,
-              movementType: 'sale_cancel',
-              quantityChange: restoreBase,
-              previousStock: cur,
-              newStock: next,
-              unitName: clip(item.unitName || '', 40),
-              unitQuantity: item.unitQuantity ?? item.quantity,
-              conversionFactor: item.conversionFactor ?? 1,
-              baseQuantity: restoreBase,
-              referenceId: sale.id,
-              notes: clip(`Returned from cancelled sale ${sale.saleNumber}`, 500),
-              createdAt: serverTimestamp(),
-            });
-          }
-
-          if (Array.isArray(item.batchAllocations)) {
-            for (const alloc of item.batchAllocations) {
-              if (!alloc?.batchId || !alloc.consumedBaseQty) continue;
-              batchRestoreAccum.set(
-                alloc.batchId,
-                roundStockQty((batchRestoreAccum.get(alloc.batchId) || 0) + alloc.consumedBaseQty)
-              );
-            }
-          }
-        }
-      }
-
-      for (const [bId, addQty] of batchRestoreAccum.entries()) {
-        const batch = batchSnaps.get(bId);
-        if (!batch || batch.status === 'cancelled') continue;
-        const nextRem = roundStockQty(Math.min(batch.initialBaseQty, batch.remainingBaseQty + addQty));
-        tx.update(shopDoc(uid, 'inventoryBatches', bId), {
-          remainingBaseQty: nextRem,
-          status: nextRem > 0 ? 'active' : 'exhausted',
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      for (const [pid, nextStock] of runningStock.entries()) {
-        tx.update(shopDoc(uid, 'products', pid), {
-          currentStock: nextStock,
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      const combinedNotes = sale.notes ? `${sale.notes} | Cancelled: ${reason}` : `Cancelled: ${reason}`;
-      tx.update(saleRef, {
-        status: 'cancelled',
-        notes: clip(combinedNotes, 500),
-        updatedAt: serverTimestamp(),
-      });
-
-      if (ssSnap.exists()) {
-        tx.update(ssRef, {
-          status: 'cancelled',
-          notes: clip(combinedNotes, 500),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      const logRef = doc(shopCol(uid, 'auditLogs'));
-      tx.set(logRef, {
-        ownerUid: uid,
-        action: 'CANCEL_SALE',
-        entityType: 'sale',
-        entityId: sale.id,
-        summary: clip(`Cancelled sale ${sale.saleNumber} (PKR ${sale.totalAmount}) and restored inventory`, 400),
-        createdAt: serverTimestamp(),
+      stageCancelSaleLedgerWrites({
+        tx,
+        uid,
+        saleId: sale.id,
+        saleNumber: sale.saleNumber,
+        saleTotalAmount: sale.totalAmount,
+        existingNotes: sale.notes,
+        reason,
+        todayIso,
+        items,
+        saleRef,
+        ssRef,
+        ssExists: ssSnap.exists(),
+        prodSnaps,
+        batchSnaps,
       });
     });
 
@@ -4281,6 +4500,14 @@ export async function updateShopSettings(
     });
     batch.update(doc(db, 'shops', uid), {
       shopName: clip(input.shopName, 150),
+      updatedAt: serverTimestamp(),
+    });
+    batch.set(shopDoc(uid, 'storefront', 'meta'), {
+      ownerUid: uid,
+      shopName: clip(input.shopName, 150),
+      phone: clip(input.phone, 40),
+      address: clip(input.address, 300),
+      currency: 'PKR',
       updatedAt: serverTimestamp(),
     });
     const logRef = doc(shopCol(uid, 'auditLogs'));

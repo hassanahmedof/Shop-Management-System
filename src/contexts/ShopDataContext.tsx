@@ -54,8 +54,14 @@ import type {
   StaffSale,
   StockAdjustment,
   StockMovement,
+  StorefrontCatalogItem,
   Supplier,
+  WebsiteOrder,
 } from '../types/shop';
+import {
+  syncStorefrontCatalogDocuments,
+  syncStorefrontMeta,
+} from '../services/websiteOrderService';
 import { getKarachiDateIso } from '../utils/formatters';
 import { sortCategoriesForDisplay } from '../utils/packaging';
 import { useAuth } from './AuthContext';
@@ -82,6 +88,8 @@ interface ShopDataContextValue {
   adminMembers: AdminMember[];
   staffCatalog: StaffCatalogItem[];
   staffSales: StaffSale[];
+  storefrontCatalog: StorefrontCatalogItem[];
+  websiteOrders: WebsiteOrder[];
   loading: boolean;
 }
 
@@ -117,6 +125,8 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   const [adminMembers, setAdminMembers] = useState<AdminMember[]>([]);
   const [staffCatalog, setStaffCatalog] = useState<StaffCatalogItem[]>([]);
   const [staffSales, setStaffSales] = useState<StaffSale[]>([]);
+  const [storefrontCatalog, setStorefrontCatalog] = useState<StorefrontCatalogItem[]>([]);
+  const [websiteOrders, setWebsiteOrders] = useState<WebsiteOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [liveListenersSettled, setLiveListenersSettled] = useState(false);
 
@@ -137,6 +147,23 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     prodSig: '',
     staffCatalog: null,
     catSig: '',
+  });
+  const storefrontMetaSigRef = useRef<string>('');
+  const storefrontSyncSigRef = useRef<string>('');
+  const storefrontSyncPartsRef = useRef<{
+    products: Product[] | null;
+    prodSig: string;
+    websiteOrders: WebsiteOrder[] | null;
+    pendingSig: string;
+    storefrontCatalog: StorefrontCatalogItem[] | null;
+    sfSig: string;
+  }>({
+    products: null,
+    prodSig: '',
+    websiteOrders: null,
+    pendingSig: '',
+    storefrontCatalog: null,
+    sfSig: '',
   });
   const lookupBackfillSigRef = useRef<string>('');
   const reconcilingIdsRef = useRef<Set<string>>(new Set());
@@ -182,6 +209,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       setBackups([]);
       setStaffMembers([]);
       setAdminMembers([]);
+      setStorefrontCatalog([]);
 
       const canReadCatalog =
         Boolean(staffProfile?.isActive) &&
@@ -189,6 +217,12 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       const canReadOwnSales =
         Boolean(staffProfile?.isActive) &&
         Boolean(staffProfile?.permissions?.canViewOwnSales || staffProfile?.permissions?.canAddSales);
+      const canViewWebsiteOrders =
+        Boolean(staffProfile?.isActive) && Boolean(staffProfile?.permissions?.canAddSales);
+
+      if (!canViewWebsiteOrders) {
+        setWebsiteOrders([]);
+      }
 
       const cachedCatalog = canReadCatalog ? loadCachedStaffCatalog(shopId, user.uid) : [];
       const cachedSales = canReadOwnSales ? loadCachedStaffSales(shopId, user.uid) : [];
@@ -205,7 +239,8 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
         setStaffSales([]);
       }
 
-      const expected = (canReadCatalog ? 1 : 0) + (canReadOwnSales ? 1 : 0);
+      const expected =
+        (canReadCatalog ? 1 : 0) + (canReadOwnSales ? 1 : 0) + (canViewWebsiteOrders ? 1 : 0);
       if (
         expected === 0 ||
         (typeof navigator !== 'undefined' && !navigator.onLine) ||
@@ -312,6 +347,39 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
         );
       }
 
+      if (canViewWebsiteOrders) {
+        const ordersPath = `shops/${shopId}/websiteOrders`;
+        const ordersQ = query(
+          collection(db, 'shops', shopId, 'websiteOrders'),
+          where('ownerUid', '==', shopId)
+        );
+        let first = true;
+        unsubs.push(
+          onSnapshot(
+            ordersQ,
+            (snap) => {
+              setWebsiteOrders(
+                snap.docs.map((d) => ({
+                  ...(d.data() as Omit<WebsiteOrder, 'id'>),
+                  id: d.id,
+                }))
+              );
+              if (first) {
+                first = false;
+                markStaffSettled();
+              }
+            },
+            (error) => {
+              if (isNetworkOrOfflineError(error)) {
+                setLoading(false);
+                return;
+              }
+              handleFirestoreError(error, OperationType.LIST, ordersPath);
+            }
+          )
+        );
+      }
+
       return () => {
         unsubs.forEach((u) => u());
       };
@@ -366,7 +434,7 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     }
 
     let settledCount = 0;
-    const totalListeners = 20;
+    const totalListeners = 23;
     const markSettled = () => {
       settledCount += 1;
       if (settledCount >= totalListeners) {
@@ -466,6 +534,8 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       listenList<AdminMember>('adminMembers', setAdminMembers),
       listenList<StaffCatalogItem>('staffCatalog', setStaffCatalog),
       listenList<StaffSale>('staffSales', setStaffSales),
+      listenList<StorefrontCatalogItem>('storefrontCatalog', setStorefrontCatalog),
+      listenList<WebsiteOrder>('websiteOrders', setWebsiteOrders),
     ];
 
     return () => {
@@ -564,6 +634,66 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       console.error('Staff catalog sync error:', err);
     });
   }, [sessionRole, shopId, liveListenersSettled, products, staffMembers, staffCatalog]);
+
+  // Owner: keep public storefront/meta synchronized with shop settings
+  useEffect(() => {
+    if (sessionRole !== 'owner' || !shopId || !liveListenersSettled || !settings) return;
+    const sig = `${shopId}:${settings.shopName || ''}:${settings.phone || ''}:${settings.address || ''}:${settings.currency || 'PKR'}`;
+    if (storefrontMetaSigRef.current === sig) return;
+    storefrontMetaSigRef.current = sig;
+
+    void syncStorefrontMeta(shopId, settings).catch((err) => {
+      console.error('Storefront meta sync error:', err);
+    });
+  }, [sessionRole, shopId, liveListenersSettled, settings]);
+
+  // Owner: keep public storefrontCatalog synchronized with real products & pending COD website reservations
+  useEffect(() => {
+    if (sessionRole !== 'owner' || !shopId || !liveListenersSettled) return;
+    if (products.length === 0 && storefrontCatalog.length === 0) return;
+
+    const parts = storefrontSyncPartsRef.current;
+    const prodSig =
+      parts.products === products
+        ? parts.prodSig
+        : products
+            .map(
+              (p) =>
+                `${p.id}:${p.name}:${p.categoryName}:${p.brandName}:${p.salePrice}:${p.currentStock}:${p.baseUnit || p.unit}:${JSON.stringify(p.packagingUnits || [])}:${p.image || ''}:${Boolean(p.isActive)}`
+            )
+            .join('|');
+    const pendingSig =
+      parts.websiteOrders === websiteOrders
+        ? parts.pendingSig
+        : websiteOrders
+            .filter((o) => o.status === 'Pending Confirmation')
+            .map((o) => `${o.id}:${(o.items || []).map((i) => `${i.productId}=${i.baseQuantity}`).join(',')}`)
+            .join('|');
+    const sfSig =
+      parts.storefrontCatalog === storefrontCatalog
+        ? parts.sfSig
+        : storefrontCatalog
+            .map(
+              (c) =>
+                `${c.productId || c.id}:${c.name}:${c.category}:${c.brand}:${c.salePrice}:${c.currentStock}:${c.baseUnit || c.unit}:${JSON.stringify(c.packagingUnits || [])}:${c.image || ''}:${Boolean(c.isActive)}`
+            )
+            .join('|');
+
+    parts.products = products;
+    parts.prodSig = prodSig;
+    parts.websiteOrders = websiteOrders;
+    parts.pendingSig = pendingSig;
+    parts.storefrontCatalog = storefrontCatalog;
+    parts.sfSig = sfSig;
+
+    const combinedSig = `${shopId}::${prodSig}::${pendingSig}::${sfSig}`;
+    if (storefrontSyncSigRef.current === combinedSig) return;
+    storefrontSyncSigRef.current = combinedSig;
+
+    void syncStorefrontCatalogDocuments(shopId, products, websiteOrders, storefrontCatalog).catch((err) => {
+      console.error('Storefront catalog sync error:', err);
+    });
+  }, [sessionRole, shopId, liveListenersSettled, products, websiteOrders, storefrontCatalog]);
 
   // Owner: backfill username-only staffLookup documents (u_<username>) for any pre-existing staff
   useEffect(() => {
@@ -829,6 +959,19 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       }),
     [staffSales]
   );
+  const sortedStorefrontCatalog = useMemo(
+    () => [...storefrontCatalog].sort((a, b) => a.name.localeCompare(b.name)),
+    [storefrontCatalog]
+  );
+  const sortedWebsiteOrders = useMemo(
+    () =>
+      [...websiteOrders].sort((a, b) => {
+        const timeDiff = timestampToMillis(b.createdAt) - timestampToMillis(a.createdAt);
+        if (timeDiff !== 0) return timeDiff;
+        return (b.orderNumber || '').localeCompare(a.orderNumber || '');
+      }),
+    [websiteOrders]
+  );
 
   const value = useMemo<ShopDataContextValue>(
     () => ({
@@ -853,6 +996,8 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       adminMembers: sortedAdminMembers,
       staffCatalog: sortedStaffCatalog,
       staffSales: sortedStaffSales,
+      storefrontCatalog: sortedStorefrontCatalog,
+      websiteOrders: sortedWebsiteOrders,
       loading,
     }),
     [
@@ -877,6 +1022,8 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       sortedAdminMembers,
       sortedStaffCatalog,
       sortedStaffSales,
+      sortedStorefrontCatalog,
+      sortedWebsiteOrders,
       loading,
     ]
   );

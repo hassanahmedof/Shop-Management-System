@@ -50,6 +50,9 @@ const StaffPortalView = lazy(() =>
 const StockAdjustmentsPage = lazy(() =>
   import('./pages/StockAdjustmentsPage').then((m) => ({ default: m.StockAdjustmentsPage }))
 );
+const WebsiteOrdersPage = lazy(() =>
+  import('./pages/WebsiteOrdersPage').then((m) => ({ default: m.WebsiteOrdersPage }))
+);
 
 function PageSuspenseFallback() {
   return (
@@ -71,6 +74,7 @@ const RESTRICTED_STAFF_PREFIXES = [
   '/reports',
   '/activity',
   '/settings',
+  '/website-orders',
 ];
 
 function isRestrictedPathForStaff(pathname: string): boolean {
@@ -265,6 +269,8 @@ function MainApp() {
         return <DashboardPage onNavigate={setActiveSection} />;
       case 'sales':
         return <SalesPage />;
+      case 'website_orders':
+        return <WebsiteOrdersPage />;
       case 'staff':
         return <StaffManagementPage />;
       case 'products':

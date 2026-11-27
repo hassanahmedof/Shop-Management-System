@@ -6,6 +6,7 @@ import type {
   ProductPackagingUnit,
   StaffCatalogItem,
   StaffPackagingOption,
+  StorefrontPackagingOption,
 } from '../types/shop';
 import { formatNumber, roundMoney } from './formatters';
 
@@ -448,6 +449,43 @@ export function toStaffPackagingUnits(
       allowSale: true,
       salePrice: Math.max(0, roundMoney(Number(u.salePrice) || 0)),
       wholesalePrice: Math.max(0, roundMoney(Number(u.wholesalePrice) || 0)),
+      isDefaultSale: Boolean(u.isDefaultSale),
+    };
+    const containsQty = roundStockQty(Number(u.containsQty) || 0);
+    if (containsQty > 0 && u.parentUnitName) {
+      opt.containsQty = containsQty;
+      opt.parentUnitName = u.parentUnitName.trim().slice(0, 40);
+    }
+    out.push(opt);
+    if (out.length >= MAX_PACKAGING_LEVELS) break;
+  }
+
+  return out;
+}
+
+export function toStorefrontPackagingUnits(
+  units: ProductPackagingUnit[] | undefined | null,
+  baseUnit?: string
+): StorefrontPackagingOption[] {
+  if (!Array.isArray(units)) return [];
+  const baseLower = (baseUnit || '').trim().toLowerCase();
+  const seen = new Set<string>();
+  const out: StorefrontPackagingOption[] = [];
+
+  for (const u of units) {
+    const unitName = (u?.unitName || '').trim().slice(0, 40);
+    if (!unitName) continue;
+    const lower = unitName.toLowerCase();
+    if ((baseLower && lower === baseLower) || seen.has(lower)) continue;
+    const conversionQty = roundStockQty(Number(u?.conversionQty) || 0);
+    if (conversionQty <= 0 || u?.allowSale === false) continue;
+
+    seen.add(lower);
+    const opt: StorefrontPackagingOption = {
+      unitName,
+      conversionQty,
+      allowSale: true,
+      salePrice: Math.max(0, roundMoney(Number(u.salePrice) || 0)),
       isDefaultSale: Boolean(u.isDefaultSale),
     };
     const containsQty = roundStockQty(Number(u.containsQty) || 0);

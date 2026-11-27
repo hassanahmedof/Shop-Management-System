@@ -330,6 +330,7 @@
         "supplierName": { "type": "string", "maxLength": 150 },
         "expiryDate": { "type": "string", "maxLength": 20 },
         "profitMarginPct": { "type": "number" },
+        "image": { "type": "string", "maxLength": 500 },
         "isActive": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
@@ -398,7 +399,7 @@
         "itemCount": { "type": "number" },
         "staffId": { "type": "string", "maxLength": 128 },
         "staffName": { "type": "string", "maxLength": 120 },
-        "recordedByRole": { "type": "string", "enum": ["owner", "staff"] },
+        "recordedByRole": { "type": "string", "enum": ["owner", "staff", "website"] },
         "customerWhatsapp": { "type": "string", "maxLength": 32 },
         "notes": { "type": "string", "maxLength": 500 },
         "status": { "type": "string", "enum": ["completed", "cancelled"] },
@@ -710,6 +711,83 @@
         "saleCountsByProduct", "pairCounts", "processedSaleIds",
         "createdAt", "updatedAt"
       ]
+    },
+    "StorefrontMeta": {
+      "title": "StorefrontMeta",
+      "description": "Public read-only shop contact and currency metadata for the customer storefront.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "address": { "type": "string", "maxLength": 300 },
+        "currency": { "type": "string", "enum": ["PKR"] },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "shopName", "phone", "address", "currency", "updatedAt"]
+    },
+    "StorefrontCatalogItem": {
+      "title": "StorefrontCatalogItem",
+      "description": "Public read-only sanitized product projection excluding cost prices, wholesale prices, margins, and supplier metadata.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "category": { "type": "string", "maxLength": 100 },
+        "brand": { "type": "string", "maxLength": 100 },
+        "salePrice": { "type": "number" },
+        "currentStock": { "type": "number" },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "baseUnit": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "packagingUnits": { "type": "array" },
+        "image": { "type": "string", "maxLength": 500 },
+        "isActive": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "productId", "name", "category", "brand",
+        "salePrice", "currentStock", "unit", "baseUnit", "packagingUnits",
+        "image", "isActive", "updatedAt"
+      ]
+    },
+    "WebsiteOrder": {
+      "title": "WebsiteOrder",
+      "description": "Customer Cash-on-Delivery order submitted from the public storefront with atomic storefrontCatalog stock reservation.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "orderNumber": { "type": "string", "minLength": 3, "maxLength": 40 },
+        "customerName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "customerPhone": { "type": "string", "minLength": 7, "maxLength": 24, "pattern": "^[0-9+\\-() ]{7,24}$" },
+        "customerAddress": { "type": "string", "minLength": 5, "maxLength": 400 },
+        "customerNotes": { "type": "string", "maxLength": 500 },
+        "paymentMethod": { "type": "string", "enum": ["Cash on Delivery"] },
+        "status": { "type": "string", "enum": ["Pending Confirmation", "Confirmed", "Out for Delivery", "Delivered", "Cancelled/Rejected"] },
+        "items": { "type": "array" },
+        "itemCount": { "type": "number" },
+        "totalQuantity": { "type": "number" },
+        "subtotal": { "type": "number" },
+        "deliveryFee": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "linkedSaleId": { "type": "string", "maxLength": 128 },
+        "linkedSaleNumber": { "type": "string", "maxLength": 40 },
+        "rejectionReason": { "type": "string", "maxLength": 300 },
+        "confirmedBy": { "type": "string", "maxLength": 128 },
+        "confirmedByName": { "type": "string", "maxLength": 120 },
+        "confirmedAt": { "type": "string", "format": "date-time" },
+        "outForDeliveryAt": { "type": "string", "format": "date-time" },
+        "deliveredAt": { "type": "string", "format": "date-time" },
+        "cancelledAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "shopId", "orderNumber", "customerName", "customerPhone", "customerAddress",
+        "customerNotes", "paymentMethod", "status", "items", "itemCount", "totalQuantity",
+        "subtotal", "deliveryFee", "totalAmount", "createdAt", "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -840,6 +918,18 @@
     "/shops/{shopId}/upsellCache/{cacheId}": {
       "schema": { "$ref": "#/entities/UpsellCooccurrenceCache" },
       "description": "Shared persistent co-occurrence cache derived from completed sales for Owner and Sales Staff POS recommendations."
+    },
+    "/shops/{shopId}/storefront/{metaId}": {
+      "schema": { "$ref": "#/entities/StorefrontMeta" },
+      "description": "Public read-only storefront shop metadata (document id: meta)."
+    },
+    "/shops/{shopId}/storefrontCatalog/{productId}": {
+      "schema": { "$ref": "#/entities/StorefrontCatalogItem" },
+      "description": "Public read-only product projection synced from real products and pending COD reservations."
+    },
+    "/shops/{shopId}/websiteOrders/{orderId}": {
+      "schema": { "$ref": "#/entities/WebsiteOrder" },
+      "description": "Public create-only Cash-on-Delivery website orders managed by Owner/Admin and delivery staff."
     }
   }
 }

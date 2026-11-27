@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   ClipboardEdit,
   FileSpreadsheet,
+  Globe,
   History,
   LayoutDashboard,
   LogOut,
@@ -49,6 +50,7 @@ const OWNER_NAV_ITEMS: Array<{
 }> = [
   { id: 'dashboard', label: 'Dashboard', group: 'Operations', icon: LayoutDashboard },
   { id: 'sales', label: 'Sales', group: 'Operations', icon: ShoppingBag },
+  { id: 'website_orders', label: 'Website Orders', group: 'Operations', icon: Globe },
   { id: 'purchases', label: 'Purchases', group: 'Operations', icon: Truck },
   { id: 'products', label: 'Products', group: 'Inventory & Finance', icon: Package },
   { id: 'inventory', label: 'Inventory', group: 'Inventory & Finance', icon: Boxes },
@@ -69,7 +71,7 @@ const OWNER_GROUPS: Array<'Operations' | 'Inventory & Finance' | 'Insights & Adm
 
 export function Layout({ activeSection, onNavigate, children }: LayoutProps) {
   const { user, sessionRole, staffProfile, logout } = useAuth();
-  const { settings, adminMembers } = useShopData();
+  const { settings, adminMembers, websiteOrders } = useShopData();
   const { isDark, toggleTheme } = useTheme();
   const {
     isOnline,
@@ -96,6 +98,9 @@ export function Layout({ activeSection, onNavigate, children }: LayoutProps) {
       if (staffProfile?.permissions?.canViewOwnSales) {
         items.push({ id: 'my_sales', label: 'My Sales', icon: History });
       }
+      if (staffProfile?.permissions?.canAddSales) {
+        items.push({ id: 'website_orders', label: 'Website Orders', icon: Globe });
+      }
       return items;
     }
     if (sessionRole === 'owner') {
@@ -103,6 +108,11 @@ export function Layout({ activeSection, onNavigate, children }: LayoutProps) {
     }
     return [];
   }, [sessionRole, staffProfile]);
+
+  const pendingWebsiteOrders = useMemo(
+    () => websiteOrders.filter((o) => o.status === 'Pending Confirmation').length,
+    [websiteOrders]
+  );
 
   const shopTitle =
     sessionRole === 'sales_staff'
@@ -176,6 +186,11 @@ export function Layout({ activeSection, onNavigate, children }: LayoutProps) {
       >
         <Icon className={`w-4 h-4 shrink-0 ${isActive ? 'text-[var(--cm-accent-text)]' : 'text-[var(--cm-text-muted)]'}`} />
         <span className="truncate">{item.label}</span>
+        {item.id === 'website_orders' && pendingWebsiteOrders > 0 && (
+          <span className="ml-auto px-1.5 py-0.5 text-[11px] font-mono-num font-bold rounded-md bg-[var(--cm-warning-soft)] text-[var(--cm-warning)] border border-[var(--cm-warning-border)]">
+            {pendingWebsiteOrders}
+          </span>
+        )}
       </button>
     );
   };

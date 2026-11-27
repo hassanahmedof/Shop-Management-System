@@ -663,9 +663,11 @@ export function AnalyticsPage() {
                       <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">
                         {row.roleType === 'owner_admin'
                           ? 'Owner / Admin'
-                          : row.roleType === 'unassigned'
-                            ? 'Legacy Unassigned'
-                            : 'Sales Staff'}
+                          : row.roleType === 'website'
+                            ? 'Website Storefront'
+                            : row.roleType === 'unassigned'
+                              ? 'Legacy Unassigned'
+                              : 'Sales Staff'}
                       </td>
                       <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">{row.orders}</td>
                       <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">{row.unitsSold}</td>
@@ -709,9 +711,11 @@ export function AnalyticsPage() {
                         <span className="font-sans text-[var(--cm-text-primary)] font-medium">
                           {row.roleType === 'owner_admin'
                             ? 'Owner / Admin'
-                            : row.roleType === 'unassigned'
-                              ? 'Legacy Unassigned'
-                              : 'Sales Staff'}
+                            : row.roleType === 'website'
+                              ? 'Website Storefront'
+                              : row.roleType === 'unassigned'
+                                ? 'Legacy Unassigned'
+                                : 'Sales Staff'}
                         </span>
                       </div>
                       <div>Units: <span className="text-[var(--cm-text-primary)]">{row.unitsSold}</span></div>

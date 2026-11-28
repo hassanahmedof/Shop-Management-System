@@ -766,7 +766,11 @@ export async function createStaffSale(
         if (!cSnap.exists()) {
           throw new Error('Selected product is not available in the catalog.');
         }
-        catalogMap.set(productId, { id: cSnap.id, ...(cSnap.data() as Omit<StaffCatalogItem, 'id'>) });
+        const catalogItem = { id: cSnap.id, ...(cSnap.data() as Omit<StaffCatalogItem, 'id'>) };
+        if (catalogItem.isActive === false) {
+          throw new Error(`Selected product "${catalogItem.name}" is inactive and cannot be sold.`);
+        }
+        catalogMap.set(productId, catalogItem);
       }
 
       const resolvedEntries: Array<{

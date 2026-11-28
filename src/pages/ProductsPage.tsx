@@ -112,6 +112,7 @@ interface ProductFormState {
   returnableUnitName: string;
   depositPerReturnable: string;
   emptyContainersOnHand: string;
+  isActive: boolean;
 }
 
 const emptyForm: ProductFormState = {
@@ -136,6 +137,7 @@ const emptyForm: ProductFormState = {
   returnableUnitName: '',
   depositPerReturnable: '0',
   emptyContainersOnHand: '0',
+  isActive: true,
 };
 
 const STANDARD_UNIT_SET = new Set(STANDARD_UNITS.map((u) => u.toLowerCase()));
@@ -234,6 +236,7 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
   const [filterBrand, setFilterBrand] = useState('');
   const [filterSupplier, setFilterSupplier] = useState('');
   const [filterOrigin, setFilterOrigin] = useState<'' | 'local' | 'imported'>('');
+  const [filterStatus, setFilterStatus] = useState<'' | 'active' | 'inactive'>('');
   const [showMobileFilters, setShowMobileFilters] = useState(false);
   const [expandedProductId, setExpandedProductId] = useState<string | null>(null);
 
@@ -584,6 +587,7 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
       returnableUnitName: p.returnableUnitName || '',
       depositPerReturnable: String(p.depositPerReturnable ?? 0),
       emptyContainersOnHand: String(p.emptyContainersOnHand ?? 0),
+      isActive: p.isActive !== false,
     });
     setCustomBaseUnitMode(!STANDARD_UNIT_SET.has(effectiveBase.toLowerCase()));
     setManualBaseOverrides({
@@ -918,7 +922,7 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
         supplierId: sup?.id || '',
         supplierName: sup?.name || 'Walk-in / Direct',
         expiryDate: form.expiryDate || '',
-        isActive: true,
+        isActive: form.isActive,
       };
 
       if (editing) {
@@ -1098,13 +1102,15 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
       if (filterBrand && p.brandId !== filterBrand) return false;
       if (filterSupplier && p.supplierId !== filterSupplier) return false;
       if (filterOrigin && (p.originType || '') !== filterOrigin) return false;
+      if (filterStatus === 'active' && p.isActive === false) return false;
+      if (filterStatus === 'inactive' && p.isActive !== false) return false;
       if (q) {
         const hay = `${p.name} ${p.categoryName} ${p.brandName} ${p.supplierName} ${p.originType || ''} ${p.bottleSize || ''} ${p.storageLocation || ''}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [products, search, filterCat, filterBrand, filterSupplier, filterOrigin]);
+  }, [products, search, filterCat, filterBrand, filterSupplier, filterOrigin, filterStatus]);
 
   return (
     <div className="space-y-4">
@@ -1144,7 +1150,7 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
         <div
           className={`${
             showMobileFilters ? 'grid' : 'hidden lg:grid'
-          } grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2`}
+          } grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2`}
         >
           <SearchableSelect
             size="sm"
@@ -1191,6 +1197,16 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
             <option value="">All Origins (Local / Imported)</option>
             <option value="local">Local Products</option>
             <option value="imported">Imported Products</option>
+          </select>
+          <select
+            aria-label="Filter by product status"
+            value={filterStatus}
+            onChange={(e) => setFilterStatus(e.target.value as '' | 'active' | 'inactive')}
+            className="cm-input w-full min-h-[36px] px-2.5 py-1.5 text-xs sm:text-sm border rounded-lg focus:outline-none focus:border-[var(--cm-accent)]"
+          >
+            <option value="">All Statuses</option>
+            <option value="active">Active Only</option>
+            <option value="inactive">Inactive Only</option>
           </select>
         </div>
       </div>
@@ -1249,7 +1265,14 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
                     key={p.id}
                     title={
                       <span className="inline-flex items-center gap-1.5 flex-wrap">
-                        <span>{p.name}</span>
+                        <span className={p.isActive === false ? 'text-[var(--cm-text-muted)]' : ''}>
+                          {p.name}
+                        </span>
+                        {p.isActive === false && (
+                          <span className="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-[var(--cm-warning-soft)] text-[var(--cm-warning)] border border-[var(--cm-warning-border)]">
+                            Inactive
+                          </span>
+                        )}
                         {p.bottleSize && (
                           <span className="px-1.5 py-0.5 text-[10px] rounded bg-[var(--cm-info-soft)] text-[var(--cm-info)] font-mono-num">
                             {p.bottleSize}
@@ -1426,7 +1449,7 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
 
                     return (
                       <Fragment key={p.id}>
-                        <tr className="hover:bg-[var(--cm-bg-hover)]">
+                        <tr className={`hover:bg-[var(--cm-bg-hover)] ${p.isActive === false ? 'opacity-80 bg-[var(--cm-bg-subtle)]/40' : ''}`}>
                           <td className="py-2 px-3">
                             <button
                               type="button"
@@ -1434,7 +1457,7 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
                                 setExpandedProductId((cur) => (cur === p.id ? null : p.id))
                               }
                               aria-expanded={isRowExpanded}
-                              className="inline-flex items-center gap-1.5 font-medium text-[var(--cm-text-primary)] hover:text-[var(--cm-accent-text)] text-left cursor-pointer"
+                              className="inline-flex items-center gap-1.5 flex-wrap font-medium text-[var(--cm-text-primary)] hover:text-[var(--cm-accent-text)] text-left cursor-pointer"
                             >
                               {isRowExpanded ? (
                                 <ChevronDown className="w-3.5 h-3.5 text-[var(--cm-accent-text)] shrink-0" />
@@ -1442,6 +1465,11 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
                                 <ChevronRight className="w-3.5 h-3.5 text-[var(--cm-text-muted)] shrink-0" />
                               )}
                               <span>{p.name}</span>
+                              {p.isActive === false && (
+                                <span className="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-[var(--cm-warning-soft)] text-[var(--cm-warning)] border border-[var(--cm-warning-border)]">
+                                  Inactive
+                                </span>
+                              )}
                             </button>
                             {(p.bottleSize || p.storageLocation || p.originType || p.isReturnable) && (
                               <div className="flex flex-wrap items-center gap-1 mt-0.5 pl-5 text-[10px]">
@@ -2106,6 +2134,50 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
                         <option value="local">Local</option>
                         <option value="imported">Imported</option>
                       </select>
+                    </div>
+                  </div>
+
+                  {/* Product Active / Inactive Status Toggle */}
+                  <div className="sm:col-span-2 p-2.5 cm-subtle border rounded-lg flex flex-wrap items-center justify-between gap-2.5">
+                    <div className="min-w-0">
+                      <div className="text-xs font-medium text-[var(--cm-text-primary)]">
+                        Product Status
+                      </div>
+                      <p className="text-[11px] text-[var(--cm-text-muted)]">
+                        {form.isActive
+                          ? 'Active: visible in Sales search, quick-add, voice search, and suggestions.'
+                          : 'Inactive: hidden from Sales and cannot be sold. Existing stock, history, and reports stay intact.'}
+                      </p>
+                    </div>
+                    <div
+                      role="group"
+                      aria-label="Product status"
+                      className="inline-flex rounded-lg border border-[var(--cm-border)] bg-[var(--cm-bg-surface)] p-0.5 shrink-0"
+                    >
+                      <button
+                        type="button"
+                        aria-pressed={form.isActive}
+                        onClick={() => setForm((prev) => ({ ...prev, isActive: true }))}
+                        className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                          form.isActive
+                            ? 'bg-[var(--cm-success-soft)] text-[var(--cm-success)] border border-[var(--cm-success-border)]'
+                            : 'text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)]'
+                        }`}
+                      >
+                        Active
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={!form.isActive}
+                        onClick={() => setForm((prev) => ({ ...prev, isActive: false }))}
+                        className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                          !form.isActive
+                            ? 'bg-[var(--cm-warning-soft)] text-[var(--cm-warning)] border border-[var(--cm-warning-border)]'
+                            : 'text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)]'
+                        }`}
+                      >
+                        Inactive
+                      </button>
                     </div>
                   </div>
                 </div>

@@ -1414,8 +1414,16 @@ export async function updateProduct(
   const wholesalePrice = Math.max(0, roundMoney(input.wholesalePrice));
   const profitMarginPct = calcProfitMarginPct(purchasePrice, salePrice);
   const cleanImage = input.image !== undefined ? clip(input.image, 500) : undefined;
+  const nextIsActive = input.isActive !== false;
+  const staffCatRef = shopDoc(uid, 'staffCatalog', productId);
+  const storefrontCatRef = shopDoc(uid, 'storefrontCatalog', productId);
 
   try {
+    const [staffCatSnap, storefrontCatSnap] = await Promise.all([
+      getDoc(staffCatRef).catch(() => null),
+      getDoc(storefrontCatRef).catch(() => null),
+    ]);
+
     const batch = writeBatch(db);
     batch.update(prodRef, {
       name: clip(input.name, 180),
@@ -1445,9 +1453,23 @@ export async function updateProduct(
       expiryDate: clip(input.expiryDate, 20),
       profitMarginPct,
       ...(cleanImage !== undefined ? { image: cleanImage } : {}),
-      isActive: input.isActive,
+      isActive: nextIsActive,
       updatedAt: serverTimestamp(),
     });
+
+    if (staffCatSnap?.exists()) {
+      batch.update(staffCatRef, {
+        isActive: nextIsActive,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    if (storefrontCatSnap?.exists()) {
+      batch.update(storefrontCatRef, {
+        isActive: nextIsActive,
+        updatedAt: serverTimestamp(),
+      });
+    }
 
     const logRef = doc(shopCol(uid, 'auditLogs'));
     batch.set(logRef, {
@@ -1455,7 +1477,10 @@ export async function updateProduct(
       action: 'UPDATE_PRODUCT',
       entityType: 'product',
       entityId: productId,
-      summary: clip(`Updated product ${input.name} (Buy: ${purchasePrice}/${baseUnit}, Sell: ${salePrice}/${baseUnit})`, 400),
+      summary: clip(
+        `Updated product ${input.name} (Buy: ${purchasePrice}/${baseUnit}, Sell: ${salePrice}/${baseUnit}, Status: ${nextIsActive ? 'Active' : 'Inactive'})`,
+        400
+      ),
       createdAt: serverTimestamp(),
     });
 
@@ -2459,6 +2484,9 @@ export function stageValidatedSaleLedgerWrites(params: StageSaleLedgerParams): {
 
   for (const [pid, reqBase] of requestedBaseByProduct.entries()) {
     const product = productMap.get(pid)!;
+    if (product.isActive === false) {
+      throw new Error(`Selected product "${product.name}" is inactive and cannot be sold.`);
+    }
     const baseUnit = getEffectiveBaseUnit(product);
     if (!allowStockOverride && product.currentStock < reqBase) {
       throw new Error(
@@ -3050,6 +3078,14 @@ export async function editSale(
         const oldBase = oldBaseByProduct.get(pid) ?? 0;
         const newBase = newBaseByProduct.get(pid) ?? 0;
         const stockDelta = roundStockQty(oldBase - newBase);
+        if (stockDelta < 0) {
+          const prod = productMap.get(pid);
+          if (prod && prod.isActive === false) {
+            throw new Error(
+              `Selected product "${prod.name}" is inactive and cannot be added to this sale.`
+            );
+          }
+        }
         if (stockDelta !== 0) {
           const prod = productMap.get(pid);
           if (!prod) {
@@ -3307,7 +3343,12 @@ export async function editSale(
 
     enqueueCooccurrenceMutationReconcile(uid, sale.id);
   } catch (err) {
-    if (err instanceof Error && (err.message.includes('Insufficient stock') || err.message.includes('Cancelled'))) {
+    if (
+      err instanceof Error &&
+      (err.message.includes('Insufficient stock') ||
+        err.message.includes('Cancelled') ||
+        err.message.includes('Selected product'))
+    ) {
       throw err;
     }
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/sales/${sale.id}`);

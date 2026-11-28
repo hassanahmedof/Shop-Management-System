@@ -221,6 +221,7 @@ export async function queryProductsFromDatabase(params: {
   role: 'owner' | 'sales_staff';
   authUid?: string;
   maxDocs?: number;
+  includeInactive?: boolean;
 }): Promise<SearchableProductItem[]> {
   const maxDocs = Math.min(Math.max(params.maxDocs ?? 500, 1), 2000);
   if (params.role === 'owner') {
@@ -230,9 +231,10 @@ export async function queryProductsFromDatabase(params: {
       limit(maxDocs)
     );
     const snap = await getDocs(q);
-    return mapProductsToSearchable(
+    const mapped = mapProductsToSearchable(
       snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Product, 'id'>) }))
     );
+    return params.includeInactive ? mapped : mapped.filter((item) => item.isActive !== false);
   }
 
   if (!params.authUid) return [];
@@ -242,9 +244,10 @@ export async function queryProductsFromDatabase(params: {
     limit(maxDocs)
   );
   const snap = await getDocs(q);
-  return mapStaffCatalogToSearchable(
+  const mapped = mapStaffCatalogToSearchable(
     snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<StaffCatalogItem, 'id'>) }))
   );
+  return params.includeInactive ? mapped : mapped.filter((item) => item.isActive !== false);
 }
 
 export function searchProductsCatalog(
@@ -263,7 +266,7 @@ export function searchProductsCatalog(
 
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i];
-    if (!item.isActive) continue;
+    if (item.isActive === false) continue;
 
     const idx =
       item._searchIdx ||

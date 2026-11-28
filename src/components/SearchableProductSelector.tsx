@@ -60,6 +60,7 @@ interface SearchableProductSelectorProps {
   inputId?: string;
   autoFocusInput?: boolean;
   enableVoiceSearch?: boolean;
+  selectedFallbackLabel?: string;
 }
 
 const RESULTS_PAGE_SIZE = 20;
@@ -111,6 +112,7 @@ export function SearchableProductSelector({
   inputId,
   autoFocusInput = false,
   enableVoiceSearch = false,
+  selectedFallbackLabel,
 }: SearchableProductSelectorProps) {
   const isMobile = useIsMobileViewport();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -182,7 +184,7 @@ export function SearchableProductSelector({
   }, [queryText]);
 
   const activeCatalogCount = useMemo(
-    () => items.reduce((count, i) => (i.isActive ? count + 1 : count), 0),
+    () => items.reduce((count, i) => (i.isActive !== false ? count + 1 : count), 0),
     [items]
   );
 
@@ -263,6 +265,10 @@ export function SearchableProductSelector({
   };
 
   const handlePickItem = (item: SearchableProductItem) => {
+    if (item.isActive === false) {
+      setStockNotice(`"${item.name}" is inactive and cannot be sold.`);
+      return;
+    }
     if (!allowOutOfStock && item.currentStock <= 0) {
       setStockNotice(`"${item.name}" is currently out of stock.`);
       return;
@@ -581,12 +587,14 @@ export function SearchableProductSelector({
               <Search className="w-4 h-4 text-[var(--cm-text-muted)] shrink-0" />
               <span
                 className={`truncate ${
-                  selectedItem && mode === 'inline'
+                  (selectedItem || (selectedProductId && selectedFallbackLabel)) && mode === 'inline'
                     ? 'text-[var(--cm-text-primary)] font-medium'
                     : 'text-[var(--cm-text-muted)]'
                 }`}
               >
-                {selectedItem && mode === 'inline' ? selectedItem.name : placeholder}
+                {mode === 'inline'
+                  ? selectedItem?.name || (selectedProductId ? selectedFallbackLabel : '') || placeholder
+                  : placeholder}
               </span>
             </span>
             <ChevronDown className="w-4 h-4 text-[var(--cm-text-muted)] shrink-0" />
@@ -615,7 +623,13 @@ export function SearchableProductSelector({
             ref={desktopInputRef}
             id={inputId}
             type="text"
-            value={isOpen ? queryText : mode === 'inline' && selectedItem ? selectedItem.name : queryText}
+            value={
+              isOpen
+                ? queryText
+                : mode === 'inline'
+                  ? selectedItem?.name || (selectedProductId ? selectedFallbackLabel : '') || queryText
+                  : queryText
+            }
             onFocus={handleOpenPicker}
             onChange={(e) => {
               setQueryText(e.target.value);

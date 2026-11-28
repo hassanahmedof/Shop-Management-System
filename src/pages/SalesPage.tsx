@@ -126,10 +126,11 @@ export function SalesPage() {
     () =>
       products.map((p) => {
         const bd = formatStockBreakdown(p.currentStock, p);
+        const statusTag = p.isActive === false ? ' · Inactive' : '';
         return {
           value: p.id,
           label: p.name,
-          subtitle: `${p.brandName || 'Unbranded'} · ${p.categoryName || 'Uncategorized'}`,
+          subtitle: `${p.brandName || 'Unbranded'} · ${p.categoryName || 'Uncategorized'}${statusTag}`,
           meta: `Stock: ${bd.summaryText}`,
           keywords: [p.name, p.brandName, p.categoryName],
         };
@@ -177,12 +178,17 @@ export function SalesPage() {
     return map;
   }, [products]);
 
+  const activeProducts = useMemo(
+    () => products.filter((p) => p.isActive !== false),
+    [products]
+  );
+
   const searchableItems = useMemo(() => {
     if (products.length > 0) {
-      return mapProductsToSearchable(products, { categories, productTemplates });
+      return mapProductsToSearchable(activeProducts, { categories, productTemplates });
     }
-    return dbFallbackItems || [];
-  }, [products, categories, productTemplates, dbFallbackItems]);
+    return (dbFallbackItems || []).filter((i) => i.isActive !== false);
+  }, [products.length, activeProducts, categories, productTemplates, dbFallbackItems]);
 
   const {
     suggestion: upsellSuggestion,
@@ -291,6 +297,10 @@ export function SalesPage() {
     notifyAssistantProductAdded();
 
     const prod = productMap.get(item.id);
+    if ((prod && prod.isActive === false) || item.isActive === false) {
+      setFormError(`Selected product "${item.name}" is inactive and cannot be sold.`);
+      return;
+    }
     const source = prod || item;
     const baseUnit = getEffectiveBaseUnit(source);
     const defUnit = getDefaultSaleUnit(source);
@@ -528,6 +538,10 @@ export function SalesPage() {
         setFormError('Selected product was not found.');
         return;
       }
+      if (prod.isActive === false) {
+        setFormError(`Selected product "${prod.name}" is inactive and cannot be sold.`);
+        return;
+      }
       const baseUnit = getEffectiveBaseUnit(prod);
       const unitLabel = r.unitName || baseUnit;
       const conv = roundStockQty(r.conversionFactor || 1) || 1;
@@ -672,6 +686,29 @@ export function SalesPage() {
       });
     }
 
+    const existingItems = saleItemsBySaleId.get(editingSale.id) || [];
+    const oldBaseByPid = new Map<string, number>();
+    for (const oldItem of existingItems) {
+      if (oldItem.status === 'cancelled') continue;
+      const baseQ = roundStockQty(oldItem.baseQuantity ?? oldItem.quantity * (oldItem.conversionFactor || 1));
+      oldBaseByPid.set(oldItem.productId, roundStockQty((oldBaseByPid.get(oldItem.productId) || 0) + baseQ));
+    }
+    const newBaseByPid = new Map<string, number>();
+    for (const line of items) {
+      const baseQ = roundStockQty(line.quantity * (line.conversionFactor || 1));
+      newBaseByPid.set(line.productId, roundStockQty((newBaseByPid.get(line.productId) || 0) + baseQ));
+    }
+    for (const [pid, newBase] of newBaseByPid.entries()) {
+      const oldBase = oldBaseByPid.get(pid) ?? 0;
+      if (newBase > oldBase) {
+        const prod = productMap.get(pid);
+        if (prod && prod.isActive === false) {
+          setEditError(`Selected product "${prod.name}" is inactive and cannot be added to this sale.`);
+          return;
+        }
+      }
+    }
+
     const editPhoneError = validateOptionalCustomerWhatsapp(editWhatsapp);
     if (editPhoneError) {
       setEditError(editPhoneError);
@@ -680,7 +717,6 @@ export function SalesPage() {
 
     setSavingEdit(true);
     try {
-      const existingItems = saleItemsBySaleId.get(editingSale.id) || [];
       await editSale(
         activeShopId,
         editingSale,
@@ -1542,6 +1578,13 @@ export function SalesPage() {
                             mode="inline"
                             items={searchableItems}
                             selectedProductId={row.productId}
+                            selectedFallbackLabel={
+                              rowProd
+                                ? rowProd.isActive === false
+                                  ? `${rowProd.name} (Inactive)`
+                                  : rowProd.name
+                                : undefined
+                            }
                             allowOutOfStock={allowStockOverride}
                             onSelect={(item) => {
                               const picked = productMap.get(item.id);

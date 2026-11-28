@@ -132,7 +132,7 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
   }, [effectiveCatalog]);
 
   const activeCatalog = useMemo(
-    () => effectiveCatalog.filter((c) => c.isActive),
+    () => effectiveCatalog.filter((c) => c.isActive !== false),
     [effectiveCatalog]
   );
 
@@ -140,7 +140,7 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
     if (activeCatalog.length > 0) {
       return mapStaffCatalogToSearchable(activeCatalog);
     }
-    return dbFallbackCatalog || [];
+    return (dbFallbackCatalog || []).filter((i) => i.isActive !== false);
   }, [activeCatalog, dbFallbackCatalog]);
 
   const {
@@ -389,6 +389,10 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
     notifyAssistantProductAdded();
 
     const prod = catalogMap.get(item.id);
+    if ((prod && prod.isActive === false) || item.isActive === false) {
+      setSaleError(`Selected product "${item.name}" is inactive and cannot be sold.`);
+      return;
+    }
     const source = prod || item;
     const baseUnit = getEffectiveBaseUnit(source);
     const defUnit = getDefaultSaleUnit(source);
@@ -538,6 +542,10 @@ export function StaffPortalView({ activeSection, onNavigate }: StaffPortalViewPr
       const prod = catalogMap.get(r.productId);
       if (!prod) {
         setSaleError('Selected product was not found in the catalog.');
+        return;
+      }
+      if (prod.isActive === false) {
+        setSaleError(`Selected product "${prod.name}" is inactive and cannot be sold.`);
         return;
       }
       const baseUnit = getEffectiveBaseUnit(prod);

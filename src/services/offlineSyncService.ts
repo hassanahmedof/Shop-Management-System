@@ -510,8 +510,11 @@ export function createAndEnqueueOfflineSale(
 
   for (const row of merged.values()) {
     const prod = effectiveCatalogMap.get(row.productId);
-    if (!prod || !prod.isActive) {
+    if (!prod) {
       throw new Error('Selected product is not available in the catalog.');
+    }
+    if (prod.isActive === false) {
+      throw new Error(`Selected product "${prod.name}" is inactive and cannot be sold.`);
     }
     const allowedUnits = getAllowedSaleUnits(prod);
     const matchedUnit =

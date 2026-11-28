@@ -233,5 +233,15 @@ export const dirtyDozenCases: DirtyDozenCase[] = [
     emailVerified: false,
     expected: 'PERMISSION_DENIED',
   },
+  {
+    id: 22,
+    name: 'Staff Sale Stock Decrement on Inactive StaffCatalog Item Blocked',
+    collectionPath: '/shops/u1/staffCatalog/p_inactive',
+    operation: 'update',
+    authUid: 'staff_uid_1',
+    emailVerified: true,
+    payload: { currentStock: 4 },
+    expected: 'PERMISSION_DENIED',
+  },
 ];
 

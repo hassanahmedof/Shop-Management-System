@@ -1252,6 +1252,7 @@ service cloud.firestore {
             (
               staffCanAddSales(shopId)
               && request.auth.uid in existing().allowedStaffUids
+              && existing().isActive == true
               && incoming().diff(existing()).affectedKeys().hasOnly(['currentStock', 'updatedAt'])
               && incoming().currentStock < existing().currentStock
               && incoming().currentStock >= 0

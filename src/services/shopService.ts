@@ -1121,21 +1121,61 @@ export async function deleteBrand(uid: string, id: string): Promise<void> {
   }
 }
 
+function normalizeSupplierNameKey(name: string): string {
+  return name.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function validateOptionalSupplierEmail(email?: string): string {
+  const trimmed = (email || '').trim();
+  if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+    throw new Error('Enter a valid supplier email address.');
+  }
+  return clip(trimmed, 200);
+}
+
 export async function createSupplier(
   uid: string,
-  input: { name: string; phone: string; address: string; notes: string }
+  input: { name: string; phone: string; address: string; email?: string; notes: string }
 ): Promise<string> {
+  const trimmedName = input.name.trim().replace(/\s+/g, ' ');
+  if (!trimmedName) {
+    throw new Error('Supplier name is required.');
+  }
+  const clippedName = clip(trimmedName, 150);
+  const clippedEmail = validateOptionalSupplierEmail(input.email);
+
+  try {
+    const snap = await getDocs(query(shopCol(uid, 'suppliers'), where('ownerUid', '==', uid)));
+    const existingSuppliers: Supplier[] = snap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Omit<Supplier, 'id'>),
+    }));
+    const targetKey = normalizeSupplierNameKey(clippedName);
+    const duplicate = existingSuppliers.find(
+      (s) => normalizeSupplierNameKey(s.name || '') === targetKey
+    );
+    if (duplicate) {
+      throw new Error(`Supplier "${duplicate.name}" already exists.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/suppliers`);
+  }
+
   const ref = doc(shopCol(uid, 'suppliers'));
   try {
     await setDoc(ref, {
       ownerUid: uid,
-      name: clip(input.name, 150),
-      phone: clip(input.phone, 40),
-      address: clip(input.address, 300),
+      name: clippedName,
+      phone: clip((input.phone || '').trim(), 40),
+      address: clip((input.address || '').trim(), 300),
+      email: clippedEmail,
       totalPurchased: 0,
       totalPaid: 0,
       outstandingBalance: 0,
-      notes: clip(input.notes, 500),
+      notes: clip((input.notes || '').trim(), 500),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -1148,19 +1188,110 @@ export async function createSupplier(
 export async function updateSupplier(
   uid: string,
   id: string,
-  input: { name: string; phone: string; address: string; notes: string }
+  input: { name: string; phone: string; address: string; email?: string; notes: string }
 ): Promise<void> {
+  if (!id) {
+    throw new Error('Invalid supplier ID.');
+  }
+  const trimmedName = input.name.trim().replace(/\s+/g, ' ');
+  if (!trimmedName) {
+    throw new Error('Supplier name is required.');
+  }
+  const clippedName = clip(trimmedName, 150);
+  const clippedEmail = validateOptionalSupplierEmail(input.email);
+
+  let existingSuppliers: Supplier[] = [];
+  try {
+    const snap = await getDocs(query(shopCol(uid, 'suppliers'), where('ownerUid', '==', uid)));
+    existingSuppliers = snap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Omit<Supplier, 'id'>),
+    }));
+    const targetKey = normalizeSupplierNameKey(clippedName);
+    const duplicate = existingSuppliers.find(
+      (s) => s.id !== id && normalizeSupplierNameKey(s.name || '') === targetKey
+    );
+    if (duplicate) {
+      throw new Error(`Another supplier named "${duplicate.name}" already exists.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.LIST, `shops/${uid}/suppliers`);
+  }
+
   const ref = shopDoc(uid, 'suppliers', id);
+  let currentSupplier = existingSuppliers.find((s) => s.id === id);
+  if (!currentSupplier) {
+    try {
+      const supSnap = await getDoc(ref);
+      if (!supSnap.exists()) {
+        throw new Error('Supplier record not found.');
+      }
+      currentSupplier = {
+        id: supSnap.id,
+        ...(supSnap.data() as Omit<Supplier, 'id'>),
+      };
+    } catch (err) {
+      if (err instanceof Error && err.message === 'Supplier record not found.') {
+        throw err;
+      }
+      handleFirestoreError(err, OperationType.GET, `shops/${uid}/suppliers/${id}`);
+    }
+  }
+
+  const nameChanged = Boolean(currentSupplier && currentSupplier.name !== clippedName);
+
   try {
     await updateDoc(ref, {
-      name: clip(input.name, 150),
-      phone: clip(input.phone, 40),
-      address: clip(input.address, 300),
-      notes: clip(input.notes, 500),
+      name: clippedName,
+      phone: clip((input.phone || '').trim(), 40),
+      address: clip((input.address || '').trim(), 300),
+      email: clippedEmail,
+      notes: clip((input.notes || '').trim(), 500),
       updatedAt: serverTimestamp(),
     });
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `shops/${uid}/suppliers/${id}`);
+  }
+
+  try {
+    const logRef = doc(shopCol(uid, 'auditLogs'));
+    await setDoc(logRef, {
+      ownerUid: uid,
+      action: 'SUPPLIER_UPDATE',
+      entityType: 'supplier',
+      entityId: id,
+      summary: clip(`Updated supplier "${clippedName}"`, 400),
+      createdAt: serverTimestamp(),
+    });
+  } catch (err) {
+    console.warn('Supplier update audit log skipped:', err);
+  }
+
+  if (nameChanged) {
+    try {
+      const prodSnap = await getDocs(
+        query(shopCol(uid, 'products'), where('ownerUid', '==', uid), where('supplierId', '==', id))
+      );
+      if (!prodSnap.empty) {
+        const CHUNK_SIZE = 400;
+        for (let i = 0; i < prodSnap.docs.length; i += CHUNK_SIZE) {
+          const batch = writeBatch(db);
+          const chunk = prodSnap.docs.slice(i, i + CHUNK_SIZE);
+          for (const prodDoc of chunk) {
+            batch.update(prodDoc.ref, {
+              supplierName: clippedName,
+              updatedAt: serverTimestamp(),
+            });
+          }
+          await batch.commit();
+        }
+      }
+    } catch (err) {
+      console.warn('Supplier rename product sync skipped:', err);
+    }
   }
 }
 

@@ -1,7 +1,8 @@
-import { Ban, CheckCircle2, ChevronDown, ChevronRight, Filter, Plus, Search, Trash2, Wallet, X } from 'lucide-react';
+import { Ban, CheckCircle2, ChevronDown, ChevronRight, Edit3, Filter, Plus, Search, Trash2, Wallet, X } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { CompactExpandableRow, CompactSection } from '../components/CompactSection';
 import { SearchableSelect, type SearchableSelectOption } from '../components/SearchableSelect';
+import { SupplierEditModal } from '../components/SupplierEditModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useShopData } from '../contexts/ShopDataContext';
 import { useToast } from '../contexts/ToastContext';
@@ -62,11 +63,13 @@ export function PurchasesPage() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
-  // Quick Add Supplier
+  // Quick Add & Edit Supplier
   const [showNewSupplier, setShowNewSupplier] = useState(false);
   const [newSupName, setNewSupName] = useState('');
   const [newSupPhone, setNewSupPhone] = useState('');
+  const [newSupEmail, setNewSupEmail] = useState('');
   const [newSupAddress, setNewSupAddress] = useState('');
+  const [editingSupplier, setEditingSupplier] = useState<Supplier | null>(null);
 
   // Filters & Mobile Expandable State
   const [search, setSearch] = useState('');
@@ -114,16 +117,21 @@ export function PurchasesPage() {
     [activeProductsList]
   );
 
+  const supplierMap = useMemo(
+    () => new Map(activeSuppliersList.map((s) => [s.id, s])),
+    [activeSuppliersList]
+  );
+
   const supplierOptions = useMemo<SearchableSelectOption[]>(
     () =>
       activeSuppliersList.map((s) => ({
         value: s.id,
         label: s.name,
-        subtitle: s.phone ? `Phone: ${s.phone}` : s.address || 'No phone on file',
+        subtitle: s.phone ? `Phone: ${s.phone}` : s.email || s.address || 'No phone on file',
         meta: s.outstandingBalance > 0 ? `Balance Due: ${formatPKR(s.outstandingBalance)}` : 'Settled',
         badge: s.outstandingBalance > 0 ? 'Balance Due' : 'Settled',
         badgeTone: s.outstandingBalance > 0 ? 'warning' : 'success',
-        keywords: [s.name, s.phone, s.address].filter(Boolean),
+        keywords: [s.name, s.phone, s.email || '', s.address].filter(Boolean),
       })),
     [activeSuppliersList]
   );
@@ -342,17 +350,31 @@ export function PurchasesPage() {
 
   const handleCreateSupplier = async () => {
     if (!activeShopId || !newSupName.trim()) return;
-    const id = await createSupplier(activeShopId, {
-      name: newSupName.trim(),
-      phone: newSupPhone.trim(),
-      address: newSupAddress.trim(),
-      notes: '',
-    });
-    setSupplierId(id);
-    setNewSupName('');
-    setNewSupPhone('');
-    setNewSupAddress('');
-    setShowNewSupplier(false);
+    setError(null);
+    try {
+      const id = await createSupplier(activeShopId, {
+        name: newSupName.trim(),
+        phone: newSupPhone.trim(),
+        address: newSupAddress.trim(),
+        email: newSupEmail.trim(),
+        notes: '',
+      });
+      setSupplierId(id);
+      setNewSupName('');
+      setNewSupPhone('');
+      setNewSupEmail('');
+      setNewSupAddress('');
+      setShowNewSupplier(false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to create supplier.';
+      setError(msg);
+      showToast({
+        title: 'Supplier Not Added',
+        message: msg,
+        tone: 'warning',
+        durationMs: 4000,
+      });
+    }
   };
 
   const handleSettle = async (e: React.FormEvent) => {
@@ -396,12 +418,13 @@ export function PurchasesPage() {
       if (filterTo && p.purchaseDate > filterTo) return false;
       if (q) {
         const items = purchaseItemsByPo.get(p.id) || [];
-        const hay = `${p.purchaseNumber} ${p.supplierName} ${items.map((i) => i.productName).join(' ')}`.toLowerCase();
+        const liveSupName = supplierMap.get(p.supplierId)?.name || p.supplierName;
+        const hay = `${p.purchaseNumber} ${liveSupName} ${p.supplierName} ${items.map((i) => i.productName).join(' ')}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [purchases, purchaseItemsByPo, search, filterSupplierId, filterFrom, filterTo]);
+  }, [purchases, purchaseItemsByPo, supplierMap, search, filterSupplierId, filterFrom, filterTo]);
 
   const supplierStats = useMemo(() => {
     const totalPurchased = suppliers.reduce((acc, s) => roundMoney(acc + (s.totalPurchased || 0)), 0);
@@ -643,7 +666,7 @@ export function PurchasesPage() {
           </div>
 
           {showNewSupplier && (
-            <div className="p-3 cm-subtle border rounded-lg grid grid-cols-1 sm:grid-cols-4 gap-2 items-end">
+            <div className="p-3 cm-subtle border rounded-lg grid grid-cols-1 sm:grid-cols-5 gap-2 items-end">
               <div>
                 <label className="block text-xs text-[var(--cm-text-secondary)] mb-1">Supplier Name *</label>
                 <input
@@ -661,6 +684,16 @@ export function PurchasesPage() {
                   value={newSupPhone}
                   onChange={(e) => setNewSupPhone(e.target.value)}
                   placeholder="0300-1234567"
+                  className="cm-input w-full min-h-[38px] px-2.5 py-1.5 text-sm border rounded-lg"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[var(--cm-text-secondary)] mb-1">Email</label>
+                <input
+                  type="email"
+                  value={newSupEmail}
+                  onChange={(e) => setNewSupEmail(e.target.value)}
+                  placeholder="orders@supplier.pk"
                   className="cm-input w-full min-h-[38px] px-2.5 py-1.5 text-sm border rounded-lg"
                 />
               </div>
@@ -1009,7 +1042,7 @@ export function PurchasesPage() {
                 <CompactExpandableRow
                   key={s.id}
                   title={s.name}
-                  subtitle={s.phone || s.address || 'No phone on file'}
+                  subtitle={[s.phone, s.email, s.address].filter(Boolean).join(' · ') || 'No contact on file'}
                   rightPrimary={
                     <span className={hasDue ? 'text-[var(--cm-warning)]' : 'text-[var(--cm-success)]'}>
                       {formatPKR(s.outstandingBalance)}
@@ -1036,7 +1069,14 @@ export function PurchasesPage() {
                           </span>
                         </div>
                       </div>
-                      <div className="flex justify-end">
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setEditingSupplier(s)}
+                          className="min-h-[36px] inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-[var(--cm-text-secondary)] cm-surface border rounded-lg cursor-pointer"
+                        >
+                          <Edit3 className="w-3.5 h-3.5" /> Edit
+                        </button>
                         {firstUnpaidPo ? (
                           <button
                             type="button"
@@ -1112,28 +1152,39 @@ export function PurchasesPage() {
                         {hasDue ? 'Payment Due' : 'Settled'}
                       </td>
                       <td className="py-2 px-3 text-right whitespace-nowrap">
-                        {firstUnpaidPo ? (
+                        <div className="inline-flex items-center justify-end gap-2">
                           <button
                             type="button"
-                            onClick={() => {
-                              setSettlingPurchase(firstUnpaidPo);
-                              setSettleAmount(String(firstUnpaidPo.balanceDue));
-                              setSettleMethod('Cash');
-                              setSettleErr(null);
-                            }}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-[var(--cm-accent-text)] border border-[var(--cm-border)] hover:bg-[var(--cm-accent-soft)] rounded cursor-pointer"
+                            aria-label={`Edit ${s.name}`}
+                            title="Edit supplier"
+                            onClick={() => setEditingSupplier(s)}
+                            className="p-1 text-[var(--cm-text-muted)] hover:text-[var(--cm-accent-text)] rounded cursor-pointer"
                           >
-                            <CheckCircle2 className="w-3.5 h-3.5" /> Pay Due
+                            <Edit3 className="w-3.5 h-3.5" />
                           </button>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => setFilterSupplierId(s.id)}
-                            className="text-xs font-medium text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] cursor-pointer"
-                          >
-                            View POs
-                          </button>
-                        )}
+                          {firstUnpaidPo ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSettlingPurchase(firstUnpaidPo);
+                                setSettleAmount(String(firstUnpaidPo.balanceDue));
+                                setSettleMethod('Cash');
+                                setSettleErr(null);
+                              }}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-[var(--cm-accent-text)] border border-[var(--cm-border)] hover:bg-[var(--cm-accent-soft)] rounded cursor-pointer"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Pay Due
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setFilterSupplierId(s.id)}
+                              className="text-xs font-medium text-[var(--cm-text-muted)] hover:text-[var(--cm-text-primary)] cursor-pointer"
+                            >
+                              View POs
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -1229,7 +1280,7 @@ export function PurchasesPage() {
                         <span className="font-mono-num">{p.purchaseNumber}</span>
                         <span className="text-[var(--cm-text-muted)]">·</span>
                         <span className="truncate font-normal text-[var(--cm-text-secondary)]">
-                          {p.supplierName}
+                          {supplierMap.get(p.supplierId)?.name || p.supplierName}
                         </span>
                       </span>
                     }
@@ -1353,7 +1404,9 @@ export function PurchasesPage() {
                         <td className="py-2 px-3 font-mono-num text-xs font-medium text-[var(--cm-text-primary)]">
                           {p.purchaseNumber}
                         </td>
-                        <td className="py-2 px-3 text-[var(--cm-text-primary)]">{p.supplierName}</td>
+                        <td className="py-2 px-3 text-[var(--cm-text-primary)]">
+                          {supplierMap.get(p.supplierId)?.name || p.supplierName}
+                        </td>
                         <td className="py-2 px-3 text-[var(--cm-text-secondary)] max-w-xs truncate" title={summary}>
                           {summary}
                         </td>
@@ -1436,8 +1489,14 @@ export function PurchasesPage() {
             )}
             <form onSubmit={handleSettle} className="space-y-4">
               <div className="text-xs text-[var(--cm-text-muted)]">
-                Supplier: <span className="font-semibold text-[var(--cm-text-primary)]">{settlingPurchase.supplierName}</span> ·
-                Due: <span className="font-semibold font-mono-num text-[var(--cm-warning)]">{formatPKR(settlingPurchase.balanceDue)}</span>
+                Supplier:{' '}
+                <span className="font-semibold text-[var(--cm-text-primary)]">
+                  {supplierMap.get(settlingPurchase.supplierId)?.name || settlingPurchase.supplierName}
+                </span>{' '}
+                · Due:{' '}
+                <span className="font-semibold font-mono-num text-[var(--cm-warning)]">
+                  {formatPKR(settlingPurchase.balanceDue)}
+                </span>
               </div>
               <div>
                 <label className="block text-xs font-medium text-[var(--cm-text-secondary)] mb-1">
@@ -1485,6 +1544,15 @@ export function PurchasesPage() {
             </form>
           </div>
         </div>
+      )}
+
+      {editingSupplier && activeShopId && (
+        <SupplierEditModal
+          shopId={activeShopId}
+          supplier={editingSupplier}
+          existingSuppliers={activeSuppliersList}
+          onClose={() => setEditingSupplier(null)}
+        />
       )}
     </div>
   );

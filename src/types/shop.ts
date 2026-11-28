@@ -69,6 +69,7 @@ export interface Supplier {
   name: string;
   phone: string;
   address: string;
+  email?: string;
   totalPurchased: number;
   totalPaid: number;
   outstandingBalance: number;

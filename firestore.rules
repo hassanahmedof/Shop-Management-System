@@ -403,7 +403,7 @@ service cloud.firestore {
           'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'ownerUid', 'name', 'phone', 'address',
+          'ownerUid', 'name', 'phone', 'address', 'email',
           'totalPurchased', 'totalPaid', 'outstandingBalance', 'notes',
           'createdAt', 'updatedAt'
         ])
@@ -411,6 +411,7 @@ service cloud.firestore {
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 150
         && data.phone is string && data.phone.size() <= 40
         && data.address is string && data.address.size() <= 300
+        && (!('email' in data) || (data.email is string && data.email.size() <= 200))
         && data.totalPurchased is number && data.totalPurchased >= 0
         && data.totalPaid is number && data.totalPaid >= 0
         && data.outstandingBalance is number && data.outstandingBalance >= 0
@@ -1376,7 +1377,7 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && shopExists(shopId)
           && (
-            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'address', 'notes', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'address', 'email', 'notes', 'updatedAt']) ||
             incoming().diff(existing()).affectedKeys().hasOnly(['totalPurchased', 'totalPaid', 'outstandingBalance', 'updatedAt'])
           );
         allow delete: if isOwner(shopId) && isValidId(supplierId) && shopExists(shopId) && existing().ownerUid == shopId;

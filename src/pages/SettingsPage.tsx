@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   Copy,
   Download,
+  Edit3,
   ExternalLink,
   Eye,
   EyeOff,
@@ -28,6 +29,8 @@ import { useEffect, useRef, useState } from 'react';
 import { BrandManagerSection } from '../components/BrandManagerSection';
 import { CatalogTemplateManagerSection } from '../components/CatalogTemplateManagerSection';
 import { CompactSection } from '../components/CompactSection';
+import { SupplierEditModal } from '../components/SupplierEditModal';
+import type { Supplier } from '../types/shop';
 import { useAuth } from '../contexts/AuthContext';
 import { useGoogleSheetsSync } from '../contexts/GoogleSheetsSyncContext';
 import { useShopData } from '../contexts/ShopDataContext';
@@ -92,6 +95,10 @@ export function SettingsPage() {
   const [newCategory, setNewCategory] = useState('');
   const [newSupplierName, setNewSupplierName] = useState('');
   const [newSupplierPhone, setNewSupplierPhone] = useState('');
+  const [newSupplierEmail, setNewSupplierEmail] = useState('');
+  const [newSupplierAddress, setNewSupplierAddress] = useState('');
+  const [newSupplierNotes, setNewSupplierNotes] = useState('');
+  const [editingSupplier, setEditingSupplier] = useState<Supplier | null>(null);
   const [newExpCategory, setNewExpCategory] = useState('');
 
   // Google Sheets sync controls state
@@ -1614,86 +1621,157 @@ export function SettingsPage() {
           defaultOpen={false}
           bodyClassName="p-3.5 sm:p-4 space-y-2.5"
         >
-          <div className="grid grid-cols-1 sm:grid-cols-[1fr_130px_auto] gap-2">
-            <input
-              type="text"
-              placeholder="Supplier name..."
-              value={newSupplierName}
-              onChange={(e) => setNewSupplierName(e.target.value)}
-              className="cm-input w-full px-3 py-1.5 min-h-[38px] sm:min-h-0 text-sm border rounded-lg"
-            />
-            <input
-              type="text"
-              placeholder="Phone"
-              value={newSupplierPhone}
-              onChange={(e) => setNewSupplierPhone(e.target.value)}
-              className="cm-input w-full px-3 py-1.5 min-h-[38px] sm:min-h-0 text-sm border rounded-lg font-mono-num"
-            />
-            <button
-              type="button"
-              onClick={async () => {
-                if (!activeShopId || !newSupplierName.trim()) return;
-                const val = newSupplierName.trim();
-                await createSupplier(activeShopId, {
-                  name: val,
-                  phone: newSupplierPhone.trim(),
-                  address: '',
-                  notes: '',
-                });
-                setNewSupplierName('');
-                setNewSupplierPhone('');
-                showToast({ title: 'Supplier Added', message: `"${val}" saved.`, tone: 'success', durationMs: 3000 });
-              }}
-              className="inline-flex items-center justify-center gap-1 px-3 py-1.5 min-h-[38px] sm:min-h-0 text-xs font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer"
-            >
-              <Plus className="w-3.5 h-3.5" /> Add
-            </button>
+          <div className="space-y-2">
+            <div className="grid grid-cols-1 sm:grid-cols-[1fr_130px_auto] gap-2">
+              <input
+                type="text"
+                placeholder="Supplier name..."
+                value={newSupplierName}
+                onChange={(e) => setNewSupplierName(e.target.value)}
+                className="cm-input w-full px-3 py-1.5 min-h-[38px] sm:min-h-0 text-sm border rounded-lg"
+              />
+              <input
+                type="text"
+                placeholder="Phone"
+                value={newSupplierPhone}
+                onChange={(e) => setNewSupplierPhone(e.target.value)}
+                className="cm-input w-full px-3 py-1.5 min-h-[38px] sm:min-h-0 text-sm border rounded-lg font-mono-num"
+              />
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!activeShopId || !newSupplierName.trim()) return;
+                  const val = newSupplierName.trim();
+                  try {
+                    await createSupplier(activeShopId, {
+                      name: val,
+                      phone: newSupplierPhone.trim(),
+                      address: newSupplierAddress.trim(),
+                      email: newSupplierEmail.trim(),
+                      notes: newSupplierNotes.trim(),
+                    });
+                    setNewSupplierName('');
+                    setNewSupplierPhone('');
+                    setNewSupplierEmail('');
+                    setNewSupplierAddress('');
+                    setNewSupplierNotes('');
+                    showToast({ title: 'Supplier Added', message: `"${val}" saved.`, tone: 'success', durationMs: 3000 });
+                  } catch (err) {
+                    showToast({
+                      title: 'Supplier Not Added',
+                      message: err instanceof Error ? err.message : 'Could not add supplier.',
+                      tone: 'warning',
+                      durationMs: 5000,
+                    });
+                  }
+                }}
+                className="inline-flex items-center justify-center gap-1 px-3 py-1.5 min-h-[38px] sm:min-h-0 text-xs font-semibold text-white bg-[var(--cm-accent)] hover:bg-[var(--cm-accent-hover)] rounded-lg cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" /> Add
+              </button>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <input
+                type="email"
+                placeholder="Email (optional)"
+                value={newSupplierEmail}
+                onChange={(e) => setNewSupplierEmail(e.target.value)}
+                className="cm-input w-full px-3 py-1.5 min-h-[36px] sm:min-h-0 text-xs border rounded-lg"
+              />
+              <input
+                type="text"
+                placeholder="Address (optional)"
+                value={newSupplierAddress}
+                onChange={(e) => setNewSupplierAddress(e.target.value)}
+                className="cm-input w-full px-3 py-1.5 min-h-[36px] sm:min-h-0 text-xs border rounded-lg"
+              />
+              <input
+                type="text"
+                placeholder="Notes (optional)"
+                value={newSupplierNotes}
+                onChange={(e) => setNewSupplierNotes(e.target.value)}
+                className="cm-input w-full px-3 py-1.5 min-h-[36px] sm:min-h-0 text-xs border rounded-lg"
+              />
+            </div>
           </div>
-          <div className="divide-y divide-[var(--cm-border)] max-h-48 overflow-y-auto">
+          <div className="divide-y divide-[var(--cm-border)] max-h-64 overflow-y-auto">
             {suppliers.length === 0 ? (
               <div className="py-3 text-xs text-[var(--cm-text-muted)]">No suppliers added yet.</div>
             ) : (
               suppliers.map((s) => (
-                <div key={s.id} className="py-1.5 flex items-center justify-between gap-2 text-xs sm:text-sm">
-                  <div className="min-w-0 truncate">
-                    <span className="text-[var(--cm-text-primary)] font-medium">{s.name}</span>
-                    {s.phone && <span className="ml-2 text-xs text-[var(--cm-text-muted)] font-mono-num">{s.phone}</span>}
+                <div key={s.id} className="py-2 flex items-start justify-between gap-2 text-xs sm:text-sm">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <span className="text-[var(--cm-text-primary)] font-medium truncate">{s.name}</span>
+                      {s.phone && (
+                        <span className="text-xs text-[var(--cm-text-muted)] font-mono-num">{s.phone}</span>
+                      )}
+                      {s.email && (
+                        <span className="text-xs text-[var(--cm-text-secondary)] truncate">{s.email}</span>
+                      )}
+                    </div>
+                    {(s.address || s.notes) && (
+                      <div className="text-[11px] text-[var(--cm-text-muted)] truncate mt-0.5">
+                        {[s.address, s.notes].filter(Boolean).join(' · ')}
+                      </div>
+                    )}
                   </div>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      if (!activeShopId) return;
-                      const hasLinkedRecords =
-                        products.some((p) => p.supplierId === s.id) ||
-                        purchases.some((p) => p.supplierId === s.id);
-                      try {
-                        await deleteSupplier(activeShopId, s.id, { hasLinkedRecords });
-                        showToast({
-                          title: 'Supplier Deleted',
-                          message: `"${s.name}" removed.`,
-                          tone: 'info',
-                          durationMs: 3000,
-                        });
-                      } catch (err) {
-                        showToast({
-                          title: 'Cannot Delete Supplier',
-                          message:
-                            err instanceof Error
-                              ? err.message
-                              : 'Supplier has existing records or balance.',
-                          tone: 'warning',
-                          durationMs: 5000,
-                        });
-                      }
-                    }}
-                    className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] cursor-pointer shrink-0"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      aria-label={`Edit ${s.name}`}
+                      title="Edit supplier"
+                      onClick={() => setEditingSupplier(s)}
+                      className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-accent-text)] cursor-pointer rounded-lg"
+                    >
+                      <Edit3 className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Delete ${s.name}`}
+                      title="Delete supplier"
+                      onClick={async () => {
+                        if (!activeShopId) return;
+                        const hasLinkedRecords =
+                          products.some((p) => p.supplierId === s.id) ||
+                          purchases.some((p) => p.supplierId === s.id);
+                        try {
+                          await deleteSupplier(activeShopId, s.id, { hasLinkedRecords });
+                          showToast({
+                            title: 'Supplier Deleted',
+                            message: `"${s.name}" removed.`,
+                            tone: 'info',
+                            durationMs: 3000,
+                          });
+                        } catch (err) {
+                          showToast({
+                            title: 'Cannot Delete Supplier',
+                            message:
+                              err instanceof Error
+                                ? err.message
+                                : 'Supplier has existing records or balance.',
+                            tone: 'warning',
+                            durationMs: 5000,
+                          });
+                        }
+                      }}
+                      className="p-1.5 text-[var(--cm-text-muted)] hover:text-[var(--cm-danger)] cursor-pointer rounded-lg"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
               ))
             )}
           </div>
+          {editingSupplier && activeShopId && (
+            <SupplierEditModal
+              shopId={activeShopId}
+              supplier={editingSupplier}
+              existingSuppliers={suppliers}
+              onClose={() => setEditingSupplier(null)}
+            />
+          )}
         </CompactSection>
 
         {/* Expense Categories */}

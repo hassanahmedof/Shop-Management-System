@@ -243,5 +243,15 @@ export const dirtyDozenCases: DirtyDozenCase[] = [
     payload: { currentStock: 4 },
     expected: 'PERMISSION_DENIED',
   },
+  {
+    id: 23,
+    name: 'Supplier Profile Edit Mixing Balance Tampering or Oversized Email Blocked',
+    collectionPath: '/shops/u1/suppliers/sup1',
+    operation: 'update',
+    authUid: 'u1',
+    emailVerified: true,
+    payload: { name: 'Edited Supplier', email: 'a@b.com', outstandingBalance: 0 },
+    expected: 'PERMISSION_DENIED',
+  },
 ];
 

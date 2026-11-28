@@ -96,13 +96,18 @@ export function InventoryPage() {
     [brands]
   );
 
+  const supplierMap = useMemo(
+    () => new Map(suppliers.map((s) => [s.id, s])),
+    [suppliers]
+  );
+
   const supplierOptions = useMemo<SearchableSelectOption[]>(
     () =>
       suppliers.map((s) => ({
         value: s.id,
         label: s.name,
-        subtitle: s.phone ? `Phone: ${s.phone}` : undefined,
-        keywords: [s.name, s.phone].filter(Boolean),
+        subtitle: s.phone ? `Phone: ${s.phone}` : s.email || undefined,
+        keywords: [s.name, s.phone, s.email || ''].filter(Boolean),
       })),
     [suppliers]
   );
@@ -686,7 +691,7 @@ export function InventoryPage() {
                             <span className="truncate">{b.productName}</span>
                           </span>
                         }
-                        subtitle={`${formatDateDDMMYYYY(b.purchaseDate)} · ${b.purchaseNumber} · ${b.supplierName}`}
+                        subtitle={`${formatDateDDMMYYYY(b.purchaseDate)} · ${b.purchaseNumber} · ${supplierMap.get(b.supplierId)?.name || b.supplierName}`}
                         rightPrimary={`${formatNumber(b.remainingBaseQty)} / ${formatNumber(b.initialBaseQty)}`}
                         rightSecondary={
                           <span className={statusTone}>
@@ -745,7 +750,9 @@ export function InventoryPage() {
                             {b.purchaseNumber}
                           </td>
                           <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">{b.productName}</td>
-                          <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">{b.supplierName || '—'}</td>
+                          <td className="py-2 px-3 text-xs text-[var(--cm-text-secondary)]">
+                            {supplierMap.get(b.supplierId)?.name || b.supplierName || '—'}
+                          </td>
                           <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">
                             <span className="font-semibold">{formatNumber(b.remainingBaseQty)}</span>
                             <span className="text-[var(--cm-text-muted)]"> / {formatNumber(b.initialBaseQty)}</span>

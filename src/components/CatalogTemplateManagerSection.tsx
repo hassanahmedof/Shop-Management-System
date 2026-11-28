@@ -28,7 +28,7 @@ import type {
   ProductTemplate,
   ProductTemplatePackaging,
 } from '../types/shop';
-import { isBrandActive } from '../utils/brands';
+import { getBrandSearchAliases, isBrandActive } from '../utils/brands';
 import { formatNumber, formatPKR } from '../utils/formatters';
 import {
   MAX_PACKAGING_LEVELS,
@@ -225,7 +225,8 @@ export function CatalogTemplateManagerSection({
         if (filterCatId && t.categoryId !== filterCatId) return false;
         if (filterBrandId && t.brandId !== filterBrandId) return false;
         if (tokens.length > 0) {
-          const hay = `${t.name} ${t.variant || ''} ${t.categoryName} ${t.brandName} ${t.bottleSize || ''} ${(t.searchKeywords || []).join(' ')}`.toLowerCase();
+          const aliasHay = getBrandSearchAliases(t.brandName || '').join(' ');
+          const hay = `${t.name} ${t.variant || ''} ${t.categoryName} ${t.brandName} ${aliasHay} ${t.bottleSize || ''} ${(t.searchKeywords || []).join(' ')}`.toLowerCase();
           if (!tokens.every((tok) => hay.includes(tok))) return false;
         }
         return true;

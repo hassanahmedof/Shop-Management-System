@@ -59,6 +59,7 @@ import {
   findExactBrandMatch,
   findSimilarBrands,
   formatBrandCategoryNames,
+  getBrandSearchAliases,
   isBrandActive,
 } from '../utils/brands';
 import {
@@ -276,7 +277,7 @@ export function ProductsPage({ onOpenCatalogSettings }: ProductsPageProps = {}) 
         subtitle: formatBrandCategoryNames(b, categoryNameMap, 2),
         badge: active ? undefined : 'Inactive',
         badgeTone: active ? undefined : 'neutral',
-        keywords: [b.name, ...catNames],
+        keywords: [b.name, ...getBrandSearchAliases(b.name), ...catNames],
       };
       baseOptionById.set(b.id, opt);
 

@@ -18,6 +18,7 @@ export const DEFAULT_PRODUCT_BRANDS: DefaultBrandDefinition[] = [
   { id: 'brand_momse', name: 'Momse', categoryIds: ['cat_diapers', 'cat_wipes'] },
   { id: 'brand_susu', name: 'Susu', categoryIds: ['cat_diapers'] },
   { id: 'brand_leo', name: 'Leo', categoryIds: ['cat_diapers', 'cat_wipes'] },
+  { id: 'brand_royalozone', name: 'Royal Ozone', categoryIds: ['cat_diapers', 'cat_wipes'] },
   { id: 'brand_carebaby', name: 'Care Baby', categoryIds: ['cat_diapers', 'cat_wipes', 'cat_baby_care'] },
   { id: 'brand_coolandcool', name: 'Cool & Cool', categoryIds: ['cat_wipes', 'cat_baby_care', 'cat_hygiene', 'cat_personal_care', 'cat_tissues'] },
   { id: 'brand_bebem', name: 'Bebem Natural', categoryIds: ['cat_diapers', 'cat_wipes'] },
@@ -283,6 +284,7 @@ export const DEFAULT_PRODUCT_BRANDS: DefaultBrandDefinition[] = [
   { id: 'brand_bakeparlor', name: 'Bake Parlor', categoryIds: ['cat_snacks', 'cat_other'] },
   { id: 'brand_national', name: 'National', categoryIds: ['cat_other', 'cat_snacks'] },
   { id: 'brand_shan', name: 'Shan', categoryIds: ['cat_other', 'cat_snacks'] },
+  { id: 'brand_shangrila', name: 'Shangrila', categoryIds: ['cat_other'] },
   { id: 'brand_knorr', name: 'Knorr', categoryIds: ['cat_snacks', 'cat_other'] },
   { id: 'brand_laziza', name: 'Laziza', categoryIds: ['cat_other'] },
   { id: 'brand_ahmedfoods', name: 'Ahmed Foods', categoryIds: ['cat_other'] },
@@ -304,12 +306,32 @@ export const DEFAULT_PRODUCT_BRANDS: DefaultBrandDefinition[] = [
   { id: 'brand_duracell', name: 'Duracell', categoryIds: ['cat_other'] },
 ];
 
+const BRAND_KEY_ALIASES: Record<string, string> = {
+  shaan: 'shan',
+  'shan foods': 'shan',
+  'shaan foods': 'shan',
+  'national foods': 'national',
+  'mother care': 'mothercare',
+  royalozone: 'royal ozone',
+  'leo baby': 'leo',
+  'shangrila foods': 'shangrila',
+};
+
+const BRAND_SEARCH_ALIASES_BY_KEY: Record<string, string[]> = {
+  shan: ['shaan', 'shan foods', 'shaan foods'],
+  national: ['national foods'],
+  mothercare: ['mother care'],
+  'royal ozone': ['royalozone'],
+  leo: ['leo', 'leo baby'],
+  shangrila: ['shangrila foods'],
+};
+
 /**
  * Strips accents, apostrophes, hyphens, and normalizes `&` to `and`
- * so spelling variations like "Coca Cola", "Coca-Cola", "Johnson's", "Johnsons" match reliably.
+ * plus canonical spelling aliases (e.g. "Shaan" / "Shan Foods" -> "shan").
  */
 export function normalizeBrandKey(name: string): string {
-  return name
+  const cleaned = name
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
@@ -318,6 +340,7 @@ export function normalizeBrandKey(name: string): string {
     .replace(/[^a-z0-9]+/g, ' ')
     .trim()
     .replace(/\s+/g, ' ');
+  return BRAND_KEY_ALIASES[cleaned] || cleaned;
 }
 
 /**
@@ -325,6 +348,14 @@ export function normalizeBrandKey(name: string): string {
  */
 export function normalizeBrandCompactKey(name: string): string {
   return normalizeBrandKey(name).replace(/\s+/g, '');
+}
+
+/**
+ * Returns known spelling/search aliases for a canonical brand name (e.g. "Shan" -> ["shaan", "shan foods"]).
+ */
+export function getBrandSearchAliases(name: string): string[] {
+  const canonical = normalizeBrandKey(name);
+  return BRAND_SEARCH_ALIASES_BY_KEY[canonical] || [];
 }
 
 function levenshtein(a: string, b: string): number {

@@ -785,7 +785,7 @@ async function runDefaultBrandsSync(
     addedByCategory: {},
   };
 
-  const storageKey = `cm_brands_v4_seeded_${uid}`;
+  const storageKey = `cm_brands_v5_seeded_${uid}`;
   const alreadySeededLocally =
     !options?.forceCheck &&
     typeof window !== 'undefined' &&
@@ -807,25 +807,27 @@ async function runDefaultBrandsSync(
         (!Array.isArray(b.categoryIds) || b.categoryIds.length === 0 || b.isActive === undefined)
     );
 
-  const hasExpandedV4Library = (list: Brand[]) => {
+  const hasExpandedV5Library = (list: Brand[]) => {
     const idSet = new Set(list.map((b) => b.id));
     return (
-      list.length >= 220 &&
+      list.length >= 222 &&
       idSet.has('brand_durex') &&
       idSet.has('brand_cerave') &&
       idSet.has('brand_morinaga') &&
       idSet.has('brand_vitaltea') &&
       idSet.has('brand_brookebond') &&
       idSet.has('brand_indomie') &&
-      idSet.has('brand_guard')
+      idSet.has('brand_guard') &&
+      idSet.has('brand_royalozone') &&
+      idSet.has('brand_shangrila')
     );
   };
 
   const isBrandsDone = (list: Brand[]) =>
     !hasMissingLegacyMeta(list) &&
-    ((alreadySeededLocally && list.length >= 120) || hasExpandedV4Library(list));
+    ((alreadySeededLocally && list.length >= 120) || hasExpandedV5Library(list));
 
-  // Fast path: if caller already has live listener data and v4 brands are seeded, skip all Firestore reads
+  // Fast path: if caller already has live listener data and v5 brands are seeded, skip all Firestore reads
   if (!options?.forceCheck && existingBrands.length > 0 && isBrandsDone(existingBrands)) {
     if (typeof window !== 'undefined' && !alreadySeededLocally) {
       window.localStorage.setItem(storageKey, '1');
@@ -1750,26 +1752,32 @@ async function runDefaultProductTemplatesSync(
     skippedByCategory: {},
   };
 
-  const storageKey = `cm_templates_v3_seeded_${uid}`;
+  const storageKey = `cm_templates_v4_seeded_${uid}`;
   const alreadySeededLocally =
     !options?.forceCheck &&
     typeof window !== 'undefined' &&
     window.localStorage.getItem(storageKey) === '1';
 
-  const hasExpandedV3Templates = (list: ProductTemplate[]) => {
+  const hasExpandedV4Templates = (list: ProductTemplate[]) => {
     const idSet = new Set(list.map((t) => t.id));
     return (
-      list.length >= 400 &&
+      list.length >= 500 &&
       idSet.has('tpl_cerelac_wheat_340g') &&
       idSet.has('tpl_tapal_danedar_900g') &&
       idSet.has('tpl_fruitavitals_chaunsa_1l') &&
       idSet.has('tpl_shan_karahi_50g') &&
-      idSet.has('tpl_sw_durex_featherlite_12')
+      idSet.has('tpl_sw_durex_featherlite_12') &&
+      idSet.has('tpl_leo_wipes_56') &&
+      idSet.has('tpl_shangrila_tomato_ketchup_400g') &&
+      idSet.has('tpl_shan_shoop_chatpata_65g') &&
+      idSet.has('tpl_national_pink_salt_800g') &&
+      idSet.has('tpl_mothercare_go_rash_powder_150g') &&
+      idSet.has('tpl_royalozone_diapers_l_50')
     );
   };
 
   const isTemplatesDone = (list: ProductTemplate[]) =>
-    (alreadySeededLocally && list.length >= 250) || hasExpandedV3Templates(list);
+    (alreadySeededLocally && list.length >= 500) || hasExpandedV4Templates(list);
 
   // Fast path: reuse live listener data without triggering Firestore collection scans
   if (!options?.forceCheck && existingTemplates && isTemplatesDone(existingTemplates)) {
@@ -1819,13 +1827,22 @@ async function runDefaultProductTemplatesSync(
         ),
   ]);
 
-  const existingIds = new Set(liveTemplates.map((t) => t.id));
-  const existingKeys = new Set(
-    liveTemplates.map((t) => normalizeTemplateKey(t.categoryId, t.brandId, t.name, t.variant))
-  );
+  const existingById = new Map(liveTemplates.map((t) => [t.id, t]));
+  const existingByKey = new Map<string, ProductTemplate>();
+  const existingByNameVariant = new Map<string, ProductTemplate>();
+  for (const t of liveTemplates) {
+    const fullKey = normalizeTemplateKey(t.categoryId, t.brandId, t.name, t.variant);
+    if (!existingByKey.has(fullKey)) existingByKey.set(fullKey, t);
+    const nvKey = normalizeTemplateKey('', '', t.name, t.variant);
+    if (!existingByNameVariant.has(nvKey)) existingByNameVariant.set(nvKey, t);
+  }
 
   const { DEFAULT_PRODUCT_TEMPLATES } = await import('../utils/productTemplates');
-  const toInsert: Array<{ id: string; data: Record<string, unknown> }> = [];
+  type TemplateBatchOp =
+    | { type: 'set'; id: string; data: Record<string, unknown> }
+    | { type: 'update'; id: string; data: Record<string, unknown> };
+  const ops: TemplateBatchOp[] = [];
+
   for (const def of DEFAULT_PRODUCT_TEMPLATES) {
     const resolved = resolveTemplateCategoryAndBrand(def, liveCategories, liveBrands);
     const key = normalizeTemplateKey(
@@ -1834,15 +1851,66 @@ async function runDefaultProductTemplatesSync(
       def.name,
       def.variant
     );
-    if (existingIds.has(def.id) || existingKeys.has(key)) {
+    const looseKey = normalizeTemplateKey('', '', def.name, def.variant);
+    const looseCandidate = existingByNameVariant.get(looseKey);
+    const isLooseBrandCompatible =
+      looseCandidate &&
+      (!looseCandidate.brandId ||
+        looseCandidate.brandId === resolved.brandId ||
+        normalizeBrandKey(looseCandidate.brandName || '') ===
+          normalizeBrandKey(resolved.brandName));
+
+    const matched =
+      existingById.get(def.id) ||
+      existingByKey.get(key) ||
+      (isLooseBrandCompatible ? looseCandidate : undefined);
+
+    if (matched) {
+      const updatePatch: Record<string, unknown> = {};
+      if (!matched.categoryId && resolved.categoryId) {
+        updatePatch.categoryId = clip(resolved.categoryId, 128);
+      }
+      if (!matched.categoryName && resolved.categoryName) {
+        updatePatch.categoryName = clip(resolved.categoryName, 100);
+      }
+      if (!matched.brandId && resolved.brandId) {
+        updatePatch.brandId = clip(resolved.brandId, 128);
+      }
+      if ((!matched.brandName || matched.brandName === 'Generic') && resolved.brandName) {
+        updatePatch.brandName = clip(resolved.brandName, 100);
+      }
+      if (
+        def.searchKeywords &&
+        def.searchKeywords.length > 0 &&
+        (!matched.searchKeywords || matched.searchKeywords.length === 0)
+      ) {
+        updatePatch.searchKeywords = sanitizeTemplateKeywords(def.searchKeywords);
+      }
+      if (Object.keys(updatePatch).length > 0) {
+        updatePatch.updatedAt = serverTimestamp();
+        ops.push({ type: 'update', id: matched.id, data: updatePatch });
+      }
       stats.templatesSkippedExisting += 1;
       stats.skippedByCategory[resolved.categoryId] =
         (stats.skippedByCategory[resolved.categoryId] || 0) + 1;
       continue;
     }
-    existingIds.add(def.id);
-    existingKeys.add(key);
-    toInsert.push({
+
+    existingById.set(def.id, {
+      id: def.id,
+      ownerUid: uid,
+      name: def.name,
+      categoryId: resolved.categoryId,
+      categoryName: resolved.categoryName,
+      brandId: resolved.brandId,
+      brandName: resolved.brandName,
+      variant: def.variant,
+      baseUnit: def.baseUnit,
+      isActive: true,
+    });
+    existingByKey.set(key, existingById.get(def.id)!);
+    ops.push({
+      type: 'set',
       id: def.id,
       data: buildProductTemplateWritePayload(uid, {
         ...def,
@@ -1859,13 +1927,15 @@ async function runDefaultProductTemplatesSync(
       (stats.addedByCategory[resolved.categoryId] || 0) + 1;
   }
 
-  if (toInsert.length > 0) {
+  if (ops.length > 0) {
     const CHUNK_SIZE = 350;
-    for (let i = 0; i < toInsert.length; i += CHUNK_SIZE) {
+    for (let i = 0; i < ops.length; i += CHUNK_SIZE) {
       const batch = writeBatch(db);
-      const chunk = toInsert.slice(i, i + CHUNK_SIZE);
-      for (const item of chunk) {
-        batch.set(shopDoc(uid, 'productTemplates', item.id), item.data);
+      const chunk = ops.slice(i, i + CHUNK_SIZE);
+      for (const op of chunk) {
+        const ref = shopDoc(uid, 'productTemplates', op.id);
+        if (op.type === 'set') batch.set(ref, op.data);
+        else batch.update(ref, op.data);
       }
       await batch.commit();
     }

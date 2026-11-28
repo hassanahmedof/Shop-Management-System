@@ -5,7 +5,7 @@ import type {
   ProductTemplate,
   ProductTemplatePackaging,
 } from '../types/shop';
-import { DEFAULT_PRODUCT_BRANDS, normalizeBrandKey } from './brands';
+import { DEFAULT_PRODUCT_BRANDS, getBrandSearchAliases, normalizeBrandKey } from './brands';
 import { DEFAULT_PRODUCT_CATEGORIES, normalizeCategoryKey } from './packaging';
 import { recordPerfMetric, startPerfTimer } from './perfMonitor';
 
@@ -117,13 +117,14 @@ function toIndexedTemplateEntry(tpl: ProductTemplate): IndexedTemplateEntry {
   const keywordsLower = tpl.searchKeywords?.length
     ? tpl.searchKeywords.join(' ').toLowerCase()
     : '';
+  const brandAliasesLower = getBrandSearchAliases(tpl.brandName || '').join(' ');
   return {
     tpl,
     nameLower,
     variantLower,
     brandLower,
     catLower,
-    combined: `${nameLower} ${variantLower} ${brandLower} ${catLower} ${bottleLower} ${keywordsLower}`,
+    combined: `${nameLower} ${variantLower} ${brandLower} ${brandAliasesLower} ${catLower} ${bottleLower} ${keywordsLower}`,
   };
 }
 
@@ -271,17 +272,17 @@ export function filterAndRankTemplates(
 
 const CATEGORY_KEYWORD_HINTS: Array<{ catId: string; keywords: string[] }> = [
   { catId: 'cat_sexual_wellness', keywords: ['condom', 'lubricant', 'lube', 'lubricating gel', 'intimacy gel', 'intimate gel', 'massage gel', 'delay spray', 'durex', 'sathi', 'saathi', 'ky jelly', 'k-y'] },
-  { catId: 'cat_diapers', keywords: ['diaper', 'pampers', 'molfix', 'canbebe', 'mamypoko', 'pants', 'newborn', 'maxi', 'midi', 'jumbo'] },
-  { catId: 'cat_wipes', keywords: ['wipe', 'wipes', 'wet wipe'] },
-  { catId: 'cat_baby_care', keywords: ['cerelac', 'lactogen', 'lactogrow', 'nan optipro', 'morinaga', 'similac', 'pediasure', 'aptamil', 'enfagrow', 'formula', 'baby cereal', 'baby lotion', 'baby oil', 'baby powder', 'baby shampoo', 'rash cream', 'baby soap', 'baby bath', 'cologne', 'feeding bottle'] },
+  { catId: 'cat_diapers', keywords: ['diaper', 'pampers', 'molfix', 'canbebe', 'mamypoko', 'pants', 'baby pants', 'royal ozone', 'newborn', 'maxi', 'midi', 'jumbo'] },
+  { catId: 'cat_wipes', keywords: ['wipe', 'wipes', 'wet wipe', 'purse pack', 'teddy wipes'] },
+  { catId: 'cat_baby_care', keywords: ['cerelac', 'lactogen', 'lactogrow', 'nan optipro', 'morinaga', 'similac', 'pediasure', 'aptamil', 'enfagrow', 'formula', 'baby cereal', 'baby lotion', 'baby oil', 'baby powder', 'baby shampoo', 'rash cream', 'go rash', 'prickly heat', 'baby jelly', 'baby soap', 'baby bath', 'baby cologne', 'cologne', 'feeding bottle'] },
   { catId: 'cat_tissues', keywords: ['tissue', 'facial', 'toilet roll', 'kitchen roll', 'napkin', 'paper towel', 'zzoop', 'rose petal'] },
   { catId: 'cat_hygiene', keywords: ['sanitary', 'pad', 'liner', 'adult diaper', 'tena', 'butterfly', 'whisper', 'kotex', 'sanitizer', 'antiseptic', 'cotton bud', 'handwash'] },
   { catId: 'cat_personal_care', keywords: ['lip balm', 'lip therapy', 'lip mask', 'cold cream', 'hand cream', 'foot cream', 'petroleum jelly', 'glycerin', 'moisturizer', 'shampoo', 'conditioner', 'hair oil', 'soap', 'body wash', 'shower gel', 'lotion', 'cream', 'face wash', 'toothpaste', 'toothbrush', 'mouthwash', 'deodorant', 'body spray', 'razor'] },
   { catId: 'cat_household_cleaning', keywords: ['detergent', 'washing powder', 'dishwash', 'bleach', 'phenyl', 'toilet cleaner', 'glass cleaner', 'insect', 'surf', 'ariel', 'harpic', 'domex', 'vim', 'scrubber', 'fabric softener'] },
   { catId: 'cat_cold_drinks', keywords: ['cola', 'soda', 'pepsi', 'sprite', '7up', 'dew', 'sting', 'pakola', 'energy', 'malt', 'barbican', 'tea', 'coffee', 'danedar', 'tapal', 'lipton', 'brooke bond', 'vital tea', 'nescafe', 'everyday', 'can', 'fizz', 'syrup', 'rooh afza', 'jam-e-shirin'] },
   { catId: 'cat_water_juices', keywords: ['water', 'juice', 'nectar', 'fruita vitals', 'nesfruta', 'milk', 'milkpak', 'olpers', 'tarang', 'tetra', 'pure life', 'aquafina', 'tang', 'lani', 'rani'] },
-  { catId: 'cat_snacks', keywords: ['chips', 'biscuit', 'cookie', 'chocolate', 'candy', 'toffee', 'wafer', 'noodle', 'indomie', 'maggi', 'knorr', 'snack', 'crisp', 'nutella', 'cupcake'] },
-  { catId: 'cat_other', keywords: ['cooking oil', 'banaspati', 'ghee', 'masala', 'spices', 'salt', 'pickle', 'ketchup', 'jam', 'mayonnaise', 'butter', 'margarine', 'rice', 'basmati', 'nuggets', 'custard', 'kheer', 'battery'] },
+  { catId: 'cat_snacks', keywords: ['chips', 'biscuit', 'cookie', 'chocolate', 'candy', 'toffee', 'wafer', 'noodle', 'shoop', 'indomie', 'maggi', 'knorr', 'snack', 'crisp', 'nutella', 'cupcake'] },
+  { catId: 'cat_other', keywords: ['cooking oil', 'banaspati', 'ghee', 'masala', 'biryani', 'karahi', 'nihari', 'haleem', 'qorma', 'spices', 'salt', 'pink salt', 'pickle', 'ketchup', 'sauce', 'vinegar', 'worcestershire', 'sriracha', 'peri peri', 'chipotle', 'habanero', 'jalapeno', 'mustard', 'umami', 'drizz', 'chutney', 'paste', 'jam', 'jelly', 'vermicelli', 'mayonnaise', 'mayo', 'butter', 'margarine', 'rice', 'basmati', 'nuggets', 'custard', 'kheer', 'battery'] },
 ];
 
 export function suggestCategoryAndBrandFromName(
@@ -296,10 +297,12 @@ export function suggestCategoryAndBrandFromName(
   let longestBrandLen = 0;
   for (const b of brands) {
     if (b.isActive === false) continue;
-    const bLower = b.name.toLowerCase().trim();
-    if (bLower.length >= 2 && lower.includes(bLower) && bLower.length > longestBrandLen) {
-      suggestedBrandId = b.id;
-      longestBrandLen = bLower.length;
+    const candidates = [b.name.toLowerCase().trim(), ...getBrandSearchAliases(b.name)];
+    for (const term of candidates) {
+      if (term.length >= 2 && lower.includes(term) && term.length > longestBrandLen) {
+        suggestedBrandId = b.id;
+        longestBrandLen = term.length;
+      }
     }
   }
 

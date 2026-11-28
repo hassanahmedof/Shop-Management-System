@@ -198,6 +198,48 @@ export function WebsiteOrdersView({
     return issues;
   };
 
+  const getOrderPriceWarnings = (order: WebsiteOrder): string[] => {
+    if (readOnlyFinancialConfirmation || !order.itemsLoaded || !order.items?.length) return [];
+    const warnings: string[] = [];
+    let computedSubtotal = 0;
+
+    if (order.itemCount !== order.items.length) {
+      warnings.push(
+        `Header reports ${formatNumber(order.itemCount)} items, but ${formatNumber(order.items.length)} item documents exist.`
+      );
+    }
+
+    for (const item of order.items) {
+      computedSubtotal = roundMoney(computedSubtotal + (Number(item.lineTotal) || 0));
+      const prod = productMap.get(item.productId);
+      if (!prod) continue;
+      const baseUnit = (prod.baseUnit || prod.unit || '').trim().toLowerCase();
+      const unitLower = (item.unitName || '').trim().toLowerCase();
+      let expectedPrice = roundMoney(prod.salePrice);
+      if (unitLower && unitLower !== baseUnit) {
+        const pkg = (prod.packagingUnits || []).find(
+          (p) => (p.unitName || '').trim().toLowerCase() === unitLower
+        );
+        if (pkg) {
+          expectedPrice = roundMoney(pkg.salePrice);
+        }
+      }
+      if (Math.abs(roundMoney(item.unitPrice) - expectedPrice) > 0.01) {
+        warnings.push(
+          `${item.productName} (${item.unitName}): submitted ${formatPKR(item.unitPrice)} vs catalog ${formatPKR(expectedPrice)}.`
+        );
+      }
+    }
+
+    if (Math.abs(roundMoney(order.subtotal) - computedSubtotal) > 0.05) {
+      warnings.push(
+        `Order subtotal (${formatPKR(order.subtotal)}) differs from sum of line items (${formatPKR(computedSubtotal)}).`
+      );
+    }
+
+    return warnings;
+  };
+
   const handleConfirmOrder = async (order: WebsiteOrder) => {
     if (!activeShopId || readOnlyFinancialConfirmation || busyOrderId) return;
     setActionError(null);
@@ -487,6 +529,8 @@ export function WebsiteOrdersView({
               const isBusy = busyOrderId === order.id;
               const stockIssues =
                 order.status === 'Pending Confirmation' ? getOrderStockIssues(order) : [];
+              const priceWarnings =
+                order.status === 'Pending Confirmation' ? getOrderPriceWarnings(order) : [];
               const badgeClass = getStatusBadgeClass(order.status);
 
               return (
@@ -706,6 +750,20 @@ export function WebsiteOrdersView({
                         </div>
                       )}
 
+                      {priceWarnings.length > 0 && (
+                        <div className="p-2.5 rounded-lg bg-[var(--cm-warning-soft)] border border-[var(--cm-warning-border)] text-xs text-[var(--cm-warning)] space-y-1">
+                          <div className="font-semibold flex items-center gap-1.5">
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                            <span>Price / Total Verification Notice</span>
+                          </div>
+                          <ul className="list-disc pl-4 space-y-0.5">
+                            {priceWarnings.map((warn) => (
+                              <li key={warn}>{warn}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
                       {order.customerNotes && (
                         <div className="text-xs text-[var(--cm-text-secondary)] bg-[var(--cm-bg-subtle)] border border-[var(--cm-border)] rounded-lg px-3 py-2">
                           <span className="font-semibold text-[var(--cm-text-primary)]">
@@ -735,30 +793,43 @@ export function WebsiteOrdersView({
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-[var(--cm-border)]">
-                              {(order.items || []).map((item, idx) => (
-                                <tr key={`${order.id}-${item.productId}-${idx}`}>
-                                  <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">
-                                    {item.productName}
-                                  </td>
-                                  <td className="py-2 px-3 text-[var(--cm-text-secondary)]">
-                                    {item.unitName}
-                                    {item.conversionFactor > 1 && (
-                                      <span className="text-[11px] text-[var(--cm-text-muted)] ml-1 font-mono-num">
-                                        (×{formatNumber(item.conversionFactor)})
-                                      </span>
-                                    )}
-                                  </td>
-                                  <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">
-                                    {formatNumber(item.quantity)}
-                                  </td>
-                                  <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">
-                                    {formatPKR(item.unitPrice)}
-                                  </td>
-                                  <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-text-primary)]">
-                                    {formatPKR(item.lineTotal)}
+                              {(!order.items || order.items.length === 0) ? (
+                                <tr>
+                                  <td
+                                    colSpan={5}
+                                    className="py-3 px-3 text-center text-[var(--cm-text-muted)]"
+                                  >
+                                    {order.itemsLoaded === false
+                                      ? 'Loading order items...'
+                                      : 'No line items found for this order.'}
                                   </td>
                                 </tr>
-                              ))}
+                              ) : (
+                                order.items.map((item, idx) => (
+                                  <tr key={item.id || `${order.id}-${item.productId}-${idx}`}>
+                                    <td className="py-2 px-3 font-medium text-[var(--cm-text-primary)]">
+                                      {item.productName}
+                                    </td>
+                                    <td className="py-2 px-3 text-[var(--cm-text-secondary)]">
+                                      {item.unitName}
+                                      {item.conversionFactor > 1 && (
+                                        <span className="text-[11px] text-[var(--cm-text-muted)] ml-1 font-mono-num">
+                                          (×{formatNumber(item.conversionFactor)})
+                                        </span>
+                                      )}
+                                    </td>
+                                    <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-primary)]">
+                                      {formatNumber(item.quantity)}
+                                    </td>
+                                    <td className="py-2 px-3 text-right font-mono-num text-[var(--cm-text-secondary)]">
+                                      {formatPKR(item.unitPrice)}
+                                    </td>
+                                    <td className="py-2 px-3 text-right font-mono-num font-semibold text-[var(--cm-text-primary)]">
+                                      {formatPKR(item.lineTotal)}
+                                    </td>
+                                  </tr>
+                                ))
+                              )}
                             </tbody>
                             <tfoot className="bg-[var(--cm-bg-subtle)] border-t border-[var(--cm-border)] font-mono-num">
                               <tr>
@@ -874,6 +945,16 @@ export function WebsiteOrdersView({
                     <ul className="list-disc pl-4 space-y-0.5">
                       {getOrderStockIssues(modalState.order).map((issue) => (
                         <li key={issue}>{issue}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {getOrderPriceWarnings(modalState.order).length > 0 && (
+                  <div className="p-2.5 rounded-lg bg-[var(--cm-warning-soft)] border border-[var(--cm-warning-border)] text-[var(--cm-warning)] space-y-1">
+                    <div className="font-semibold">Price / total mismatch detected:</div>
+                    <ul className="list-disc pl-4 space-y-0.5">
+                      {getOrderPriceWarnings(modalState.order).map((warn) => (
+                        <li key={warn}>{warn}</li>
                       ))}
                     </ul>
                   </div>

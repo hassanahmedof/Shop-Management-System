@@ -564,6 +564,10 @@ export type WebsiteOrderStatus =
   | 'Cancelled/Rejected';
 
 export interface WebsiteOrderItem {
+  id?: string;
+  ownerUid?: string;
+  shopId?: string;
+  orderId?: string;
   productId: string;
   productName: string;
   unitName: string;
@@ -572,9 +576,26 @@ export interface WebsiteOrderItem {
   baseQuantity: number;
   unitPrice: number;
   lineTotal: number;
+  createdAt?: Timestamp;
 }
 
-export interface WebsiteOrder {
+export interface WebsiteOrderItemDoc {
+  id: string;
+  ownerUid: string;
+  shopId: string;
+  orderId: string;
+  productId: string;
+  productName: string;
+  unitName: string;
+  conversionFactor: number;
+  quantity: number;
+  baseQuantity: number;
+  unitPrice: number;
+  lineTotal: number;
+  createdAt?: Timestamp;
+}
+
+export interface WebsiteOrderHeader {
   id: string;
   ownerUid: string;
   shopId: string;
@@ -585,7 +606,6 @@ export interface WebsiteOrder {
   customerNotes: string;
   paymentMethod: 'Cash on Delivery';
   status: WebsiteOrderStatus;
-  items: WebsiteOrderItem[];
   itemCount: number;
   totalQuantity: number;
   subtotal: number;
@@ -602,6 +622,11 @@ export interface WebsiteOrder {
   cancelledAt?: Timestamp;
   createdAt?: Timestamp;
   updatedAt?: Timestamp;
+}
+
+export interface WebsiteOrder extends WebsiteOrderHeader {
+  items: WebsiteOrderItem[];
+  itemsLoaded?: boolean;
 }
 
 export type NavSection =

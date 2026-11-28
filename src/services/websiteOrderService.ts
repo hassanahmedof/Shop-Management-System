@@ -2,9 +2,12 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
+  query,
   runTransaction,
   serverTimestamp,
   setDoc,
+  where,
   writeBatch,
 } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
@@ -16,6 +19,8 @@ import type {
   StorefrontCatalogItem,
   StorefrontMeta,
   WebsiteOrder,
+  WebsiteOrderHeader,
+  WebsiteOrderItem,
   WebsiteOrderStatus,
 } from '../types/shop';
 import {
@@ -44,6 +49,35 @@ import {
   enqueueSaleCooccurrenceUpdate,
 } from './upsellCooccurrenceService';
 
+export interface PlaceWebsiteOrderLineInput {
+  productId: string;
+  unitName?: string;
+  quantity: number;
+}
+
+export interface PlaceWebsiteOrderInput {
+  orderNumber?: string;
+  customerName: string;
+  customerPhone: string;
+  customerAddress: string;
+  customerNotes?: string;
+  deliveryFee?: number;
+  items: PlaceWebsiteOrderLineInput[];
+}
+
+export interface PlaceWebsiteOrderResult {
+  orderId: string;
+  orderNumber: string;
+  itemIds: string[];
+  itemCount: number;
+  totalQuantity: number;
+  subtotal: number;
+  deliveryFee: number;
+  totalAmount: number;
+}
+
+const PHONE_REGEX = /^[0-9+\-() ]{7,24}$/;
+
 function clip(val: string | undefined | null, maxLen: number): string {
   return (val || '').trim().slice(0, maxLen);
 }
@@ -68,6 +102,253 @@ export function computePendingWebsiteReservedByProduct(
     }
   }
   return reserved;
+}
+
+export async function fetchWebsiteOrderItems(
+  shopId: string,
+  orderId: string,
+  fallbackInlineItems?: WebsiteOrderItem[]
+): Promise<WebsiteOrderItem[]> {
+  try {
+    const snap = await getDocs(
+      query(
+        collection(db, 'shops', shopId, 'websiteOrders', orderId, 'items'),
+        where('ownerUid', '==', shopId)
+      )
+    );
+    if (!snap.empty) {
+      return snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<WebsiteOrderItem, 'id'>),
+      }));
+    }
+    return fallbackInlineItems ? [...fallbackInlineItems] : [];
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, `shops/${shopId}/websiteOrders/${orderId}/items`);
+  }
+}
+
+export async function placeWebsiteOrder(
+  shopId: string,
+  input: PlaceWebsiteOrderInput
+): Promise<PlaceWebsiteOrderResult> {
+  const customerName = clip(input.customerName, 120);
+  const customerPhone = clip(input.customerPhone, 24);
+  const customerAddress = clip(input.customerAddress, 400);
+  const customerNotes = clip(input.customerNotes, 500);
+  const deliveryFee = Math.max(0, roundMoney(Number(input.deliveryFee) || 0));
+
+  if (customerName.length < 2) {
+    throw new Error('Customer name must be at least 2 characters.');
+  }
+  if (!PHONE_REGEX.test(customerPhone)) {
+    throw new Error('Customer phone number must be 7-24 characters using digits, +, -, (), or spaces.');
+  }
+  if (customerAddress.length < 5) {
+    throw new Error('Customer delivery address must be at least 5 characters.');
+  }
+  if (deliveryFee > 100000) {
+    throw new Error('Delivery fee exceeds allowed maximum.');
+  }
+  if (!Array.isArray(input.items) || input.items.length === 0 || input.items.length > 50) {
+    throw new Error('Website orders must contain between 1 and 50 line items.');
+  }
+
+  for (const line of input.items) {
+    if (!line?.productId || typeof line.productId !== 'string') {
+      throw new Error('Each order line item requires a valid productId.');
+    }
+    const qty = Number(line.quantity);
+    if (!Number.isFinite(qty) || qty <= 0 || qty > 10000) {
+      throw new Error(`Invalid quantity for product ${line.productId}. Must be between 0 and 10,000.`);
+    }
+  }
+
+  const uniqueProductIds = Array.from(new Set(input.items.map((l) => l.productId)));
+  const orderRef = doc(collection(db, 'shops', shopId, 'websiteOrders'));
+  const itemsColRef = collection(db, 'shops', shopId, 'websiteOrders', orderRef.id, 'items');
+  const itemRefs = input.items.map(() => doc(itemsColRef));
+  const rawOrderNumber = clip(input.orderNumber || generateTxnNumber('WEB'), 40);
+  const orderNumber = rawOrderNumber.length >= 3 ? rawOrderNumber : generateTxnNumber('WEB');
+
+  try {
+    let summary: Omit<PlaceWebsiteOrderResult, 'orderId' | 'orderNumber' | 'itemIds'> = {
+      itemCount: input.items.length,
+      totalQuantity: 0,
+      subtotal: 0,
+      deliveryFee,
+      totalAmount: deliveryFee,
+    };
+
+    await runTransaction(db, async (tx) => {
+      // Phase 1: ALL reads before ANY writes
+      const catalogSnaps = await Promise.all(
+        uniqueProductIds.map((pid) => tx.get(doc(db, 'shops', shopId, 'storefrontCatalog', pid)))
+      );
+
+      const catalogMap = new Map<string, StorefrontCatalogItem>();
+      for (let i = 0; i < uniqueProductIds.length; i += 1) {
+        const pid = uniqueProductIds[i];
+        const snap = catalogSnaps[i];
+        if (!snap.exists()) {
+          throw new Error(`Product "${pid}" is no longer available in the storefront catalog.`);
+        }
+        const data = { id: snap.id, ...(snap.data() as Omit<StorefrontCatalogItem, 'id'>) };
+        if (!data.isActive) {
+          throw new Error(`Product "${data.name}" is currently unavailable for online ordering.`);
+        }
+        catalogMap.set(pid, data);
+      }
+
+      const requiredBaseByProduct = new Map<string, number>();
+      const resolvedItems: Array<Omit<WebsiteOrderItem, 'id' | 'createdAt'>> = [];
+
+      let totalQuantity = 0;
+      let subtotal = 0;
+
+      for (const line of input.items) {
+        const catalogItem = catalogMap.get(line.productId)!;
+        const baseUnit = clip(catalogItem.baseUnit || catalogItem.unit || 'Piece', 40) || 'Piece';
+        const requestedUnit = clip(line.unitName || baseUnit, 40) || baseUnit;
+        const quantity = roundStockQty(Number(line.quantity));
+
+        let resolvedUnitName = baseUnit;
+        let conversionFactor = 1;
+        let unitPrice = Math.max(0, roundMoney(Number(catalogItem.salePrice) || 0));
+
+        if (requestedUnit.toLowerCase() !== baseUnit.toLowerCase()) {
+          const pkg = (catalogItem.packagingUnits || []).find(
+            (p) =>
+              p.allowSale !== false &&
+              (p.unitName || '').trim().toLowerCase() === requestedUnit.toLowerCase()
+          );
+          if (!pkg) {
+            throw new Error(
+              `Unit "${requestedUnit}" is not enabled for sale on product "${catalogItem.name}".`
+            );
+          }
+          const factor = Number(pkg.conversionQty);
+          if (!Number.isFinite(factor) || factor <= 0 || factor > 100000) {
+            throw new Error(`Invalid packaging conversion for "${catalogItem.name}" (${pkg.unitName}).`);
+          }
+          resolvedUnitName = clip(pkg.unitName, 40) || requestedUnit;
+          conversionFactor = roundStockQty(factor);
+          unitPrice = Math.max(0, roundMoney(Number(pkg.salePrice) || 0));
+        }
+
+        const baseQuantity = roundStockQty(quantity * conversionFactor);
+        if (!Number.isFinite(baseQuantity) || baseQuantity <= 0 || baseQuantity > 1000000) {
+          throw new Error(`Calculated base quantity out of range for "${catalogItem.name}".`);
+        }
+
+        const lineTotal = roundMoney(unitPrice * quantity);
+        if (unitPrice > 10000000 || lineTotal > 10000000) {
+          throw new Error(`Line total out of bounds for "${catalogItem.name}".`);
+        }
+
+        totalQuantity = roundStockQty(totalQuantity + baseQuantity);
+        subtotal = roundMoney(subtotal + lineTotal);
+        requiredBaseByProduct.set(
+          catalogItem.productId || catalogItem.id,
+          roundStockQty((requiredBaseByProduct.get(catalogItem.productId || catalogItem.id) || 0) + baseQuantity)
+        );
+
+        resolvedItems.push({
+          ownerUid: shopId,
+          shopId,
+          orderId: orderRef.id,
+          productId: catalogItem.productId || catalogItem.id,
+          productName: clip(catalogItem.name, 180) || 'Product',
+          unitName: resolvedUnitName,
+          conversionFactor,
+          quantity,
+          baseQuantity,
+          unitPrice,
+          lineTotal,
+        });
+      }
+
+      for (const [pid, reqBaseQty] of requiredBaseByProduct.entries()) {
+        const catalogItem = catalogMap.get(pid)!;
+        const available = roundStockQty(Math.max(0, Number(catalogItem.currentStock) || 0));
+        if (available < reqBaseQty) {
+          throw new Error(
+            `Insufficient online stock for "${catalogItem.name}": requested ${reqBaseQty} ${catalogItem.baseUnit || catalogItem.unit}, available ${available}.`
+          );
+        }
+      }
+
+      const totalAmount = roundMoney(subtotal + deliveryFee);
+
+      // Phase 2: ALL writes after ALL reads
+      for (const [pid, reqBaseQty] of requiredBaseByProduct.entries()) {
+        const catalogItem = catalogMap.get(pid)!;
+        const available = roundStockQty(Math.max(0, Number(catalogItem.currentStock) || 0));
+        const nextStock = roundStockQty(available - reqBaseQty);
+        tx.update(doc(db, 'shops', shopId, 'storefrontCatalog', pid), {
+          currentStock: nextStock,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      const orderHeaderPayload: Omit<WebsiteOrderHeader, 'id' | 'createdAt' | 'updatedAt'> & {
+        createdAt: ReturnType<typeof serverTimestamp>;
+        updatedAt: ReturnType<typeof serverTimestamp>;
+      } = {
+        ownerUid: shopId,
+        shopId,
+        orderNumber,
+        customerName,
+        customerPhone,
+        customerAddress,
+        customerNotes,
+        paymentMethod: 'Cash on Delivery',
+        status: 'Pending Confirmation',
+        itemCount: resolvedItems.length,
+        totalQuantity,
+        subtotal,
+        deliveryFee,
+        totalAmount,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      tx.set(orderRef, orderHeaderPayload);
+
+      for (let i = 0; i < resolvedItems.length; i += 1) {
+        tx.set(itemRefs[i], {
+          ...resolvedItems[i],
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      summary = {
+        itemCount: resolvedItems.length,
+        totalQuantity,
+        subtotal,
+        deliveryFee,
+        totalAmount,
+      };
+    });
+
+    return {
+      orderId: orderRef.id,
+      orderNumber,
+      itemIds: itemRefs.map((r) => r.id),
+      ...summary,
+    };
+  } catch (err) {
+    if (
+      err instanceof Error &&
+      (err.message.includes('Insufficient online stock') ||
+        err.message.includes('no longer available') ||
+        err.message.includes('currently unavailable') ||
+        err.message.includes('not enabled for sale'))
+    ) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.CREATE, `shops/${shopId}/websiteOrders/${orderRef.id}`);
+  }
 }
 
 export function buildStorefrontMetaPayload(
@@ -212,11 +493,13 @@ export async function confirmWebsiteOrder(
   if (order.status !== 'Pending Confirmation') {
     throw new Error(`Order ${order.orderNumber} is already "${order.status}".`);
   }
-  if (!order.items?.length) {
+
+  const liveItems = await fetchWebsiteOrderItems(shopId, order.id, order.items);
+  if (!liveItems.length) {
     throw new Error('Cannot confirm an order with no line items.');
   }
 
-  const lineDrafts = order.items.map((item) => ({
+  const lineDrafts = liveItems.map((item) => ({
     productId: item.productId,
     unitName: item.unitName,
     conversionFactor: item.conversionFactor,
@@ -239,6 +522,7 @@ export async function confirmWebsiteOrder(
     options?.activeBatchIds
   );
 
+  const subItemIds = liveItems.map((it) => it.id).filter((id): id is string => Boolean(id));
   const saleRef = doc(collection(db, 'shops', shopId, 'sales'));
   const saleNumber = generateTxnNumber('SL');
   const orderRef = doc(db, 'shops', shopId, 'websiteOrders', order.id);
@@ -257,8 +541,11 @@ export async function confirmWebsiteOrder(
 
     await runTransaction(db, async (tx) => {
       // Phase 1: ALL reads before ANY writes
-      const [orderSnap, prodSnaps, batchSnaps] = await Promise.all([
+      const [orderSnap, itemSnaps, prodSnaps, batchSnaps] = await Promise.all([
         tx.get(orderRef),
+        Promise.all(
+          subItemIds.map((iid) => tx.get(doc(db, 'shops', shopId, 'websiteOrders', order.id, 'items', iid)))
+        ),
         Promise.all(involvedPids.map((pid) => tx.get(doc(db, 'shops', shopId, 'products', pid)))),
         Promise.all(candidateBatchIds.map((bid) => tx.get(doc(db, 'shops', shopId, 'inventoryBatches', bid)))),
       ]);
@@ -266,9 +553,13 @@ export async function confirmWebsiteOrder(
       if (!orderSnap.exists()) {
         throw new Error(`Website order ${order.orderNumber} no longer exists.`);
       }
-      const liveOrder = { id: orderSnap.id, ...(orderSnap.data() as Omit<WebsiteOrder, 'id'>) };
+      const liveOrder = { id: orderSnap.id, ...(orderSnap.data() as Omit<WebsiteOrderHeader, 'id'>) };
       if (liveOrder.status !== 'Pending Confirmation') {
         throw new Error(`Order ${liveOrder.orderNumber} is already "${liveOrder.status}".`);
+      }
+
+      if (subItemIds.length > 0 && itemSnaps.some((s) => !s.exists())) {
+        throw new Error(`Website order ${order.orderNumber} items changed concurrently. Please refresh.`);
       }
 
       const productMap = new Map<string, Product>();
@@ -378,6 +669,7 @@ export async function confirmWebsiteOrder(
         err.message.includes('Selected product') ||
         err.message.includes('already') ||
         err.message.includes('no longer exists') ||
+        err.message.includes('changed concurrently') ||
         err.message.includes('500-write atomic transaction limit'))
     ) {
       throw err;
@@ -396,7 +688,10 @@ export async function rejectWebsiteOrder(
   }
 
   const orderRef = doc(db, 'shops', shopId, 'websiteOrders', order.id);
-  const reservedByProduct = computePendingWebsiteReservedByProduct([order]);
+  const liveItems = await fetchWebsiteOrderItems(shopId, order.id, order.items);
+  const reservedByProduct = computePendingWebsiteReservedByProduct([
+    { status: 'Pending Confirmation', items: liveItems },
+  ]);
   const productIds = Array.from(reservedByProduct.keys());
   const cleanReason = clip(reason || 'Cancelled by shop', 300) || 'Cancelled by shop';
 
@@ -412,19 +707,17 @@ export async function rejectWebsiteOrder(
       if (!orderSnap.exists()) {
         throw new Error(`Website order ${order.orderNumber} no longer exists.`);
       }
-      const liveOrder = { id: orderSnap.id, ...(orderSnap.data() as Omit<WebsiteOrder, 'id'>) };
+      const liveOrder = { id: orderSnap.id, ...(orderSnap.data() as Omit<WebsiteOrderHeader, 'id'>) };
       if (liveOrder.status !== 'Pending Confirmation') {
         throw new Error(`Order ${liveOrder.orderNumber} is already "${liveOrder.status}".`);
       }
-
-      const liveReserved = computePendingWebsiteReservedByProduct([liveOrder]);
 
       for (let i = 0; i < productIds.length; i += 1) {
         const pid = productIds[i];
         const sfSnap = sfSnaps[i];
         if (!sfSnap.exists()) continue;
 
-        const addBack = liveReserved.get(pid) || 0;
+        const addBack = reservedByProduct.get(pid) || 0;
         if (addBack <= 0) continue;
 
         const sfData = sfSnap.data() as Partial<StorefrontCatalogItem>;
@@ -512,7 +805,7 @@ export async function cancelConfirmedWebsiteOrder(
       if (!orderSnap.exists()) {
         throw new Error(`Website order ${order.orderNumber} no longer exists.`);
       }
-      const liveOrder = { id: orderSnap.id, ...(orderSnap.data() as Omit<WebsiteOrder, 'id'>) };
+      const liveOrder = { id: orderSnap.id, ...(orderSnap.data() as Omit<WebsiteOrderHeader, 'id'>) };
       if (liveOrder.status !== 'Confirmed' && liveOrder.status !== 'Out for Delivery') {
         throw new Error(`Order ${liveOrder.orderNumber} is already "${liveOrder.status}".`);
       }
@@ -602,7 +895,7 @@ async function rejectWebsiteOrderFallbackNoSale(
     if (!orderSnap.exists()) {
       throw new Error(`Website order ${order.orderNumber} no longer exists.`);
     }
-    const live = orderSnap.data() as WebsiteOrder;
+    const live = orderSnap.data() as WebsiteOrderHeader;
     if (live.status !== 'Confirmed' && live.status !== 'Out for Delivery') {
       throw new Error(`Order ${order.orderNumber} is already "${live.status}".`);
     }
@@ -627,7 +920,7 @@ export async function updateWebsiteOrderDeliveryStatus(
       if (!snap.exists()) {
         throw new Error(`Website order ${order.orderNumber} no longer exists.`);
       }
-      const live = snap.data() as WebsiteOrder;
+      const live = snap.data() as WebsiteOrderHeader;
       const isValidTransition =
         (live.status === 'Confirmed' &&
           (nextStatus === 'Out for Delivery' || nextStatus === 'Delivered')) ||

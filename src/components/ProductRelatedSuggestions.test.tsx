@@ -1,5 +1,11 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../lib/firebase', () => ({
+  db: {},
+  auth: { currentUser: null },
+}));
+
 import { resetCatalogIntelligence } from '../services/catalogIntelligenceService';
 import type { SearchableProductItem } from '../services/productSearchService';
 import {

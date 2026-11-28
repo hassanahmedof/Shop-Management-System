@@ -6,6 +6,8 @@ import type {
   ShopSettings,
   StorefrontCatalogItem,
   WebsiteOrder,
+  WebsiteOrderHeader,
+  WebsiteOrderItem,
 } from '../types/shop';
 
 const state = vi.hoisted(() => ({
@@ -230,6 +232,8 @@ import {
   buildStorefrontCatalogPayload,
   cancelConfirmedWebsiteOrder,
   confirmWebsiteOrder,
+  fetchWebsiteOrderItems,
+  placeWebsiteOrder,
   rejectWebsiteOrder,
   syncStorefrontCatalogDocuments,
   syncStorefrontMeta,
@@ -309,6 +313,39 @@ function makeBatch(overrides: Partial<InventoryBatch> = {}): InventoryBatch {
   };
 }
 
+function makeDefaultItems(): WebsiteOrderItem[] {
+  return [
+    {
+      id: 'item_1',
+      ownerUid: UID,
+      shopId: UID,
+      orderId: 'wo_1',
+      productId: 'prod_1',
+      productName: 'Pampers Active Baby Medium',
+      unitName: 'Carton',
+      conversionFactor: 4,
+      quantity: 1,
+      baseQuantity: 4,
+      unitPrice: 5800,
+      lineTotal: 5800,
+    },
+    {
+      id: 'item_2',
+      ownerUid: UID,
+      shopId: UID,
+      orderId: 'wo_1',
+      productId: 'prod_1',
+      productName: 'Pampers Active Baby Medium',
+      unitName: 'Pack',
+      conversionFactor: 1,
+      quantity: 2,
+      baseQuantity: 2,
+      unitPrice: 1500,
+      lineTotal: 3000,
+    },
+  ];
+}
+
 function makeWebsiteOrder(overrides: Partial<WebsiteOrder> = {}): WebsiteOrder {
   return {
     id: 'wo_1',
@@ -321,28 +358,8 @@ function makeWebsiteOrder(overrides: Partial<WebsiteOrder> = {}): WebsiteOrder {
     customerNotes: 'Call before delivery',
     paymentMethod: 'Cash on Delivery',
     status: 'Pending Confirmation',
-    items: [
-      {
-        productId: 'prod_1',
-        productName: 'Pampers Active Baby Medium',
-        unitName: 'Carton',
-        conversionFactor: 4,
-        quantity: 1,
-        baseQuantity: 4,
-        unitPrice: 5800,
-        lineTotal: 5800,
-      },
-      {
-        productId: 'prod_1',
-        productName: 'Pampers Active Baby Medium',
-        unitName: 'Pack',
-        conversionFactor: 1,
-        quantity: 2,
-        baseQuantity: 2,
-        unitPrice: 1500,
-        lineTotal: 3000,
-      },
-    ],
+    items: makeDefaultItems(),
+    itemsLoaded: true,
     itemCount: 2,
     totalQuantity: 6,
     subtotal: 8800,
@@ -352,8 +369,40 @@ function makeWebsiteOrder(overrides: Partial<WebsiteOrder> = {}): WebsiteOrder {
   };
 }
 
+/**
+ * Persists parent order header (WITHOUT inline items) and child subcollection documents
+ * under /shops/{shopId}/websiteOrders/{orderId}/items/{itemId}.
+ */
+function seedSubcollectionOrder(order: WebsiteOrder): void {
+  const { items, itemsLoaded: _itemsLoaded, ...headerOnly } = order;
+  const header: WebsiteOrderHeader = headerOnly;
+  state.docs.set(`shops/${UID}/websiteOrders/${order.id}`, header as unknown as Record<string, unknown>);
+  (items || []).forEach((item, idx) => {
+    const itemId = item.id || `item_${idx + 1}`;
+    state.docs.set(`shops/${UID}/websiteOrders/${order.id}/items/${itemId}`, {
+      ...item,
+      id: undefined,
+      ownerUid: UID,
+      shopId: UID,
+      orderId: order.id,
+      createdAt: 'SERVER_TIMESTAMP',
+    });
+  });
+}
+
 function listDocsInCollection(colName: string): Array<{ id: string; data: Record<string, unknown> }> {
   const prefix = `shops/${UID}/${colName}/`;
+  const out: Array<{ id: string; data: Record<string, unknown> }> = [];
+  for (const [k, v] of state.docs.entries()) {
+    if (k.startsWith(prefix) && !k.slice(prefix.length).includes('/')) {
+      out.push({ id: k.slice(prefix.length), data: v });
+    }
+  }
+  return out;
+}
+
+function listOrderItemDocs(orderId: string): Array<{ id: string; data: Record<string, unknown> }> {
+  const prefix = `shops/${UID}/websiteOrders/${orderId}/items/`;
   const out: Array<{ id: string; data: Record<string, unknown> }> = [];
   for (const [k, v] of state.docs.entries()) {
     if (k.startsWith(prefix)) {
@@ -363,7 +412,38 @@ function listDocsInCollection(colName: string): Array<{ id: string; data: Record
   return out;
 }
 
-describe('Website Orders & Public Storefront Projection', () => {
+/**
+ * Mirrors firestore.rules `isValidWebsiteOrderItemDoc` invariant for local regression verification.
+ */
+function matchesSubcollectionItemRule(
+  data: Record<string, unknown>,
+  shopId: string,
+  orderId: string
+): boolean {
+  const required = [
+    'ownerUid', 'shopId', 'orderId', 'productId', 'productName',
+    'unitName', 'conversionFactor', 'quantity', 'baseQuantity',
+    'unitPrice', 'lineTotal', 'createdAt',
+  ];
+  const keys = Object.keys(data);
+  if (!required.every((k) => keys.includes(k))) return false;
+  if (!keys.every((k) => required.includes(k))) return false;
+  if (data.ownerUid !== shopId || data.shopId !== shopId || data.orderId !== orderId) return false;
+  if (typeof data.productId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(data.productId)) return false;
+  if (typeof data.productName !== 'string' || data.productName.length < 1 || data.productName.length > 180) return false;
+  if (typeof data.unitName !== 'string' || data.unitName.length < 1 || data.unitName.length > 40) return false;
+  if (typeof data.conversionFactor !== 'number' || data.conversionFactor <= 0 || data.conversionFactor > 100000) return false;
+  if (typeof data.quantity !== 'number' || data.quantity <= 0 || data.quantity > 10000) return false;
+  if (typeof data.baseQuantity !== 'number' || data.baseQuantity <= 0 || data.baseQuantity > 1000000) return false;
+  if (Math.abs(data.baseQuantity - data.quantity * data.conversionFactor) > 0.005) return false;
+  if (typeof data.unitPrice !== 'number' || data.unitPrice < 0 || data.unitPrice > 10000000) return false;
+  if (typeof data.lineTotal !== 'number' || data.lineTotal < 0 || data.lineTotal > 10000000) return false;
+  if (Math.abs(data.lineTotal - data.unitPrice * data.quantity) > 0.01) return false;
+  if (!data.createdAt) return false;
+  return true;
+}
+
+describe('Website Orders & Public Storefront Projection (Subcollection Line Items)', () => {
   beforeEach(() => {
     state.docs.clear();
     state.autoIdSeq = 1;
@@ -406,6 +486,184 @@ describe('Website Orders & Public Storefront Projection', () => {
     expect(json).not.toContain('allowPurchase');
     expect(json).not.toContain('1200');
     expect(json).not.toContain('1350');
+  });
+
+  it('places multi-item order atomically using subcollection items without storing inline items on parent doc', async () => {
+    const p1 = makeProduct({ id: 'prod_1', name: 'Pampers', currentStock: 10, salePrice: 1500 });
+    const p2 = makeProduct({
+      id: 'prod_2',
+      name: 'Cerelac Wheat',
+      currentStock: 8,
+      salePrice: 650,
+      packagingUnits: [],
+      unit: 'Box',
+      baseUnit: 'Box',
+    });
+    const p3 = makeProduct({
+      id: 'prod_3',
+      name: 'Johnson Baby Lotion',
+      currentStock: 5,
+      salePrice: 900,
+      packagingUnits: [],
+      unit: 'Bottle',
+      baseUnit: 'Bottle',
+    });
+
+    state.docs.set(
+      `shops/${UID}/storefrontCatalog/prod_1`,
+      buildStorefrontCatalogPayload(UID, p1, 10) as unknown as Record<string, unknown>
+    );
+    state.docs.set(
+      `shops/${UID}/storefrontCatalog/prod_2`,
+      buildStorefrontCatalogPayload(UID, p2, 8) as unknown as Record<string, unknown>
+    );
+    state.docs.set(
+      `shops/${UID}/storefrontCatalog/prod_3`,
+      buildStorefrontCatalogPayload(UID, p3, 5) as unknown as Record<string, unknown>
+    );
+
+    const res = await placeWebsiteOrder(UID, {
+      orderNumber: 'WEB-TEST-003',
+      customerName: 'Zainab Tariq',
+      customerPhone: '+92 321 7654321',
+      customerAddress: 'Street 9, DHA Phase 5, Lahore',
+      customerNotes: 'Ring bell twice',
+      deliveryFee: 200,
+      items: [
+        { productId: 'prod_1', unitName: 'Carton', quantity: 1 }, // 4 * Pack, authoritative 5800
+        { productId: 'prod_2', unitName: 'Box', quantity: 2 }, // 2 * 650 = 1300
+        { productId: 'prod_3', unitName: 'Bottle', quantity: 1 }, // 1 * 900 = 900
+      ],
+    });
+
+    expect(res.itemCount).toBe(3);
+    expect(res.totalQuantity).toBe(7); // 4 + 2 + 1 base units
+    expect(res.subtotal).toBe(8000); // 5800 + 1300 + 900
+    expect(res.totalAmount).toBe(8200); // 8000 + 200 delivery
+
+    const parentDoc = state.docs.get(`shops/${UID}/websiteOrders/${res.orderId}`);
+    expect(parentDoc).toBeDefined();
+    expect('items' in (parentDoc || {})).toBe(false);
+    expect(parentDoc?.status).toBe('Pending Confirmation');
+
+    const subItems = listOrderItemDocs(res.orderId);
+    expect(subItems).toHaveLength(3);
+    for (const docEntry of subItems) {
+      expect(matchesSubcollectionItemRule(docEntry.data, UID, res.orderId)).toBe(true);
+    }
+
+    // Storefront stock decremented atomically
+    expect(state.docs.get(`shops/${UID}/storefrontCatalog/prod_1`)?.currentStock).toBe(6);
+    expect(state.docs.get(`shops/${UID}/storefrontCatalog/prod_2`)?.currentStock).toBe(6);
+    expect(state.docs.get(`shops/${UID}/storefrontCatalog/prod_3`)?.currentStock).toBe(4);
+  });
+
+  it('rejects checkout atomically when 2nd item has invalid/negative quantity or insufficient stock (zero partial writes)', async () => {
+    const p1 = makeProduct({ id: 'prod_1', currentStock: 10, salePrice: 1500 });
+    const p2 = makeProduct({ id: 'prod_2', name: 'P2', currentStock: 1, salePrice: 500, packagingUnits: [] });
+
+    state.docs.set(
+      `shops/${UID}/storefrontCatalog/prod_1`,
+      buildStorefrontCatalogPayload(UID, p1, 10) as unknown as Record<string, unknown>
+    );
+    state.docs.set(
+      `shops/${UID}/storefrontCatalog/prod_2`,
+      buildStorefrontCatalogPayload(UID, p2, 1) as unknown as Record<string, unknown>
+    );
+
+    // Case A: Negative quantity on 2nd item rejected before transaction
+    await expect(
+      placeWebsiteOrder(UID, {
+        customerName: 'Bilal Ahmed',
+        customerPhone: '+92 300 9998877',
+        customerAddress: 'Block C, Model Town, Lahore',
+        items: [
+          { productId: 'prod_1', unitName: 'Pack', quantity: 1 },
+          { productId: 'prod_2', unitName: 'Pack', quantity: -3 },
+          { productId: 'prod_1', unitName: 'Pack', quantity: 1 },
+        ],
+      })
+    ).rejects.toThrow(/Invalid quantity/i);
+
+    // Case B: Insufficient stock on 2nd item aborts transaction cleanly without deducting 1st item
+    await expect(
+      placeWebsiteOrder(UID, {
+        customerName: 'Bilal Ahmed',
+        customerPhone: '+92 300 9998877',
+        customerAddress: 'Block C, Model Town, Lahore',
+        items: [
+          { productId: 'prod_1', unitName: 'Pack', quantity: 2 },
+          { productId: 'prod_2', unitName: 'Pack', quantity: 5 },
+          { productId: 'prod_1', unitName: 'Pack', quantity: 1 },
+        ],
+      })
+    ).rejects.toThrow(/Insufficient online stock/i);
+
+    expect(state.docs.get(`shops/${UID}/storefrontCatalog/prod_1`)?.currentStock).toBe(10);
+    expect(state.docs.get(`shops/${UID}/storefrontCatalog/prod_2`)?.currentStock).toBe(1);
+    expect(listDocsInCollection('websiteOrders')).toHaveLength(0);
+
+    // Case C: Subcollection rule validation matrix rejects malformed 2nd item directly
+    const badSecondItem = {
+      ownerUid: UID,
+      shopId: UID,
+      orderId: 'wo_x',
+      productId: 'prod_2',
+      productName: 'P2',
+      unitName: 'Pack',
+      conversionFactor: 1,
+      quantity: -1,
+      baseQuantity: -1,
+      unitPrice: 500,
+      lineTotal: -500,
+      createdAt: 'SERVER_TIMESTAMP',
+    };
+    expect(matchesSubcollectionItemRule(badSecondItem, UID, 'wo_x')).toBe(false);
+  });
+
+  it('handles maximum 50-item checkout across 50 distinct products with per-item subcollection validation', async () => {
+    const lineInputs = [];
+    for (let i = 1; i <= 50; i += 1) {
+      const pid = `prod_${i}`;
+      const prod = makeProduct({
+        id: pid,
+        name: `Item ${i}`,
+        currentStock: 10,
+        salePrice: 100 + i,
+        packagingUnits: [],
+        unit: 'Piece',
+        baseUnit: 'Piece',
+      });
+      state.docs.set(
+        `shops/${UID}/storefrontCatalog/${pid}`,
+        buildStorefrontCatalogPayload(UID, prod, 10) as unknown as Record<string, unknown>
+      );
+      lineInputs.push({ productId: pid, unitName: 'Piece', quantity: 2 });
+    }
+
+    const res = await placeWebsiteOrder(UID, {
+      orderNumber: 'WEB-BULK-50',
+      customerName: 'Bulk Wholesale Buyer',
+      customerPhone: '+92 333 1112233',
+      customerAddress: 'Main Boulevard, Bahria Town, Islamabad',
+      deliveryFee: 0,
+      items: lineInputs,
+    });
+
+    expect(res.itemCount).toBe(50);
+    expect(res.totalQuantity).toBe(100);
+    const parentDoc = state.docs.get(`shops/${UID}/websiteOrders/${res.orderId}`);
+    expect('items' in (parentDoc || {})).toBe(false);
+
+    const subItems = listOrderItemDocs(res.orderId);
+    expect(subItems).toHaveLength(50);
+    for (const itemDoc of subItems) {
+      expect(matchesSubcollectionItemRule(itemDoc.data, UID, res.orderId)).toBe(true);
+    }
+
+    for (let i = 1; i <= 50; i += 1) {
+      expect(state.docs.get(`shops/${UID}/storefrontCatalog/prod_${i}`)?.currentStock).toBe(8);
+    }
   });
 
   it('syncs storefront/meta and storefrontCatalog subtracting pending COD reservations and deleting orphans', async () => {
@@ -462,7 +720,7 @@ describe('Website Orders & Public Storefront Projection', () => {
     expect(state.docs.has(`shops/${UID}/storefrontCatalog/prod_deleted`)).toBe(false);
   });
 
-  it('atomically confirms a Pending Confirmation order using FIFO ledger allocation and links POS sale', async () => {
+  it('atomically confirms a Pending Confirmation order by reading subcollection items and allocating FIFO batches', async () => {
     const prod = makeProduct({ currentStock: 10, purchasePrice: 1250 });
     const batch1 = makeBatch({ id: 'batch_1', purchaseDate: '2026-01-01', initialBaseQty: 4, remainingBaseQty: 4, unitCostInBase: 1100 });
     const batch2 = makeBatch({ id: 'batch_2', purchaseDate: '2026-01-10', initialBaseQty: 6, remainingBaseQty: 6, unitCostInBase: 1250 });
@@ -471,9 +729,14 @@ describe('Website Orders & Public Storefront Projection', () => {
     state.docs.set(`shops/${UID}/products/prod_1`, prod as unknown as Record<string, unknown>);
     state.docs.set(`shops/${UID}/inventoryBatches/batch_1`, batch1 as unknown as Record<string, unknown>);
     state.docs.set(`shops/${UID}/inventoryBatches/batch_2`, batch2 as unknown as Record<string, unknown>);
-    state.docs.set(`shops/${UID}/websiteOrders/wo_1`, order as unknown as Record<string, unknown>);
+    seedSubcollectionOrder(order);
 
-    const result = await confirmWebsiteOrder(UID, order, {
+    // Even if UI memory passed empty items, confirmWebsiteOrder fetches live subcollection docs
+    const fetched = await fetchWebsiteOrderItems(UID, 'wo_1');
+    expect(fetched).toHaveLength(2);
+
+    const headerOnlyArg: WebsiteOrder = { ...order, items: [] };
+    const result = await confirmWebsiteOrder(UID, headerOnlyArg, {
       activeBatchIds: ['batch_1', 'batch_2'],
       confirmedByUid: UID,
       confirmedByName: 'Main Owner',
@@ -484,6 +747,7 @@ describe('Website Orders & Public Storefront Projection', () => {
     expect(updatedOrder?.linkedSaleId).toBe(result.saleId);
     expect(updatedOrder?.linkedSaleNumber).toBe(result.saleNumber);
     expect(updatedOrder?.confirmedByName).toBe('Main Owner');
+    expect('items' in (updatedOrder || {})).toBe(false);
 
     const createdSale = state.docs.get(`shops/${UID}/sales/${result.saleId}`);
     expect(createdSale).toMatchObject({
@@ -523,7 +787,7 @@ describe('Website Orders & Public Storefront Projection', () => {
 
     state.docs.set(`shops/${UID}/products/prod_1`, prod as unknown as Record<string, unknown>);
     state.docs.set(`shops/${UID}/inventoryBatches/batch_1`, batch1 as unknown as Record<string, unknown>);
-    state.docs.set(`shops/${UID}/websiteOrders/wo_1`, order as unknown as Record<string, unknown>);
+    seedSubcollectionOrder(order);
 
     await expect(
       confirmWebsiteOrder(UID, order, { activeBatchIds: ['batch_1'] })
@@ -536,16 +800,16 @@ describe('Website Orders & Public Storefront Projection', () => {
     expect(listDocsInCollection('stockMovements')).toHaveLength(0);
   });
 
-  it('rejects a Pending Confirmation order by restoring storefrontCatalog stock ONLY and never touching real ledger', async () => {
+  it('rejects a Pending Confirmation order using subcollection items to restore storefrontCatalog stock ONLY', async () => {
     const prod = makeProduct({ currentStock: 10 });
     const sfItem = buildStorefrontCatalogPayload(UID, prod, 4); // 10 - 6 reserved at checkout
     const order = makeWebsiteOrder();
 
     state.docs.set(`shops/${UID}/products/prod_1`, prod as unknown as Record<string, unknown>);
     state.docs.set(`shops/${UID}/storefrontCatalog/prod_1`, sfItem as unknown as Record<string, unknown>);
-    state.docs.set(`shops/${UID}/websiteOrders/wo_1`, order as unknown as Record<string, unknown>);
+    seedSubcollectionOrder(order);
 
-    await rejectWebsiteOrder(UID, order, 'Unable to confirm on phone');
+    await rejectWebsiteOrder(UID, { ...order, items: [] }, 'Unable to confirm on phone');
 
     const updatedOrder = state.docs.get(`shops/${UID}/websiteOrders/wo_1`);
     expect(updatedOrder?.status).toBe('Cancelled/Rejected');
@@ -571,22 +835,24 @@ describe('Website Orders & Public Storefront Projection', () => {
     state.docs.set(`shops/${UID}/products/prod_1`, prod as unknown as Record<string, unknown>);
     state.docs.set(`shops/${UID}/inventoryBatches/batch_1`, batch1 as unknown as Record<string, unknown>);
     state.docs.set(`shops/${UID}/inventoryBatches/batch_2`, batch2 as unknown as Record<string, unknown>);
-    state.docs.set(`shops/${UID}/websiteOrders/wo_1`, order as unknown as Record<string, unknown>);
+    seedSubcollectionOrder(order);
 
     const { saleId } = await confirmWebsiteOrder(UID, order, {
       activeBatchIds: ['batch_1', 'batch_2'],
     });
-    const confirmedOrder = {
-      ...(state.docs.get(`shops/${UID}/websiteOrders/wo_1`) as unknown as WebsiteOrder),
+    const confirmedOrder: WebsiteOrder = {
+      ...(state.docs.get(`shops/${UID}/websiteOrders/wo_1`) as unknown as WebsiteOrderHeader),
       id: 'wo_1',
+      items: order.items,
     };
 
     await updateWebsiteOrderDeliveryStatus(UID, confirmedOrder, 'Out for Delivery');
     expect(state.docs.get(`shops/${UID}/websiteOrders/wo_1`)?.status).toBe('Out for Delivery');
 
-    const dispatchedOrder = {
-      ...(state.docs.get(`shops/${UID}/websiteOrders/wo_1`) as unknown as WebsiteOrder),
+    const dispatchedOrder: WebsiteOrder = {
+      ...(state.docs.get(`shops/${UID}/websiteOrders/wo_1`) as unknown as WebsiteOrderHeader),
       id: 'wo_1',
+      items: order.items,
     };
 
     // Cancel while Out for Delivery (customer refused COD) -> reverses sale and restores FIFO lots

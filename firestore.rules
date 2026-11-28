@@ -890,24 +890,33 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    function isValidWebsiteOrderItemMap(item) {
-      return item is map
-        && item.keys().hasAll([
-          'productId', 'productName', 'unitName', 'conversionFactor',
-          'quantity', 'baseQuantity', 'unitPrice', 'lineTotal'
+    function isValidWebsiteOrderItemDoc(data, shopId, orderId) {
+      return data.keys().hasAll([
+          'ownerUid', 'shopId', 'orderId', 'productId', 'productName',
+          'unitName', 'conversionFactor', 'quantity', 'baseQuantity',
+          'unitPrice', 'lineTotal', 'createdAt'
         ])
-        && item.keys().hasOnly([
-          'productId', 'productName', 'unitName', 'conversionFactor',
-          'quantity', 'baseQuantity', 'unitPrice', 'lineTotal'
+        && data.keys().hasOnly([
+          'ownerUid', 'shopId', 'orderId', 'productId', 'productName',
+          'unitName', 'conversionFactor', 'quantity', 'baseQuantity',
+          'unitPrice', 'lineTotal', 'createdAt'
         ])
-        && item.productId is string && isValidId(item.productId)
-        && item.productName is string && item.productName.size() >= 1 && item.productName.size() <= 180
-        && item.unitName is string && item.unitName.size() >= 1 && item.unitName.size() <= 40
-        && item.conversionFactor is number && item.conversionFactor > 0
-        && item.quantity is number && item.quantity > 0 && item.quantity <= 10000
-        && item.baseQuantity is number && item.baseQuantity > 0
-        && item.unitPrice is number && item.unitPrice >= 0 && item.unitPrice <= 10000000
-        && item.lineTotal is number && item.lineTotal >= 0 && item.lineTotal <= 10000000;
+        && data.ownerUid is string && data.ownerUid == shopId && data.ownerUid.size() <= 128
+        && data.shopId is string && data.shopId == shopId && data.shopId.size() <= 128
+        && data.orderId is string && data.orderId == orderId && isValidId(data.orderId)
+        && data.productId is string && isValidId(data.productId)
+        && data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 180
+        && data.unitName is string && data.unitName.size() >= 1 && data.unitName.size() <= 40
+        && data.conversionFactor is number && data.conversionFactor > 0 && data.conversionFactor <= 100000
+        && data.quantity is number && data.quantity > 0 && data.quantity <= 10000
+        && data.baseQuantity is number && data.baseQuantity > 0 && data.baseQuantity <= 1000000
+        && data.baseQuantity <= data.quantity * data.conversionFactor + 0.005
+        && data.baseQuantity >= data.quantity * data.conversionFactor - 0.005
+        && data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 10000000
+        && data.lineTotal is number && data.lineTotal >= 0 && data.lineTotal <= 10000000
+        && data.lineTotal <= data.unitPrice * data.quantity + 0.01
+        && data.lineTotal >= data.unitPrice * data.quantity - 0.01
+        && data.createdAt is timestamp;
     }
 
     function isValidWebsiteOrderCore(data, shopId) {
@@ -920,9 +929,7 @@ service cloud.firestore {
         && data.customerAddress is string && data.customerAddress.size() >= 5 && data.customerAddress.size() <= 400
         && data.customerNotes is string && data.customerNotes.size() <= 500
         && data.paymentMethod == 'Cash on Delivery'
-        && data.items is list && data.items.size() >= 1 && data.items.size() <= 50
-        && isValidWebsiteOrderItemMap(data.items[0])
-        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 50 && data.itemCount == data.items.size()
+        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 50
         && data.totalQuantity is number && data.totalQuantity > 0 && data.totalQuantity <= 100000
         && data.subtotal is number && data.subtotal >= 0 && data.subtotal <= 10000000
         && data.deliveryFee is number && data.deliveryFee >= 0 && data.deliveryFee <= 100000
@@ -938,13 +945,13 @@ service cloud.firestore {
       return data.keys().hasAll([
           'ownerUid', 'shopId', 'orderNumber', 'customerName', 'customerPhone',
           'customerAddress', 'customerNotes', 'paymentMethod', 'status',
-          'items', 'itemCount', 'totalQuantity', 'subtotal', 'deliveryFee',
+          'itemCount', 'totalQuantity', 'subtotal', 'deliveryFee',
           'totalAmount', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
           'ownerUid', 'shopId', 'orderNumber', 'customerName', 'customerPhone',
           'customerAddress', 'customerNotes', 'paymentMethod', 'status',
-          'items', 'itemCount', 'totalQuantity', 'subtotal', 'deliveryFee',
+          'itemCount', 'totalQuantity', 'subtotal', 'deliveryFee',
           'totalAmount', 'createdAt', 'updatedAt'
         ])
         && data.status == 'Pending Confirmation'
@@ -955,7 +962,7 @@ service cloud.firestore {
       return data.keys().hasAll([
           'ownerUid', 'shopId', 'orderNumber', 'customerName', 'customerPhone',
           'customerAddress', 'customerNotes', 'paymentMethod', 'status',
-          'items', 'itemCount', 'totalQuantity', 'subtotal', 'deliveryFee',
+          'itemCount', 'totalQuantity', 'subtotal', 'deliveryFee',
           'totalAmount', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
@@ -1820,7 +1827,8 @@ service cloud.firestore {
         allow delete: if isOwner(shopId) && isValidId(productId) && shopExists(shopId) && existing().ownerUid == shopId;
       }
 
-      // Customer COD Website Orders (Public create-only with atomic storefrontCatalog stock decrement; zero public read/update/delete)
+      // Customer COD Website Orders (Public create-only headers; zero public read/update/delete)
+      // Each line item is stored and individually validated in subcollection /websiteOrders/{orderId}/items/{itemId}.
       match /websiteOrders/{orderId} {
         allow get: if isValidId(orderId) && (
           (isOwner(shopId) && (resource == null || (shopExists(shopId) && existing().ownerUid == shopId))) ||
@@ -1833,10 +1841,7 @@ service cloud.firestore {
           && isValidWebsiteOrderCreate(incoming(), shopId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && shopExists(shopId)
-          && get(/databases/$(database)/documents/shops/$(shopId)/storefrontCatalog/$(incoming().items[0].productId)).data.isActive == true
-          && getAfter(/databases/$(database)/documents/shops/$(shopId)/storefrontCatalog/$(incoming().items[0].productId)).data.currentStock < get(/databases/$(database)/documents/shops/$(shopId)/storefrontCatalog/$(incoming().items[0].productId)).data.currentStock
-          && getAfter(/databases/$(database)/documents/shops/$(shopId)/storefrontCatalog/$(incoming().items[0].productId)).data.currentStock >= 0;
+          && shopExists(shopId);
         allow update: if isValidId(shopId)
           && isValidId(orderId)
           && isValidWebsiteOrderUpdate(incoming(), shopId)
@@ -1849,7 +1854,7 @@ service cloud.firestore {
           && incoming().customerAddress == existing().customerAddress
           && incoming().customerNotes == existing().customerNotes
           && incoming().paymentMethod == existing().paymentMethod
-          && incoming().items == existing().items
+          && (!('items' in incoming()) || ('items' in existing() && incoming().items == existing().items))
           && incoming().itemCount == existing().itemCount
           && incoming().totalQuantity == existing().totalQuantity
           && incoming().subtotal == existing().subtotal
@@ -1895,6 +1900,24 @@ service cloud.firestore {
             )
           );
         allow delete: if false;
+
+        match /items/{itemId} {
+          allow get: if isValidId(itemId) && (
+            (isOwner(shopId) && (resource == null || (shopExists(shopId) && existing().ownerUid == shopId))) ||
+            (staffCanAddSales(shopId) && shopExists(shopId) && (resource == null || existing().ownerUid == shopId))
+          );
+          allow list: if (isOwner(shopId) && existing().ownerUid == shopId)
+            || (staffCanAddSales(shopId) && existing().ownerUid == shopId);
+          allow create: if isValidId(shopId)
+            && isValidId(orderId)
+            && isValidId(itemId)
+            && isValidWebsiteOrderItemDoc(incoming(), shopId, orderId)
+            && incoming().createdAt == request.time
+            && shopExists(shopId)
+            && getAfter(/databases/$(database)/documents/shops/$(shopId)/websiteOrders/$(orderId)).data.ownerUid == shopId
+            && getAfter(/databases/$(database)/documents/shops/$(shopId)/websiteOrders/$(orderId)).data.status == 'Pending Confirmation';
+          allow update, delete: if false;
+        }
       }
     }
   }

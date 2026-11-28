@@ -110,10 +110,13 @@ const firebaseConfig: FirebaseAppletConfig = {
     '(default)',
 };
 
-if (!firebaseConfig.projectId) {
-  throw new Error(
-    'Firebase projectId missing. Provide firebase-applet-config.json locally or set FIREBASE_PROJECT_ID / VITE_FIREBASE_PROJECT_ID.'
-  );
+function getFirebaseProjectId(): string {
+  if (!firebaseConfig.projectId) {
+    throw new Error(
+      'Firebase projectId missing. Provide firebase-applet-config.json locally or set FIREBASE_PROJECT_ID / VITE_FIREBASE_PROJECT_ID.'
+    );
+  }
+  return firebaseConfig.projectId;
 }
 
 const FIRESTORE_DB_ID = firebaseConfig.firestoreDatabaseId || '(default)';
@@ -225,9 +228,10 @@ async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFirebaseU
   }>(payloadB64);
 
   const nowSec = Math.floor(Date.now() / 1000);
-  const expectedIssuer = `https://securetoken.google.com/${firebaseConfig.projectId}`;
+  const projectId = getFirebaseProjectId();
+  const expectedIssuer = `https://securetoken.google.com/${projectId}`;
 
-  if (payload.aud !== firebaseConfig.projectId) {
+  if (payload.aud !== projectId) {
     throw new Error('Token audience mismatch.');
   }
   if (payload.iss !== expectedIssuer) {
@@ -374,7 +378,7 @@ async function firestoreGetDoc(
   docPath: string,
   bearerToken?: string
 ): Promise<Record<string, unknown> | null> {
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${FIRESTORE_DB_ID}/documents/${docPath}`;
+  const url = `https://firestore.googleapis.com/v1/projects/${getFirebaseProjectId()}/databases/${FIRESTORE_DB_ID}/documents/${docPath}`;
   const headers: Record<string, string> = {};
   if (bearerToken) {
     headers.Authorization = `Bearer ${bearerToken}`;
@@ -395,7 +399,7 @@ async function firestoreListCollection(
   collectionPath: string,
   bearerToken: string
 ): Promise<Array<Record<string, unknown>>> {
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${FIRESTORE_DB_ID}/documents/${collectionPath}`;
+  const url = `https://firestore.googleapis.com/v1/projects/${getFirebaseProjectId()}/databases/${FIRESTORE_DB_ID}/documents/${collectionPath}`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${bearerToken}` },
   });
@@ -413,7 +417,7 @@ async function firestoreQuerySaleItemsBySaleId(
   saleId: string,
   bearerToken: string
 ): Promise<Array<Record<string, unknown>>> {
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${FIRESTORE_DB_ID}/documents/shops/${encodeURIComponent(shopId)}:runQuery`;
+  const url = `https://firestore.googleapis.com/v1/projects/${getFirebaseProjectId()}/databases/${FIRESTORE_DB_ID}/documents/shops/${encodeURIComponent(shopId)}:runQuery`;
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -462,8 +466,9 @@ async function firestoreBatchGetDocs(
 ): Promise<Map<string, Record<string, unknown>>> {
   const out = new Map<string, Record<string, unknown>>();
   if (docPaths.length === 0) return out;
-  const docPrefix = `projects/${firebaseConfig.projectId}/databases/${FIRESTORE_DB_ID}/documents/`;
-  const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${FIRESTORE_DB_ID}/documents:batchGet`;
+  const projectId = getFirebaseProjectId();
+  const docPrefix = `projects/${projectId}/databases/${FIRESTORE_DB_ID}/documents/`;
+  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${FIRESTORE_DB_ID}/documents:batchGet`;
 
   for (let i = 0; i < docPaths.length; i += 100) {
     const chunk = docPaths.slice(i, i + 100);
@@ -2343,6 +2348,7 @@ export function createCaremartApp(overrides: Partial<ServerDependencies> = {}) {
 }
 
 async function startServer() {
+  getFirebaseProjectId();
   validateRequiredSecrets();
   const app = createCaremartApp();
 

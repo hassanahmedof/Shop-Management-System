@@ -96,3 +96,19 @@ Every instance where a bounded list currently validates element `[0]` as a struc
 ### Option B: Rules-Only with Reduced Item Limit
 If public client-side Firestore transactions must remain without a backend endpoint or subcollection:
 - Unroll `isValidWebsiteOrderItemMap(data.items[i])` with concise field checks for `i = 0..(MAX - 1)` **and** reduce `data.items.size()` from `50` to a smaller limit (e.g., `<= 6–8` items) verified against the **Firebase Firestore Emulator** (`@firebase/rules-unit-testing` with Java installed) to stay safely below the 1,000-expression limit.
+
+---
+
+## 6. Implemented Fix: Subcollection-Based Line Items (Starter Tier / Rules-Only)
+
+Option A.2 (Firestore Subcollection) has been implemented so the project runs 100% client-side with zero `firebase-admin` / billing-tier upgrades:
+
+1. **Parent Header (`/shops/{shopId}/websiteOrders/{orderId}`):**
+   - Retains customer contact, delivery address, payment method, status, and order-level totals (`itemCount`, `totalQuantity`, `subtotal`, `deliveryFee`, `totalAmount`) and **forbids inline `items` arrays on `create`**.
+2. **Line Item Subcollection (`/shops/{shopId}/websiteOrders/{orderId}/items/{itemId}`):**
+   - Each ordered item is created as an individual immutable document (`allow update, delete: if false`) validated by `isValidWebsiteOrderItemDoc(incoming(), shopId, orderId)` (constant expression budget per item regardless of cart size up to 50+ items).
+   - Verifies per-item math (`baseQuantity ≈ quantity * conversionFactor`, `lineTotal ≈ unitPrice * quantity`) and parent order atomicity via `getAfter(/shops/{shopId}/websiteOrders/{orderId})` (uses 1 cached document access across all items in the transaction).
+3. **Authoritative Total/Price Computation & Residual Risk:**
+   - The checkout transaction (`placeWebsiteOrder` in `src/services/websiteOrderService.ts`) reads `storefrontCatalog/{productId}` inside `runTransaction`, recomputes authoritative `unitPrice`, `baseQuantity`, `lineTotal`, `subtotal`, `totalQuantity`, and `totalAmount` from catalog data, and decrements `storefrontCatalog/{productId}.currentStock` atomically.
+   - **Residual Rules Risk:** Firestore Security Rules cannot query/aggregate child subcollection documents to verify `parent.subtotal == sum(items.lineTotal)`, and Firestore enforces a **20 document-access ceiling (`get`/`exists`/`getAfter`) across an entire transaction** (so calling `get(storefrontCatalog/{productId})` per item inside `items/{itemId}` would break >18 distinct-product checkouts). As operational mitigation, `Pending Confirmation` orders never deduct POS stock or create `sales` records until reviewed and confirmed by the Shop Owner in **Website Orders**, which surfaces stock and catalog price-mismatch warnings directly on the order review panel.
+

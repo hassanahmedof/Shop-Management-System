@@ -25,6 +25,7 @@
 14. **Public WebsiteOrder Enumeration / PII Read**: Unauthenticated caller attempts `get` or `list` on `/shops/u1/websiteOrders` -> `PERMISSION_DENIED`.
 15. **Storefront Stock Negative / Inflation Tampering**: Public caller attempts to increase `storefrontCatalog/{productId}.currentStock` or set negative stock -> `PERMISSION_DENIED`.
 16. **Pre-Confirmed WebsiteOrder Spoofing**: Public caller attempts to create `/shops/u1/websiteOrders/wo1` with `status: 'Confirmed'` or `linkedSaleId` -> `PERMISSION_DENIED`.
-17. **Oversized Order Line-Item DoS**: Public caller submits `websiteOrders` with `items.size() > 50` or invalid phone format -> `PERMISSION_DENIED`.
+17. **Oversized Order Header / Invalid Format DoS**: Public caller submits `websiteOrders` with `itemCount > 50`, inline `items` array, or invalid phone format -> `PERMISSION_DENIED`.
 18. **Staff Financial Confirmation Escalation**: Sales staff attempts to change a `Pending Confirmation` website order to `Confirmed` -> `PERMISSION_DENIED`.
+19. **Malformed Subcollection Line Item**: Public caller creates `/shops/u1/websiteOrders/wo1/items/i2` with negative quantity, mismatched `lineTotal != unitPrice * quantity`, missing parent order, or extra fields -> `PERMISSION_DENIED`.
 

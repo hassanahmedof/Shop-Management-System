@@ -753,7 +753,7 @@
     },
     "WebsiteOrder": {
       "title": "WebsiteOrder",
-      "description": "Customer Cash-on-Delivery order submitted from the public storefront with atomic storefrontCatalog stock reservation.",
+      "description": "Customer Cash-on-Delivery order header submitted from the public storefront with atomic storefrontCatalog stock reservation; line items are stored in the items subcollection.",
       "type": "object",
       "properties": {
         "ownerUid": { "type": "string", "maxLength": 128 },
@@ -765,7 +765,6 @@
         "customerNotes": { "type": "string", "maxLength": 500 },
         "paymentMethod": { "type": "string", "enum": ["Cash on Delivery"] },
         "status": { "type": "string", "enum": ["Pending Confirmation", "Confirmed", "Out for Delivery", "Delivered", "Cancelled/Rejected"] },
-        "items": { "type": "array" },
         "itemCount": { "type": "number" },
         "totalQuantity": { "type": "number" },
         "subtotal": { "type": "number" },
@@ -785,8 +784,32 @@
       },
       "required": [
         "ownerUid", "shopId", "orderNumber", "customerName", "customerPhone", "customerAddress",
-        "customerNotes", "paymentMethod", "status", "items", "itemCount", "totalQuantity",
+        "customerNotes", "paymentMethod", "status", "itemCount", "totalQuantity",
         "subtotal", "deliveryFee", "totalAmount", "createdAt", "updatedAt"
+      ]
+    },
+    "WebsiteOrderItem": {
+      "title": "WebsiteOrderItem",
+      "description": "Immutable Cash-on-Delivery line item document stored in websiteOrders/{orderId}/items/{itemId} so each item is individually validated by Firestore Security Rules.",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "shopId": { "type": "string", "maxLength": 128 },
+        "orderId": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "unitName": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "conversionFactor": { "type": "number" },
+        "quantity": { "type": "number" },
+        "baseQuantity": { "type": "number" },
+        "unitPrice": { "type": "number" },
+        "lineTotal": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerUid", "shopId", "orderId", "productId", "productName",
+        "unitName", "conversionFactor", "quantity", "baseQuantity",
+        "unitPrice", "lineTotal", "createdAt"
       ]
     }
   },
@@ -929,7 +952,11 @@
     },
     "/shops/{shopId}/websiteOrders/{orderId}": {
       "schema": { "$ref": "#/entities/WebsiteOrder" },
-      "description": "Public create-only Cash-on-Delivery website orders managed by Owner/Admin and delivery staff."
+      "description": "Public create-only Cash-on-Delivery website order headers managed by Owner/Admin and delivery staff."
+    },
+    "/shops/{shopId}/websiteOrders/{orderId}/items/{itemId}": {
+      "schema": { "$ref": "#/entities/WebsiteOrderItem" },
+      "description": "Immutable per-item subcollection documents for websiteOrders, individually validated by security rules on create."
     }
   }
 }

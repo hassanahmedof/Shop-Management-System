@@ -57,6 +57,8 @@ import type {
   StorefrontCatalogItem,
   Supplier,
   WebsiteOrder,
+  WebsiteOrderHeader,
+  WebsiteOrderItem,
 } from '../types/shop';
 import {
   syncStorefrontCatalogDocuments,
@@ -126,9 +128,22 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   const [staffCatalog, setStaffCatalog] = useState<StaffCatalogItem[]>([]);
   const [staffSales, setStaffSales] = useState<StaffSale[]>([]);
   const [storefrontCatalog, setStorefrontCatalog] = useState<StorefrontCatalogItem[]>([]);
-  const [websiteOrders, setWebsiteOrders] = useState<WebsiteOrder[]>([]);
+  const [rawWebsiteOrders, setRawWebsiteOrders] = useState<
+    Array<WebsiteOrderHeader & { items?: WebsiteOrderItem[] }>
+  >([]);
+  const [websiteOrderItemsMap, setWebsiteOrderItemsMap] = useState<
+    Record<string, WebsiteOrderItem[]>
+  >({});
   const [loading, setLoading] = useState(true);
   const [liveListenersSettled, setLiveListenersSettled] = useState(false);
+
+  const websiteOrderItemUnsubsRef = useRef<{
+    scopeKey: string;
+    unsubs: Map<string, () => void>;
+  }>({
+    scopeKey: '',
+    unsubs: new Map(),
+  });
 
   const autoBackupAttemptedRef = useRef<string>('');
   const defaultCatsCheckedRef = useRef<string>('');
@@ -221,7 +236,8 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
         Boolean(staffProfile?.isActive) && Boolean(staffProfile?.permissions?.canAddSales);
 
       if (!canViewWebsiteOrders) {
-        setWebsiteOrders([]);
+        setRawWebsiteOrders([]);
+        setWebsiteOrderItemsMap({});
       }
 
       const cachedCatalog = canReadCatalog ? loadCachedStaffCatalog(shopId, user.uid) : [];
@@ -358,9 +374,9 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
           onSnapshot(
             ordersQ,
             (snap) => {
-              setWebsiteOrders(
+              setRawWebsiteOrders(
                 snap.docs.map((d) => ({
-                  ...(d.data() as Omit<WebsiteOrder, 'id'>),
+                  ...(d.data() as Omit<WebsiteOrderHeader, 'id'> & { items?: WebsiteOrderItem[] }),
                   id: d.id,
                 }))
               );
@@ -535,7 +551,10 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
       listenList<StaffCatalogItem>('staffCatalog', setStaffCatalog),
       listenList<StaffSale>('staffSales', setStaffSales),
       listenList<StorefrontCatalogItem>('storefrontCatalog', setStorefrontCatalog),
-      listenList<WebsiteOrder>('websiteOrders', setWebsiteOrders),
+      listenList<WebsiteOrderHeader & { items?: WebsiteOrderItem[] }>(
+        'websiteOrders',
+        setRawWebsiteOrders
+      ),
     ];
 
     return () => {
@@ -552,6 +571,124 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
     staffProfile?.permissions?.canAddSales,
     staffProfile?.permissions?.canViewOwnSales,
   ]);
+
+  // Manage live subcollection listeners for /shops/{shopId}/websiteOrders/{orderId}/items
+  useEffect(() => {
+    const canListenOrderItems =
+      Boolean(user && shopId && sessionRole && shopReady && !initializingShop) &&
+      (sessionRole === 'owner' ||
+        (sessionRole === 'sales_staff' &&
+          Boolean(staffProfile?.isActive) &&
+          Boolean(staffProfile?.permissions?.canAddSales)));
+
+    const registry = websiteOrderItemUnsubsRef.current;
+    const nextScopeKey = canListenOrderItems ? `${shopId}:${sessionRole}` : '';
+
+    if (registry.scopeKey !== nextScopeKey) {
+      for (const unsub of registry.unsubs.values()) {
+        unsub();
+      }
+      registry.unsubs.clear();
+      registry.scopeKey = nextScopeKey;
+      setWebsiteOrderItemsMap({});
+    }
+
+    if (!canListenOrderItems || !shopId) {
+      return;
+    }
+
+    const desiredOrderIds = new Set(rawWebsiteOrders.map((o) => o.id));
+
+    // Unsubscribe deleted/removed orders
+    let removedAny = false;
+    for (const [orderId, unsub] of registry.unsubs.entries()) {
+      if (!desiredOrderIds.has(orderId)) {
+        unsub();
+        registry.unsubs.delete(orderId);
+        removedAny = true;
+      }
+    }
+    if (removedAny) {
+      setWebsiteOrderItemsMap((prev) => {
+        const next = { ...prev };
+        for (const k of Object.keys(next)) {
+          if (!desiredOrderIds.has(k)) {
+            delete next[k];
+          }
+        }
+        return next;
+      });
+    }
+
+    // Subscribe any newly arrived order headers
+    for (const order of rawWebsiteOrders) {
+      if (registry.unsubs.has(order.id)) continue;
+      const itemsPath = `shops/${shopId}/websiteOrders/${order.id}/items`;
+      const itemsQ = query(
+        collection(db, 'shops', shopId, 'websiteOrders', order.id, 'items'),
+        where('ownerUid', '==', shopId)
+      );
+      const unsub = onSnapshot(
+        itemsQ,
+        (snap) => {
+          const items = snap.docs.map((d) => ({
+            id: d.id,
+            ...(d.data() as Omit<WebsiteOrderItem, 'id'>),
+          }));
+          setWebsiteOrderItemsMap((prev) => ({
+            ...prev,
+            [order.id]: items,
+          }));
+        },
+        (error) => {
+          if (isNetworkOrOfflineError(error)) {
+            return;
+          }
+          handleFirestoreError(error, OperationType.LIST, itemsPath);
+        }
+      );
+      registry.unsubs.set(order.id, unsub);
+    }
+  }, [
+    user,
+    shopId,
+    sessionRole,
+    shopReady,
+    initializingShop,
+    staffProfile?.isActive,
+    staffProfile?.permissions?.canAddSales,
+    rawWebsiteOrders,
+  ]);
+
+  // Clean up all order-item subcollection listeners on provider unmount
+  useEffect(() => {
+    const registry = websiteOrderItemUnsubsRef.current;
+    return () => {
+      for (const unsub of registry.unsubs.values()) {
+        unsub();
+      }
+      registry.unsubs.clear();
+    };
+  }, []);
+
+  const websiteOrders = useMemo<WebsiteOrder[]>(
+    () =>
+      rawWebsiteOrders.map((header) => {
+        const hasSubItemsLoaded = Object.prototype.hasOwnProperty.call(
+          websiteOrderItemsMap,
+          header.id
+        );
+        const subItems = websiteOrderItemsMap[header.id];
+        const legacyItems = Array.isArray(header.items) ? header.items : [];
+        const items = subItems && subItems.length > 0 ? subItems : legacyItems;
+        return {
+          ...header,
+          items,
+          itemsLoaded: hasSubItemsLoaded || legacyItems.length > 0,
+        };
+      }),
+    [rawWebsiteOrders, websiteOrderItemsMap]
+  );
 
   // Persist permanent Owner catalog locally whenever categories, brands, products, or templates update
   useEffect(() => {
@@ -651,6 +788,10 @@ export function ShopDataProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (sessionRole !== 'owner' || !shopId || !liveListenersSettled) return;
     if (products.length === 0 && storefrontCatalog.length === 0) return;
+    // Wait until every Pending Confirmation order's /items subcollection has hydrated
+    if (websiteOrders.some((o) => o.status === 'Pending Confirmation' && !o.itemsLoaded)) {
+      return;
+    }
 
     const parts = storefrontSyncPartsRef.current;
     const prodSig =
